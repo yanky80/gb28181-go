@@ -1,4 +1,4 @@
-package mp4_test
+package mp4
 
 import (
 	"bytes"
@@ -6,8 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
-	"github.com/mickeyzzc/gb28181-go/platform/mp4"
+	"github.com/mickeyzzc/gb28181-go/platform"
+	"github.com/mickeyzzc/gb28181-go/platform/cascade"
+	"github.com/mickeyzzc/gb28181-go/psmux"
 	"github.com/stretchr/testify/require"
 )
 
@@ -24,7 +27,7 @@ func TestParseSegmentH264MultipleFragments(t *testing.T) {
 		{{duration: 40, data: data[2], key: true}},
 	}))
 
-	got, err := mp4.ParseSegment(path)
+	got, err := ParseSegment(path)
 	require.NoError(t, err)
 	require.Equal(t, "h264", got.Codec)
 	require.Equal(t, uint32(1000), got.Timescale)
@@ -46,7 +49,7 @@ func TestParseSegmentH265HVCC(t *testing.T) {
 		{{duration: 3000, data: []byte{0, 0, 0, 2, 0x26, 0x01}, key: true}},
 	}))
 
-	got, err := mp4.ParseSegment(path)
+	got, err := ParseSegment(path)
 	require.NoError(t, err)
 	require.Equal(t, "h265", got.Codec)
 	require.Equal(t, vps, got.VPS)
@@ -56,19 +59,124 @@ func TestParseSegmentH265HVCC(t *testing.T) {
 	require.True(t, got.Samples[0].IsKeyFrame)
 }
 
+func TestParseSegmentPlaybackAnnexBParameterSets(t *testing.T) {
+	tests := []struct {
+		name string
+		path string
+		want [][]byte
+	}{
+		{
+			name: "h264",
+			path: writeSegment(t, h264Segment([]byte{0x67, 1}, []byte{0x68, 2}, [][]sample{{
+				{duration: 40, data: []byte{0, 0, 0, 2, 0x65, 9}, key: true},
+			}})),
+			want: [][]byte{{0x67, 1}, {0x68, 2}, {0x65, 9}},
+		},
+		{
+			name: "h265",
+			path: writeSegment(t, h265Segment([]byte{0x40, 1}, []byte{0x42, 1}, []byte{0x44, 1}, [][]sample{{
+				{duration: 40, data: []byte{0, 0, 0, 2, 0x26, 9}, key: true},
+			}})),
+			want: [][]byte{{0x40, 1}, {0x42, 1}, {0x44, 1}, {0x26, 9}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info, err := ParseSegment(tt.path)
+			require.NoError(t, err)
+			f, err := os.Open(tt.path)
+			require.NoError(t, err)
+			defer f.Close()
+			data := make([]byte, info.Samples[0].Size)
+			_, err = f.ReadAt(data, info.Samples[0].Offset)
+			require.NoError(t, err)
+
+			annexB := prependParameterSets(info, lengthPrefixedToAnnexB(data))
+			mux := psmux.New()
+			mux.SetVideoCodec(info.Codec)
+			nalus, err := platform.NewPSDemuxer().FeedAU(mux.WriteAU(annexB, 90000, true), 9000, true)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, nalus)
+		})
+	}
+}
+
 func TestParseSegmentUsesTrackDefaults(t *testing.T) {
 	sampleData := []byte{0, 0, 0, 1, 0x65}
 	moof, offset := defaultMoof(sampleData)
 	binary.BigEndian.PutUint32(moof[offset:offset+4], uint32(len(moof)+8))
-	data := append(box("ftyp", []byte("isom\x00\x00\x02\x00isomiso6")), moov(avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2})))...)
+	data := append(makeBox("ftyp", []byte("isom\x00\x00\x02\x00isomiso6")), moov(avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2})))...)
 	data = append(data, moof...)
-	data = append(data, box("mdat", sampleData)...)
+	data = append(data, makeBox("mdat", sampleData)...)
 
-	got, err := mp4.ParseSegment(writeSegment(t, data))
+	got, err := ParseSegment(writeSegment(t, data))
 	require.NoError(t, err)
 	require.Equal(t, uint32(40), got.Samples[0].Duration)
 	require.Equal(t, uint32(len(sampleData)), got.Samples[0].Size)
 	require.True(t, got.Samples[0].IsKeyFrame)
+}
+
+func TestParseSegmentStandardVersion1Tkhd(t *testing.T) {
+	sps, pps := []byte{0x67, 1}, []byte{0x68, 2}
+	path := writeSegment(t, fragmentedFileVersion(avc1Box(avcC(sps, pps)), [][]sample{{
+		{duration: 40, data: []byte{0, 0, 0, 1, 0x65}, key: true},
+	}}, 1))
+
+	got, err := ParseSegment(path)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1000), got.Timescale)
+	require.Len(t, got.Samples, 1)
+}
+
+func TestParseSegmentRejectsNestedBoxBudget(t *testing.T) {
+	var nested []byte
+	for i := 0; i < 100001; i++ {
+		nested = append(nested, makeBox("free", nil)...)
+	}
+	base := moov(avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2})))
+	largeMoov := makeBox("moov", append(base[8:], makeBox("mvex", nested)...))
+	data := append(makeBox("ftyp", []byte("isom\x00\x00\x02\x00isomiso6")), largeMoov...)
+
+	err := parseError(t, data)
+	require.ErrorIs(t, err, ErrInvalid)
+}
+
+func TestParseSegmentRejectsGrowthAndTruncationBeforeFinalStat(t *testing.T) {
+	valid := h264Segment([]byte{0x67, 1}, []byte{0x68, 2}, [][]sample{{
+		{duration: 40, data: []byte{0, 0, 0, 1, 0x65}, key: true},
+	}})
+	for _, tc := range []struct {
+		name  string
+		write func(string) error
+	}{
+		{"growth", func(path string) error {
+			f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			_, err = f.Write([]byte{0})
+			return err
+		}},
+		{"truncation", func(path string) error {
+			return os.Truncate(path, int64(len(valid)-1))
+		}},
+		{"metadata", func(path string) error {
+			st, err := os.Stat(path)
+			if err != nil {
+				return err
+			}
+			return os.Chtimes(path, st.ModTime(), st.ModTime().Add(time.Second))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeSegment(t, valid)
+			var writeErr error
+			_, err := parseSegment(path, func() { writeErr = tc.write(path) })
+			require.NoError(t, writeErr)
+			require.ErrorIs(t, err, ErrChanged)
+		})
+	}
 }
 
 func TestParseSegmentRejectsTruncatedAndInvalidFiles(t *testing.T) {
@@ -77,12 +185,12 @@ func TestParseSegmentRejectsTruncatedAndInvalidFiles(t *testing.T) {
 
 	truncated := append([]byte(nil), valid[:len(valid)-1]...)
 	err := parseError(t, truncated)
-	require.ErrorIs(t, err, mp4.ErrTruncated)
+	require.ErrorIs(t, err, ErrTruncated)
 
 	badSize := append([]byte(nil), valid...)
 	binary.BigEndian.PutUint32(badSize[:4], 4)
 	err = parseError(t, badSize)
-	require.ErrorIs(t, err, mp4.ErrInvalid)
+	require.ErrorIs(t, err, ErrInvalid)
 
 	badOffset := h264Segment(sps, pps, [][]sample{{{duration: 40, data: []byte{0, 0, 0, 1, 0x65}, key: true}}})
 	// The first trun data offset is the only sample data locator in this fixture.
@@ -90,19 +198,19 @@ func TestParseSegmentRejectsTruncatedAndInvalidFiles(t *testing.T) {
 	require.NotEqual(t, -1, idx)
 	binary.BigEndian.PutUint32(badOffset[idx+12:idx+16], uint32(len(badOffset)))
 	err = parseError(t, badOffset)
-	require.ErrorIs(t, err, mp4.ErrInvalid)
+	require.ErrorIs(t, err, ErrInvalid)
 
 	badCount := h264Segment(sps, pps, [][]sample{{{duration: 40, data: []byte{0, 0, 0, 1, 0x65}, key: true}}})
 	idx = bytes.Index(badCount, []byte("trun"))
 	binary.BigEndian.PutUint32(badCount[idx+8:idx+12], 100001)
 	err = parseError(t, badCount)
-	require.ErrorIs(t, err, mp4.ErrInvalid)
+	require.ErrorIs(t, err, ErrInvalid)
 
 	badConfig := h264Segment(sps, pps, [][]sample{{{duration: 40, data: []byte{0, 0, 0, 1, 0x65}, key: true}}})
 	idx = bytes.Index(badConfig, []byte("avcC"))
 	binary.BigEndian.PutUint16(badConfig[idx+10:idx+12], 0xffff)
 	err = parseError(t, badConfig)
-	require.ErrorIs(t, err, mp4.ErrInvalid)
+	require.ErrorIs(t, err, ErrInvalid)
 }
 
 type sample struct {
@@ -121,8 +229,35 @@ func writeSegment(t *testing.T, data []byte) string {
 func parseError(t *testing.T, data []byte) error {
 	t.Helper()
 	path := writeSegment(t, data)
-	_, err := mp4.ParseSegment(path)
+	_, err := ParseSegment(path)
 	return err
+}
+
+func prependParameterSets(info *cascade.SegmentInfo, annexB []byte) []byte {
+	var out []byte
+	sets := [][]byte{info.SPS, info.PPS}
+	if info.Codec == "h265" {
+		sets = [][]byte{info.VPS, info.SPS, info.PPS}
+	}
+	for _, set := range sets {
+		out = append(out, 0, 0, 0, 1)
+		out = append(out, set...)
+	}
+	return append(out, annexB...)
+}
+
+func lengthPrefixedToAnnexB(data []byte) []byte {
+	var out []byte
+	for len(data) >= 4 {
+		n := int(binary.BigEndian.Uint32(data))
+		if n > len(data)-4 {
+			return nil
+		}
+		out = append(out, 0, 0, 0, 1)
+		out = append(out, data[4:4+n]...)
+		data = data[4+n:]
+	}
+	return out
 }
 
 func h264Segment(sps, pps []byte, fragments [][]sample) []byte {
@@ -134,49 +269,68 @@ func h265Segment(vps, sps, pps []byte, fragments [][]sample) []byte {
 }
 
 func fragmentedFile(codecBox []byte, fragments [][]sample) []byte {
-	data := append(box("ftyp", []byte("isom\x00\x00\x02\x00isomiso6")), moov(codecBox)...)
+	return fragmentedFileVersion(codecBox, fragments, 0)
+}
+
+func fragmentedFileVersion(codecBox []byte, fragments [][]sample, tkhdVersion byte) []byte {
+	data := append(makeBox("ftyp", []byte("isom\x00\x00\x02\x00isomiso6")), moovVersion(codecBox, tkhdVersion)...)
 	for i, samples := range fragments {
 		moof, offset := moof(i+1, samples)
 		mdatData := flattenSamples(samples)
 		binary.BigEndian.PutUint32(moof[offset:offset+4], uint32(len(moof)+8))
 		data = append(data, moof...)
-		data = append(data, box("mdat", mdatData)...)
+		data = append(data, makeBox("mdat", mdatData)...)
 	}
 	return data
 }
 
 func moov(codecBox []byte) []byte {
+	return moovVersion(codecBox, 0)
+}
+
+func moovVersion(codecBox []byte, tkhdVersion byte) []byte {
 	mvhd := fullBox("mvhd", 0, 0, make([]byte, 16))
 	binary.BigEndian.PutUint32(mvhd[20:24], 1000)
 	mdhd := fullBox("mdhd", 0, 0, make([]byte, 16))
 	binary.BigEndian.PutUint32(mdhd[20:24], 1000)
-	hdlr := fullBox("hdlr", 0, 0, append(make([]byte, 4), []byte("vide")...))
+	hdlrPayload := make([]byte, 24)
+	copy(hdlrPayload[4:8], "vide")
+	copy(hdlrPayload[16:], "camera")
+	hdlr := fullBox("hdlr", 0, 0, hdlrPayload)
 	stsdPayload := append(make([]byte, 4), codecBox...)
 	binary.BigEndian.PutUint32(stsdPayload, 1)
 	stsd := fullBox("stsd", 0, 0, stsdPayload)
-	tkhd := fullBox("tkhd", 0, 0, append(make([]byte, 8), 0, 0, 0, 1))
-	stbl := box("stbl", stsd)
-	minf := box("minf", stbl)
-	mdia := box("mdia", append(append(mdhd, hdlr...), minf...))
-	trak := box("trak", append(tkhd, mdia...))
-	return box("moov", append(mvhd, trak...))
+	tkhdPayload := make([]byte, 80)
+	if tkhdVersion == 1 {
+		tkhdPayload = make([]byte, 92)
+		binary.BigEndian.PutUint32(tkhdPayload[16:20], 1)
+	}
+	if tkhdVersion == 0 {
+		binary.BigEndian.PutUint32(tkhdPayload[8:12], 1)
+	}
+	tkhd := fullBox("tkhd", uint32(tkhdVersion), 0, tkhdPayload)
+	stbl := makeBox("stbl", stsd)
+	minf := makeBox("minf", stbl)
+	mdia := makeBox("mdia", append(append(mdhd, hdlr...), minf...))
+	trak := makeBox("trak", append(tkhd, mdia...))
+	return makeBox("moov", append(mvhd, trak...))
 }
 
 func avc1Box(config []byte) []byte {
 	payload := append(make([]byte, 78), config...)
-	return box("avc1", payload)
+	return makeBox("avc1", payload)
 }
 
 func hvc1Box(config []byte) []byte {
 	payload := append(make([]byte, 78), config...)
-	return box("hvc1", payload)
+	return makeBox("hvc1", payload)
 }
 
 func avcC(sps, pps []byte) []byte {
 	p := []byte{1, 0x64, 0, 0x1f, 0xff, 0xe1, byte(len(sps) >> 8), byte(len(sps))}
 	p = append(p, sps...)
 	p = append(p, 1, byte(len(pps)>>8), byte(len(pps)))
-	return box("avcC", append(p, pps...))
+	return makeBox("avcC", append(p, pps...))
 }
 
 func hvcC(vps, sps, pps []byte) []byte {
@@ -186,7 +340,7 @@ func hvcC(vps, sps, pps []byte) []byte {
 		p = append(p, 0x80|typ, 0, 1, byte(len(nalu)>>8), byte(len(nalu)))
 		p = append(p, nalu...)
 	}
-	return box("hvcC", p)
+	return makeBox("hvcC", p)
 }
 
 func moof(sequence int, samples []sample) ([]byte, int) {
@@ -203,22 +357,23 @@ func moof(sequence int, samples []sample) ([]byte, int) {
 		}
 	}
 	trun := fullBox("trun", 0, 0x701, trunPayload)
-	traf := box("traf", append(tfhd, trun...))
-	moof := box("moof", append(fullBox("mfhd", 0, 0, []byte{0, 0, 0, byte(sequence)}), traf...))
+	traf := makeBox("traf", append(tfhd, trun...))
+	moof := makeBox("moof", append(fullBox("mfhd", 0, 0, []byte{0, 0, 0, byte(sequence)}), traf...))
 	// trun's data_offset starts 16 bytes after the box's type field.
 	return moof, 8 + 16 + 8 + 16 + 16
 }
 
 func defaultMoof(sampleData []byte) ([]byte, int) {
-	tfhdPayload := make([]byte, 16)
+	tfhdPayload := make([]byte, 20)
 	binary.BigEndian.PutUint32(tfhdPayload[0:4], 1)
-	binary.BigEndian.PutUint32(tfhdPayload[4:8], 40)
-	binary.BigEndian.PutUint32(tfhdPayload[8:12], uint32(len(sampleData)))
-	tfhd := fullBox("tfhd", 0, 0x020038, tfhdPayload)
+	binary.BigEndian.PutUint32(tfhdPayload[4:8], 1)
+	binary.BigEndian.PutUint32(tfhdPayload[8:12], 40)
+	binary.BigEndian.PutUint32(tfhdPayload[12:16], uint32(len(sampleData)))
+	tfhd := fullBox("tfhd", 0, 0x02003a, tfhdPayload)
 	trun := fullBox("trun", 0, 1, make([]byte, 8))
 	binary.BigEndian.PutUint32(trun[12:16], 1)
-	traf := box("traf", append(tfhd, trun...))
-	moof := box("moof", append(fullBox("mfhd", 0, 0, []byte{0, 0, 0, 1}), traf...))
+	traf := makeBox("traf", append(tfhd, trun...))
+	moof := makeBox("moof", append(fullBox("mfhd", 0, 0, []byte{0, 0, 0, 1}), traf...))
 	return moof, bytes.Index(moof, []byte("trun")) + 12
 }
 
@@ -233,10 +388,10 @@ func flattenSamples(samples []sample) []byte {
 func fullBox(typ string, version, flags uint32, payload []byte) []byte {
 	h := make([]byte, 4)
 	binary.BigEndian.PutUint32(h, version<<24|flags)
-	return box(typ, append(h, payload...))
+	return makeBox(typ, append(h, payload...))
 }
 
-func box(typ string, payload []byte) []byte {
+func makeBox(typ string, payload []byte) []byte {
 	out := make([]byte, 8+len(payload))
 	binary.BigEndian.PutUint32(out, uint32(len(out)))
 	copy(out[4:8], typ)

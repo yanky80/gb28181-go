@@ -18,10 +18,13 @@ var (
 	ErrInvalid = errors.New("mp4: invalid fragmented MP4")
 	// ErrTruncated reports a file that ends before a declared box or table.
 	ErrTruncated = errors.New("mp4: truncated fragmented MP4")
+	// ErrChanged reports a file whose size or stat metadata changed mid-parse.
+	ErrChanged = errors.New("mp4: segment changed during parse")
 )
 
 const (
 	maxBoxes      = 100_000
+	maxMetadata   = 100_000
 	maxSamples    = 100_000
 	maxConfigSize = 1 << 20
 	// ponytail: 16 MiB sample cap bounds playback allocation; raise only with
@@ -29,10 +32,14 @@ const (
 	maxSampleSize = 16 << 20
 )
 
-// ParseSegment parses one complete fragmented MP4 segment. The returned
-// offsets point into path and sample payloads retain their MP4 length-prefix
-// framing, as required by cascade playback.
+// ParseSegment parses one complete fragmented MP4 recording made of one or
+// more fragments. Returned offsets point into path, and sample payloads retain
+// their MP4 length-prefix framing for cascade playback.
 func ParseSegment(path string) (*cascade.SegmentInfo, error) {
+	return parseSegment(path, nil)
+}
+
+func parseSegment(path string, beforeFinalStat func()) (*cascade.SegmentInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("mp4: open %s: %w", path, err)
@@ -45,12 +52,28 @@ func ParseSegment(path string) (*cascade.SegmentInfo, error) {
 	if st.Size() < 8 {
 		return nil, fmt.Errorf("%w: file is too short", ErrTruncated)
 	}
-	return (&parser{r: f, size: st.Size()}).parse()
+	info, err := (&parser{r: f, size: st.Size()}).parse()
+	if err != nil {
+		return nil, err
+	}
+	if beforeFinalStat != nil {
+		beforeFinalStat()
+	}
+	end, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("mp4: final stat %s: %w", path, err)
+	}
+	if end.Size() != st.Size() || end.Mode() != st.Mode() || !end.ModTime().Equal(st.ModTime()) {
+		return nil, fmt.Errorf("%w: %s", ErrChanged, path)
+	}
+	return info, nil
 }
 
 type parser struct {
-	r    io.ReaderAt
-	size int64
+	r         io.ReaderAt
+	size      int64
+	boxCount  int
+	metaCount int
 }
 
 type box struct {
@@ -60,10 +83,7 @@ type box struct {
 
 func (p *parser) parse() (*cascade.SegmentInfo, error) {
 	var top []box
-	for off, count := int64(0), 0; off < p.size; count++ {
-		if count >= maxBoxes {
-			return nil, invalid("too many top-level boxes")
-		}
+	for off := int64(0); off < p.size; {
 		b, err := p.readBox(off, p.size, true)
 		if err != nil {
 			return nil, err
@@ -168,6 +188,9 @@ func (p *parser) parseMoov(moov box) (*trackInfo, error) {
 					return nil, err
 				}
 				if child.typ == "trex" {
+					if err := p.addMetadata(1); err != nil {
+						return nil, err
+					}
 					flags, data, err := p.fullBox(child)
 					if err != nil {
 						return nil, err
@@ -208,7 +231,7 @@ func (p *parser) parseTrak(trak box) (*trackInfo, bool, error) {
 		}
 		switch b.typ {
 		case "tkhd":
-			v, err := p.readSmall(b, 24)
+			v, err := p.readPrefix(b, 24)
 			if err != nil {
 				return nil, false, err
 			}
@@ -264,7 +287,7 @@ func (p *parser) parseTrak(trak box) (*trackInfo, bool, error) {
 				timescale = binary.BigEndian.Uint32(v[12:16])
 			}
 		case "hdlr":
-			v, err := p.readSmall(b, 24)
+			v, err := p.readPrefix(b, 12)
 			if err != nil {
 				return nil, false, err
 			}
@@ -570,6 +593,12 @@ func (p *parser) parseTraf(traf, moof box, track *trackInfo) ([]cascade.SegmentS
 		}
 		base, off = int64(v), off+8
 	}
+	if flags&0x000002 != 0 {
+		if len(data)-off < 4 {
+			return nil, truncated("short tfhd sample description index")
+		}
+		off += 4
+	}
 	if flags&0x000008 != 0 {
 		if len(data)-off < 4 {
 			return nil, truncated("short tfhd duration")
@@ -611,6 +640,9 @@ func (p *parser) parseTraf(traf, moof box, track *trackInfo) ([]cascade.SegmentS
 		}
 		if uint64(len(out))+uint64(count) > maxSamples {
 			return nil, invalid("sample count exceeds limit")
+		}
+		if err := p.addMetadata(int(count)); err != nil {
+			return nil, err
 		}
 		off := 4
 		dataOffset := cursor
@@ -732,7 +764,28 @@ func (p *parser) readSmall(b box, max int) ([]byte, error) {
 	return v, nil
 }
 
+func (p *parser) readPrefix(b box, n int) ([]byte, error) {
+	if n < 0 || n > 128 {
+		return nil, invalid("prefix size exceeds limit")
+	}
+	if b.end-b.payload < int64(n) {
+		return nil, truncated("short box prefix")
+	}
+	v := make([]byte, n)
+	if _, err := p.r.ReadAt(v, b.payload); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, truncated("short box prefix")
+		}
+		return nil, err
+	}
+	return v, nil
+}
+
 func (p *parser) readBox(off, limit int64, allowZero bool) (box, error) {
+	if p.boxCount >= maxBoxes {
+		return box{}, invalid("box budget exceeded")
+	}
+	p.boxCount++
 	if off < 0 || limit < off || limit-off < 8 {
 		return box{}, truncated("short box header")
 	}
@@ -771,6 +824,14 @@ func (p *parser) readBox(off, limit int64, allowZero bool) (box, error) {
 		return box{}, invalid("box offset overflows")
 	}
 	return box{start: off, payload: off + header, end: end, typ: string(h[4:8])}, nil
+}
+
+func (p *parser) addMetadata(n int) error {
+	if n < 0 || p.metaCount > maxMetadata-n {
+		return invalid("metadata budget exceeded")
+	}
+	p.metaCount += n
+	return nil
 }
 
 func inMdat(start, end int64, mdats []box) bool {
