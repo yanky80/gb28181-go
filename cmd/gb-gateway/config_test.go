@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigValidMatrixAndDefaults(t *testing.T) {
@@ -127,6 +129,59 @@ func TestCredentialsFormattingIsRedacted(t *testing.T) {
 		if strings.Contains(got, "top-secret") || !strings.Contains(got, "redacted") {
 			t.Errorf("fmt.Sprintf(%q) = %q, want redacted output", format, got)
 		}
+	}
+}
+
+func TestLoadCredentialsRejectsFIFOWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "credentials.fifo")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "credentials-link")
+	if err := os.Symlink(fifo, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{fifo, link} {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			done := make(chan error, 1)
+			go func() {
+				_, err := LoadCredentials(path)
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "regular") {
+					t.Fatalf("LoadCredentials() error = %v, want non-regular error", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("LoadCredentials() blocked on FIFO")
+			}
+		})
+	}
+}
+
+func TestLoadCredentialsRejectsSpecialPermissionBits(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{"setuid", 0600 | os.ModeSetuid},
+		{"setgid", 0600 | os.ModeSetgid},
+		{"sticky", 0600 | os.ModeSticky},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "credentials")
+			if err := os.WriteFile(path, []byte("sip.password=top-secret\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadCredentials(path); err == nil || !strings.Contains(err.Error(), "0600") {
+				t.Fatalf("LoadCredentials() error = %v, want strict 0600 error", err)
+			}
+		})
 	}
 }
 

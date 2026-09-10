@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -497,7 +498,9 @@ func validHostname(host string) bool {
 // LoadCredentials reads key=value secrets from a regular file with exactly
 // 0600 permissions. It never includes credential values in returned errors.
 func LoadCredentials(path string) (Credentials, error) {
-	f, err := os.Open(path)
+	// O_NONBLOCK makes opening a FIFO (including one reached through a
+	// symlink) return immediately; regular-file checks still use this FD.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return Credentials{}, err
 	}
@@ -509,7 +512,7 @@ func LoadCredentials(path string) (Credentials, error) {
 	if !info.Mode().IsRegular() {
 		return Credentials{}, fmt.Errorf("credentials file is not regular")
 	}
-	if info.Mode().Perm() != 0600 {
+	if info.Mode().Perm() != 0600 || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
 		return Credentials{}, fmt.Errorf("credentials file must have 0600 permissions")
 	}
 	values := make(map[string]string)
