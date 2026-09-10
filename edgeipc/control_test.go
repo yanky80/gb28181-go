@@ -134,6 +134,15 @@ func TestControlReaderRejectsInvalidJSONAndOversizedLine(t *testing.T) {
 	}
 }
 
+func TestControlReaderRejectsInvalidUTF8(t *testing.T) {
+	line := []byte("{\"type\":\"error\",\"version\":1,\"code\":\"bad-")
+	line = append(line, 0xff)
+	line = append(line, []byte("\",\"retryable\":false}\n")...)
+	if _, err := NewControlReader(bytes.NewReader(line)).Read(); !errors.Is(err, ErrInvalidJSON) {
+		t.Fatalf("invalid UTF-8 error = %v, want invalid JSON", err)
+	}
+}
+
 func TestControlLineLimitAcceptsExactLFCRLFAndEOF(t *testing.T) {
 	lf := ControlMessage{Type: MessageError, Version: ProtocolVersion, Code: "x"}
 	for len(mustJSON(lf))+1 < MaxControlLine {

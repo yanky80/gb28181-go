@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"unicode/utf8"
 )
 
 const MaxControlLine = 16 << 10
@@ -261,6 +262,9 @@ func decodeControlLine(line []byte) (ControlMessage, error) {
 	line = bytes.TrimSuffix(line, []byte{'\r'})
 	if len(line) == 0 {
 		return ControlMessage{}, ErrInvalidJSON
+	}
+	if !utf8.Valid(line) {
+		return ControlMessage{}, fmt.Errorf("%w: invalid UTF-8", ErrInvalidJSON)
 	}
 	var message ControlMessage
 	if err := json.Unmarshal(line, &message); err != nil {
