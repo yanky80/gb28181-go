@@ -279,6 +279,97 @@ func TestChannelStoreWriteFailureDoesNotPublishMapping(t *testing.T) {
 	}
 }
 
+func TestChannelStoreRetriesAfterDirectoryFault(t *testing.T) {
+	tests := []struct {
+		name     string
+		allocate bool
+		fault    string
+	}{
+		{name: "upsert open", fault: "open"},
+		{name: "upsert sync", fault: "sync"},
+		{name: "allocate open", allocate: true, fault: "open"},
+		{name: "allocate sync", allocate: true, fault: "sync"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "channels.json")
+			store, err := NewChannelStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			originalOpen := openChannelStoreDir
+			originalSync := syncChannelStoreDir
+			t.Cleanup(func() {
+				openChannelStoreDir = originalOpen
+				syncChannelStoreDir = originalSync
+			})
+			if tt.fault == "open" {
+				openChannelStoreDir = func(string) (*os.File, error) {
+					return nil, errors.New("injected directory open failure")
+				}
+			} else {
+				syncChannelStoreDir = func(*os.File) error {
+					return errors.New("injected directory sync failure")
+				}
+			}
+
+			ctx := context.Background()
+			channel := cascade.CascadeChannel{
+				CameraID:    "front",
+				GBChannelID: "34020000001320000001",
+			}
+			if tt.allocate {
+				_, err = store.AllocateCascadeChannel(ctx, channel.CameraID, "3402000000132", channel.Name)
+			} else {
+				err = store.UpsertCascadeChannel(ctx, channel)
+			}
+			if err == nil {
+				t.Fatal("faulted write unexpectedly succeeded")
+			}
+
+			channels, err := store.ListCascadeChannels(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(channels) != 0 {
+				t.Fatalf("channels after failed write = %#v, want empty", channels)
+			}
+
+			openChannelStoreDir = originalOpen
+			syncChannelStoreDir = originalSync
+			if tt.allocate {
+				channel, err = store.AllocateCascadeChannel(ctx, channel.CameraID, "3402000000132", channel.Name)
+			} else {
+				err = store.UpsertCascadeChannel(ctx, channel)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			channels, err = store.ListCascadeChannels(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(channels) != 1 || channels[0].CameraID != channel.CameraID {
+				t.Fatalf("channels after retry = %#v, want %#v", channels, channel)
+			}
+
+			restarted, err := NewChannelStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			persisted, err := restarted.ListCascadeChannels(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(persisted) != 1 || persisted[0].CameraID != channel.CameraID {
+				t.Fatalf("reopened channels = %#v, want %#v", persisted, channel)
+			}
+		})
+	}
+}
+
 func formatSerial(n int) string {
 	return fmt.Sprintf("%07d", n)
 }

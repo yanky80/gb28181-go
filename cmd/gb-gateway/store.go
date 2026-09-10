@@ -26,6 +26,9 @@ var (
 	ErrChannelStoreCorrupt  = errors.New("channel store is corrupt")
 	ErrChannelStoreVersion  = errors.New("unsupported channel store version")
 	ErrChannelStoreConflict = errors.New("channel store mapping conflict")
+
+	openChannelStoreDir = os.Open
+	syncChannelStoreDir = func(directory *os.File) error { return directory.Sync() }
 )
 
 type channelStoreFile struct {
@@ -315,17 +318,15 @@ func (s *ChannelStore) write(channels map[string]cascade.CascadeChannel) error {
 		return fmt.Errorf("replace channel store: %w", err)
 	}
 	removeTemp = false
-	// Rename committed the new snapshot; keep the in-memory view aligned even
-	// if the following directory fsync reports an error.
-	s.channels = channels
 
-	directory, err := os.Open(dir)
+	directory, err := openChannelStoreDir(dir)
 	if err != nil {
 		return fmt.Errorf("open channel store directory: %w", err)
 	}
 	defer directory.Close()
-	if err := directory.Sync(); err != nil {
+	if err := syncChannelStoreDir(directory); err != nil {
 		return fmt.Errorf("sync channel store directory: %w", err)
 	}
+	s.channels = channels
 	return nil
 }
