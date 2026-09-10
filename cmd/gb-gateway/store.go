@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -28,8 +29,8 @@ var (
 )
 
 type channelStoreFile struct {
-	Version  int                   `json:"version"`
-	Channels []channelStoreChannel `json:"channels"`
+	Version  int                    `json:"version"`
+	Channels *[]channelStoreChannel `json:"channels"`
 }
 
 type channelStoreChannel struct {
@@ -39,7 +40,7 @@ type channelStoreChannel struct {
 	UpdatedAt   time.Time `json:"updated_at,omitempty"`
 }
 
-// ChannelStore persists the stable local-camera-to-GB-channel mapping used by
+// ChannelStore persists the stable local camera-to-GB channel mapping used by
 // the gateway. Mutations are serialized so a failed disk write cannot publish
 // an in-memory mapping that was never persisted.
 type ChannelStore struct {
@@ -87,8 +88,11 @@ func (s *ChannelStore) load() error {
 	if file.Version != channelStorePreviousVersion && file.Version != channelStoreVersion {
 		return fmt.Errorf("%w: %d", ErrChannelStoreVersion, file.Version)
 	}
+	if file.Channels == nil {
+		return fmt.Errorf("%w: channels is missing or null", ErrChannelStoreCorrupt)
+	}
 
-	channels, err := validateChannelRows(file.Channels)
+	channels, err := validateChannelRows(*file.Channels)
 	if err != nil {
 		return err
 	}
@@ -142,6 +146,58 @@ func validateChannelMapping(cameraID, gbChannelID string) error {
 	return nil
 }
 
+// AllocateCascadeChannel atomically assigns the next unused serial. Existing
+// mappings are returned unchanged so rename, disablement, and outage do not
+// change the GB channel identity.
+func (s *ChannelStore) AllocateCascadeChannel(ctx context.Context, cameraID, prefix, name string) (cascade.CascadeChannel, error) {
+	if err := ctx.Err(); err != nil {
+		return cascade.CascadeChannel{}, err
+	}
+	if cameraID == "" {
+		return cascade.CascadeChannel{}, errors.New("camera_id is empty")
+	}
+	if len(prefix) != 13 {
+		return cascade.CascadeChannel{}, fmt.Errorf("channel prefix %q must be 13 digits", prefix)
+	}
+	for i := range prefix {
+		if prefix[i] < '0' || prefix[i] > '9' {
+			return cascade.CascadeChannel{}, fmt.Errorf("channel prefix %q must be 13 digits", prefix)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return cascade.CascadeChannel{}, err
+	}
+	if previous, exists := s.channels[cameraID]; exists {
+		return previous, nil
+	}
+
+	maxSerial := 0
+	for _, previous := range s.channels {
+		serial, err := strconv.Atoi(previous.GBChannelID[len(previous.GBChannelID)-7:])
+		if err == nil && serial > maxSerial {
+			maxSerial = serial
+		}
+	}
+	if maxSerial == 9999999 {
+		return cascade.CascadeChannel{}, errors.New("GB channel serial space exhausted")
+	}
+	channel := cascade.CascadeChannel{
+		CameraID:    cameraID,
+		GBChannelID: fmt.Sprintf("%s%07d", prefix, maxSerial+1),
+		Name:        name,
+		UpdatedAt:   time.Now(),
+	}
+	next := cloneChannels(s.channels)
+	next[cameraID] = channel
+	if err := s.write(next); err != nil {
+		return cascade.CascadeChannel{}, err
+	}
+	return channel, nil
+}
+
 // UpsertCascadeChannel adds or updates a local camera's persisted metadata. A
 // local camera's assigned GB channel ID is immutable once it has been stored.
 func (s *ChannelStore) UpsertCascadeChannel(ctx context.Context, ch cascade.CascadeChannel) error {
@@ -171,7 +227,6 @@ func (s *ChannelStore) UpsertCascadeChannel(ctx context.Context, ch cascade.Casc
 	if err := s.write(next); err != nil {
 		return err
 	}
-	s.channels = next
 	return nil
 }
 
@@ -195,7 +250,7 @@ func (s *ChannelStore) ListCascadeChannels(ctx context.Context) ([]cascade.Casca
 }
 
 // Recordings belong to a later gateway capability. Returning an empty result
-// keeps the channel-mapping store compatible with cascade.Store without
+// keeps the GB channel mapping store compatible with cascade.Store without
 // claiming that playback data exists.
 func (s *ChannelStore) ListRecordings(ctx context.Context, _ cascade.RecordingFilter) ([]cascade.Recording, error) {
 	if err := ctx.Err(); err != nil {
@@ -223,7 +278,7 @@ func (s *ChannelStore) write(channels map[string]cascade.CascadeChannel) error {
 		})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].CameraID < rows[j].CameraID })
-	data, err := json.MarshalIndent(channelStoreFile{Version: channelStoreVersion, Channels: rows}, "", "  ")
+	data, err := json.MarshalIndent(channelStoreFile{Version: channelStoreVersion, Channels: &rows}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode channel store: %w", err)
 	}
@@ -260,6 +315,9 @@ func (s *ChannelStore) write(channels map[string]cascade.CascadeChannel) error {
 		return fmt.Errorf("replace channel store: %w", err)
 	}
 	removeTemp = false
+	// Rename committed the new snapshot; keep the in-memory view aligned even
+	// if the following directory fsync reports an error.
+	s.channels = channels
 
 	directory, err := os.Open(dir)
 	if err != nil {

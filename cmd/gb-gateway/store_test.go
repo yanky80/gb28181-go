@@ -123,10 +123,13 @@ func TestChannelStoreRejectsCorruptRows(t *testing.T) {
 		body string
 	}{
 		{"malformed JSON", `{"version":2`},
+		{"half-written row", `{"version":2,"channels":[{"camera_id":"front","gb_channel_id":"340200000013200000`},
 		{"trailing JSON", `{"version":2,"channels":[]} {}`},
-		{"duplicate camera", `{"version":2,"channels":[{"camera_id":"front","gb_channel_id":"34020000001320000001"},{"camera_id":"front","gb_channel_id":"34020000001320000002"}]}`},
-		{"duplicate GB ID", `{"version":2,"channels":[{"camera_id":"front","gb_channel_id":"34020000001320000001"},{"camera_id":"back","gb_channel_id":"34020000001320000001"}]}`},
-		{"invalid GB ID", `{"version":2,"channels":[{"camera_id":"front","gb_channel_id":"not-an-id"}]}`},
+		{"missing channels", `{"version":2}`},
+		{"null channels", `{"version":2,"channels":null}`},
+		{"duplicate local camera", `{"version":2,"channels":[{"camera_id":"front","gb_channel_id":"34020000001320000001"},{"camera_id":"front","gb_channel_id":"34020000001320000002"}]}`},
+		{"duplicate GB channel ID", `{"version":2,"channels":[{"camera_id":"front","gb_channel_id":"34020000001320000001"},{"camera_id":"back","gb_channel_id":"34020000001320000001"}]}`},
+		{"invalid GB channel ID", `{"version":2,"channels":[{"camera_id":"front","gb_channel_id":"not-an-id"}]}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -142,7 +145,7 @@ func TestChannelStoreRejectsCorruptRows(t *testing.T) {
 	}
 }
 
-func TestChannelStoreKeepsMappingStableAndRejectsConflicts(t *testing.T) {
+func TestChannelStoreKeepsLocalCameraMappingStableAndRejectsConflicts(t *testing.T) {
 	store, err := NewChannelStore(filepath.Join(t.TempDir(), "channels.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +174,7 @@ func TestChannelStoreKeepsMappingStableAndRejectsConflicts(t *testing.T) {
 	}
 }
 
-func TestChannelStoreConcurrentUpsertsHaveUniqueMappings(t *testing.T) {
+func TestChannelStoreConcurrentUpsertsHaveUniqueGBChannelMappings(t *testing.T) {
 	store, err := NewChannelStore(filepath.Join(t.TempDir(), "channels.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -209,6 +212,45 @@ func TestChannelStoreConcurrentUpsertsHaveUniqueMappings(t *testing.T) {
 			t.Fatalf("duplicate GB channel ID %q", channel.GBChannelID)
 		}
 		seen[channel.GBChannelID] = true
+	}
+}
+
+func TestChannelStoreAllocatesUniqueGBChannelsConcurrently(t *testing.T) {
+	store, err := NewChannelStore(filepath.Join(t.TempDir(), "channels.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 32
+	var wg sync.WaitGroup
+	results := make(chan cascade.CascadeChannel, count)
+	errs := make(chan error, count)
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			channel, err := store.AllocateCascadeChannel(context.Background(), "camera-"+formatSerial(i+1), "3402000000132", "")
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- channel
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool, count)
+	for channel := range results {
+		if seen[channel.GBChannelID] {
+			t.Fatalf("duplicate allocated GB channel ID %q", channel.GBChannelID)
+		}
+		seen[channel.GBChannelID] = true
+	}
+	if len(seen) != count {
+		t.Fatalf("allocated channel count = %d, want %d", len(seen), count)
 	}
 }
 
