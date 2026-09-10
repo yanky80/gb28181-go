@@ -63,7 +63,7 @@ func (s *Service) catalogItems() ([]manscdp.Item, error) {
 			DeviceID:     chID,
 			Name:         cam.Name,
 			Parental:     0,
-			Status:       "ON",
+			Status:       s.cameraStatus(cam.ID),
 			Manufacturer: orDefault(cam.Brand, s.cfg.CatalogManufacturer()),
 			Model:        orDefault(cam.Model, s.cfg.CatalogModel()),
 			RegisterWay:  1,

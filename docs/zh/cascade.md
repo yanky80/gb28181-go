@@ -30,12 +30,22 @@ type CameraSource interface {
     Hub(cameraID string) *platform.FrameHub // 每台相机的实时帧
 }
 
+// 可选：不改变 CameraSource，提供本地相机当前状态。
+type CameraStatusSource interface {
+    CameraStatus(cameraID string) string // "ON" 或 "OFF"
+}
+
 type Store interface {
     UpsertCascadeChannel(ctx, CascadeChannel) error
     ListCascadeChannels(ctx) ([]CascadeChannel, error)
     ListRecordings(ctx, RecordingFilter) ([]Recording, error)
 }
 ```
+
+实现 `CameraStatusSource` 后，Catalog 和 DeviceStatus 使用动态状态；空值或
+非 `ON` 值均上报 `OFF`。未实现该接缝的旧来源保持目录原有的 `ON` 行为。
+DeviceStatus 同时接受级联本地设备 ID 和已分配的 GB 通道 ID；未知或隐藏通道
+上报 `OFF`，时间使用 `SetGBTimezone` 配置的时区。
 
 接线与启动：
 

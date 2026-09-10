@@ -57,6 +57,13 @@ type CameraSource interface {
 	Hub(cameraID string) *platform.FrameHub
 }
 
+// CameraStatusSource is an optional dynamic status view for CameraSource.
+// Sources that do not implement it retain the historical catalog behavior:
+// every visible camera is reported as ON. An empty or non-ON status is OFF.
+type CameraStatusSource interface {
+	CameraStatus(cameraID string) string
+}
+
 // SubStreamAcquirer grants the cascade access to the on-demand sub-stream
 // tier (#513): one INVITE holds one reference for its lifetime. Nil (or an
 // error) falls back to main-stream forwarding.
@@ -213,6 +220,17 @@ func (s *Service) gbTZ() *time.Location {
 		return s.gbLoc
 	}
 	return time.Local
+}
+
+func (s *Service) cameraStatus(cameraID string) string {
+	src, ok := s.src.(CameraStatusSource)
+	if !ok {
+		return "ON"
+	}
+	if strings.EqualFold(strings.TrimSpace(src.CameraStatus(cameraID)), "ON") {
+		return "ON"
+	}
+	return "OFF"
 }
 
 func (s *Service) Name() string { return "gb28181-cascade" }
@@ -658,6 +676,10 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 		if d, ok := payload.(manscdp.DeviceInfo); ok && d.SN > 0 {
 			s.answerDeviceInfo(u, d.SN)
 		}
+	case manscdp.CmdDeviceStatus:
+		if q, ok := payload.(manscdp.DeviceStatusQuery); ok && q.SN > 0 {
+			s.answerDeviceStatus(u, q.SN, q.DeviceID)
+		}
 	case manscdp.CmdRecordInfo:
 		// Root <Query> carries CmdType RecordInfo (decoded as
 		// RecordInfoQuery); the Response-root form is a device answer that
@@ -707,6 +729,29 @@ func (s *Service) answerDeviceInfo(u *upper, sn int) {
 	if err == nil {
 		if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
 			slog.Warn("gb28181-cascade: deviceinfo response failed", "error", err)
+		}
+	}
+}
+
+func (s *Service) answerDeviceStatus(u *upper, sn int, deviceID string) {
+	status := "OFF"
+	if deviceID == u.cfg.LocalDeviceID {
+		status = "ON"
+	} else if cameraID, ok := s.cameraOfChannel(deviceID); ok {
+		if cam, exists := s.cameraInfo(cameraID); exists && !cam.CascadeHidden {
+			status = s.cameraStatus(cameraID)
+		}
+	}
+	body, err := manscdp.Encode(manscdp.DeviceStatus{
+		CmdType:  manscdp.CmdDeviceStatus,
+		SN:       sn,
+		DeviceID: deviceID,
+		Status:   status,
+		Time:     time.Now().In(s.gbTZ()).Format(gbTimeLayout),
+	})
+	if err == nil {
+		if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
+			slog.Warn("gb28181-cascade: device status response failed", "device", deviceID, "error", err)
 		}
 	}
 }

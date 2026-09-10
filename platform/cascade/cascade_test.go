@@ -17,6 +17,41 @@ type fakeSource struct {
 	cams []CameraInfo
 }
 
+type mutableStatusSource struct {
+	fakeSource
+	mu       sync.RWMutex
+	statuses map[string]string
+}
+
+func (s *mutableStatusSource) Cameras() []CameraInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]CameraInfo(nil), s.fakeSource.cams...)
+}
+
+func (s *mutableStatusSource) CameraStatus(cameraID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.statuses[cameraID]
+}
+
+func (s *mutableStatusSource) SetStatus(cameraID, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statuses[cameraID] = status
+}
+
+func (s *mutableStatusSource) SetCamera(camera CameraInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.fakeSource.cams {
+		if s.fakeSource.cams[i].ID == camera.ID {
+			s.fakeSource.cams[i] = camera
+			return
+		}
+	}
+}
+
 // segByPath backs the injected fake segment parser: tests write raw sample
 // files and register their SegmentInfo here (replaces the source repo's
 // fMP4 writer+parser fixture pair with equivalent pump inputs).
@@ -133,6 +168,23 @@ func TestCatalogItemsAllocatesAndPersists(t *testing.T) {
 	items3, err := svc3.catalogItems()
 	require.NoError(t, err)
 	require.Equal(t, "34020000001320000003", items3[2].DeviceID)
+}
+
+func TestCatalogItemsUsesDynamicCameraStatus(t *testing.T) {
+	src := &mutableStatusSource{
+		fakeSource: fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}},
+		statuses:   map[string]string{"front": "OFF"},
+	}
+	svc := New(testCfg(), src, newCascadeTestDB(t))
+
+	items, err := svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "OFF", items[0].Status)
+
+	src.SetStatus("front", "ON")
+	items, err = svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "ON", items[0].Status)
 }
 
 // TestCatalogHiddenCamerasExcluded verifies catalog convergence: cameras with
