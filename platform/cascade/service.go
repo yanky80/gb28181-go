@@ -456,7 +456,7 @@ func (s *Service) upperOf(req sip.Request) *upper {
 
 func (s *Service) upperForDeviceStatus(req sip.Request) *upper {
 	from, ok := req.From()
-	if !ok {
+	if !ok || from.Address == nil {
 		return nil
 	}
 	user := from.Address.User().String()
@@ -682,13 +682,15 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 400, "Bad MANSCDP", "", nil)
 		return
 	}
-	u := s.upperOf(req)
+	var u *upper
 	if cmd == manscdp.CmdDeviceStatus {
 		u = s.upperForDeviceStatus(req)
 		if u == nil {
 			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 			return
 		}
+	} else {
+		u = s.upperOf(req)
 	}
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	switch cmd {
