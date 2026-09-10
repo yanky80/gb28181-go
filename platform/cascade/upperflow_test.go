@@ -150,7 +150,7 @@ func TestLoopbackMediaPump(t *testing.T) {
 
 	sdp := "v=0\r\no=" + lbUpperDevice + " 0 0 IN IP4 " + lbLocalHost + "\r\ns=Play\r\n" +
 		"c=IN IP4 " + lbLocalHost + "\r\nt=0 0\r\n" +
-		"m=video " + strconv.Itoa(media.LocalAddr().(*net.UDPAddr).Port) + " RTP/AVP 96\r\ny=4242\r\n"
+		"m=video " + strconv.Itoa(media.LocalAddr().(*net.UDPAddr).Port) + " RTP/AVP 96\r\na=recvonly\r\na=rtpmap:96 PS/90000\r\ny=4242\r\n"
 	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, sdp, "application/sdp"))
 	require.Equal(t, 200, int(res.StatusCode()))
 

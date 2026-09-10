@@ -32,6 +32,10 @@ const notifyScanInterval = 10 * time.Second
 // dialog for change-driven NOTIFYs. Non-catalog events get Expires 0 (upper
 // falls back to polling).
 func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
+	u := s.requireUpper(req)
+	if u == nil {
+		return
+	}
 	event := ""
 	for _, h := range req.GetHeaders("Event") {
 		if e, ok := h.(*sip.Event); ok {
@@ -65,7 +69,6 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 		return
 	}
 
-	u := s.upperOf(req)
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()

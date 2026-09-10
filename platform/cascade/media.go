@@ -101,21 +101,70 @@ type inviteSDP struct {
 // seconds are accepted too (both conventions exist in the field).
 func sdpFromInvite(body []byte) (inviteSDP, error) {
 	var sd inviteSDP
+	var hasVideo, hasAudio, hasOtherMedia, hasDirection, hasPS, hasSSRC bool
+	var mediaErr, direction, setup string
 	for _, line := range strings.Split(string(body), "\r\n") {
 		line = strings.TrimSpace(line)
 		switch {
 		case strings.HasPrefix(line, "c=IN IP4 "):
-			sd.host = strings.TrimSpace(strings.TrimPrefix(line, "c=IN IP4"))
-		case strings.HasPrefix(line, "m=video "):
 			fields := strings.Fields(line)
-			if len(fields) >= 3 && fields[2] == "TCP/RTP/AVP" {
-				sd.tcp = true
+			ip := net.ParseIP(strings.TrimSpace(strings.TrimPrefix(line, "c=IN IP4")))
+			if len(fields) != 3 || ip == nil || ip.To4() == nil || ip.IsUnspecified() || ip.IsMulticast() {
+				return sd, fmt.Errorf("invalid c= media address")
 			}
-			if len(fields) >= 2 {
-				sd.port, _ = strconv.Atoi(fields[1])
+			sd.host = fields[2]
+		case strings.HasPrefix(line, "m=video "):
+			if hasVideo {
+				return sd, fmt.Errorf("duplicate m=video media line")
+			}
+			hasVideo = true
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				mediaErr = "invalid m=video line"
+				break
+			}
+			port, err := strconv.Atoi(fields[1])
+			if err != nil || port < 1 || port > 65535 {
+				mediaErr = "invalid video port"
+				break
+			}
+			sd.port = port
+			switch fields[2] {
+			case "RTP/AVP":
+				sd.tcp = false
+			case "TCP/RTP/AVP":
+				sd.tcp = true
+			default:
+				mediaErr = "unsupported media transport"
+			}
+			if fields[3] != "96" {
+				mediaErr = "unsupported PS payload"
+			}
+		case strings.HasPrefix(line, "m=audio "):
+			hasAudio = true
+		case strings.HasPrefix(line, "m="):
+			hasOtherMedia = true
+		case strings.HasPrefix(line, "a=recvonly") || strings.HasPrefix(line, "a=sendonly") || strings.HasPrefix(line, "a=sendrecv") || strings.HasPrefix(line, "a=inactive"):
+			if hasDirection {
+				return sd, fmt.Errorf("multiple media directions")
+			}
+			hasDirection = true
+			direction = strings.TrimPrefix(line, "a=")
+		case strings.HasPrefix(line, "a=setup:"):
+			setup = strings.TrimSpace(strings.TrimPrefix(line, "a=setup:"))
+		case strings.HasPrefix(line, "a=rtpmap:96 "):
+			if strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(line, "a=rtpmap:96 ")), "PS/90000") {
+				hasPS = true
 			}
 		case strings.HasPrefix(line, "y="):
-			v, _ := strconv.ParseUint(strings.TrimPrefix(line, "y="), 10, 32)
+			if hasSSRC {
+				return sd, fmt.Errorf("duplicate SSRC")
+			}
+			hasSSRC = true
+			v, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "y=")), 10, 32)
+			if err != nil || v == 0 {
+				return sd, fmt.Errorf("invalid SSRC")
+			}
 			sd.ssrc = uint32(v)
 		case strings.HasPrefix(line, "s="):
 			sd.name = strings.TrimSpace(strings.TrimPrefix(line, "s="))
@@ -132,8 +181,32 @@ func sdpFromInvite(body []byte) (inviteSDP, error) {
 			}
 		}
 	}
-	if sd.host == "" || sd.port <= 0 {
-		return sd, fmt.Errorf("invite SDP lacks c=/m=video address")
+	if sd.host == "" {
+		return sd, fmt.Errorf("missing c= media address")
+	}
+	if !hasVideo {
+		return sd, fmt.Errorf("missing m=video media line")
+	}
+	if mediaErr != "" {
+		return sd, fmt.Errorf("%s", mediaErr)
+	}
+	if hasAudio || hasOtherMedia {
+		return sd, fmt.Errorf("audio or non-video media is not supported")
+	}
+	if !hasSSRC || sd.ssrc == 0 {
+		return sd, fmt.Errorf("missing SSRC")
+	}
+	if !hasDirection || direction != "recvonly" {
+		return sd, fmt.Errorf("unsupported media direction")
+	}
+	if !hasPS {
+		return sd, fmt.Errorf("unsupported media format; require PS/90000")
+	}
+	if sd.tcp && setup != "passive" {
+		return sd, fmt.Errorf("unsupported TCP setup; require passive")
+	}
+	if !sd.tcp && setup != "" {
+		return sd, fmt.Errorf("setup is only supported for TCP media")
 	}
 	return sd, nil
 }
@@ -154,6 +227,10 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	if s.srv == nil {
 		return
 	}
+	u := s.requireUpper(req)
+	if u == nil {
+		return
+	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
@@ -170,7 +247,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	// Playback/download dialogs take the recordings-backed path (download =
 	// same pump without 1x pacing, #378).
 	if strings.EqualFold(sd.name, "Playback") || strings.EqualFold(sd.name, "Download") {
-		s.onPlaybackInvite(req, callID, channelID, sd)
+		s.onPlaybackInvite(req, callID, channelID, sd, u)
 		return
 	}
 
@@ -178,12 +255,22 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	// for a live playback restarts it when the requested window moved.
 	s.mu.Lock()
 	if ms, ok := s.sessions[callID]; ok {
+		if ms.upper != u {
+			s.mu.Unlock()
+			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+			return
+		}
 		sdp := ms.sdpBody
 		s.mu.Unlock()
 		_, _ = s.srv.RespondOnRequest(req, 200, "OK", sdp, nil)
 		return
 	}
 	if ps, ok := s.playbacks[callID]; ok {
+		if ps.upper != u {
+			s.mu.Unlock()
+			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+			return
+		}
 		sameWindow := sd.hasT && abs64(sd.t0-ps.start.Unix()) < 2 && abs64(sd.t1-ps.end.Unix()) < 2
 		if sameWindow {
 			sdp := ps.sdpBody
@@ -260,7 +347,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 
 	ms := &mediaSession{
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
-		upper: s.upperOf(req),
+		upper: u,
 		conn:  conn, dst: dst, ssrc: sd.ssrc,
 		mux:       psmux.New(),
 		withAudio: strings.Contains(string(req.Body()), "m=audio"),
@@ -506,18 +593,26 @@ func (ms *mediaSession) run(hub *platform.FrameHub) {
 // onBye tears a forward or playback dialog down when the upper platform
 // sends BYE.
 func (s *Service) onBye(req sip.Request, _ sip.ServerTransaction) {
+	u := s.requireUpper(req)
+	if u == nil {
+		return
+	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
 	}
-	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
-
 	s.mu.Lock()
 	ms := s.sessions[callID]
-	delete(s.sessions, callID)
 	ps := s.playbacks[callID]
+	if (ms != nil && ms.upper != u) || (ps != nil && ps.upper != u) {
+		s.mu.Unlock()
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
+	delete(s.sessions, callID)
 	delete(s.playbacks, callID)
 	s.mu.Unlock()
+	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	if ms != nil {
 		ms.close()
 		slog.Info("gb28181-cascade: BYE — forward stopped", "channel", ms.channel)

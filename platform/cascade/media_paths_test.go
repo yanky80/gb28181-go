@@ -26,7 +26,7 @@ func tcpPlaySDP(t *testing.T, tcpPort int) string {
 	return "v=0\r\no=" + lbUpperDevice + " 0 0 IN IP4 " + lbLocalHost + "\r\ns=Play\r\n" +
 		"c=IN IP4 " + lbLocalHost + "\r\nt=0 0\r\n" +
 		"m=video " + strconv.Itoa(tcpPort) + " TCP/RTP/AVP 96\r\n" +
-		"a=setup:passive\r\na=connection:new\r\n" +
+		"a=recvonly\r\na=setup:passive\r\na=connection:new\r\n" +
 		"a=rtpmap:96 PS/90000\r\ny=12345678\r\n"
 }
 
