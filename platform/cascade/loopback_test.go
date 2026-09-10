@@ -189,6 +189,11 @@ func playSDP(t *testing.T, name string, withT bool) string {
 func startLoopbackService(t *testing.T, src CameraSource, db Store) (*Service, *upperSocket) {
 	t.Helper()
 	cfg := testCfg()
+	return startLoopbackServiceWithConfig(t, cfg, src, db)
+}
+
+func startLoopbackServiceWithConfig(t *testing.T, cfg Config, src CameraSource, db Store) (*Service, *upperSocket) {
+	t.Helper()
 	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
 
 	up := newUpperSocket(t, cfg.SIPListen)

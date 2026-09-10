@@ -187,6 +187,65 @@ func TestCatalogItemsUsesDynamicCameraStatus(t *testing.T) {
 	require.Equal(t, "ON", items[0].Status)
 }
 
+func TestCameraStatusNormalizesCaseAndWhitespace(t *testing.T) {
+	src := &mutableStatusSource{
+		fakeSource: fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}},
+		statuses:   map[string]string{"front": " \t oN\n"},
+	}
+	svc := New(testCfg(), src, newCascadeTestDB(t))
+
+	items, err := svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "ON", items[0].Status)
+
+	src.SetStatus("front", " off ")
+	items, err = svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "OFF", items[0].Status)
+}
+
+func TestCameraOfChannelResolvesPersistedIDBeforeCatalog(t *testing.T) {
+	db := newCascadeTestDB(t)
+	require.NoError(t, db.UpsertCascadeChannel(context.Background(), CascadeChannel{
+		CameraID: "front", GBChannelID: "34020000001320000042",
+	}))
+	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}}, db)
+
+	cameraID, ok := svc.cameraOfChannel("34020000001320000042")
+	require.True(t, ok)
+	require.Equal(t, "front", cameraID)
+}
+
+func TestCatalogItemsRejectsMalformedPersistedChannelID(t *testing.T) {
+	db := newCascadeTestDB(t)
+	require.NoError(t, db.UpsertCascadeChannel(context.Background(), CascadeChannel{
+		CameraID: "front", GBChannelID: "short",
+	}))
+	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}}, db)
+
+	require.NotPanics(t, func() {
+		_, err := svc.catalogItems()
+		require.Error(t, err)
+	})
+}
+
+func TestCatalogItemsWithoutStoreResolvesPublishedChannel(t *testing.T) {
+	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}}, nil)
+	items, err := svc.catalogItems()
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+
+	cameraID, ok := svc.cameraOfChannel(items[0].DeviceID)
+	require.True(t, ok)
+	require.Equal(t, "front", cameraID)
+}
+
+func TestUpperForDeviceStatusRejectsUnknownSource(t *testing.T) {
+	svc := New(testCfg(), fakeSource{}, newCascadeTestDB(t))
+	require.Nil(t, svc.upperForDeviceStatus(newFromRequest(t, "unknown-upper")))
+	require.Equal(t, svc.uppers[0], svc.upperForDeviceStatus(newFromRequest(t, testCfg().ServerDomain)))
+}
+
 // TestCatalogHiddenCamerasExcluded verifies catalog convergence: cameras with
 // CascadeHidden are absent from the aggregated catalog, while their persisted
 // channel allocation is kept — re-enabling restores the same channel code.

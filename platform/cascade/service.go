@@ -113,6 +113,7 @@ type Service struct {
 	playbacks  map[string]*playbackSession // SIP Call-ID → active playback dialog
 	subs       map[string]*catalogSub      // catalog subscriptions (SUBSCRIBE → NOTIFY, #370)
 	ptzForward PTZForwarder
+	tzMu       sync.RWMutex
 	gbLoc      *time.Location // GB naive-clock zone (nil → time.Local)
 }
 
@@ -210,12 +211,16 @@ func (s *Service) parseSegment(path string) (*SegmentInfo, error) {
 // set this to the devices' zone.
 func (s *Service) SetGBTimezone(loc *time.Location) {
 	if loc != nil {
+		s.tzMu.Lock()
 		s.gbLoc = loc
+		s.tzMu.Unlock()
 	}
 }
 
 // gbTZ returns the effective GB naive-clock zone.
 func (s *Service) gbTZ() *time.Location {
+	s.tzMu.RLock()
+	defer s.tzMu.RUnlock()
 	if s.gbLoc != nil {
 		return s.gbLoc
 	}
@@ -449,6 +454,20 @@ func (s *Service) upperOf(req sip.Request) *upper {
 	return s.uppers[0]
 }
 
+func (s *Service) upperForDeviceStatus(req sip.Request) *upper {
+	from, ok := req.From()
+	if !ok {
+		return nil
+	}
+	user := from.Address.User().String()
+	for _, u := range s.uppers {
+		if u.cfg.ServerDomain == user {
+			return u
+		}
+	}
+	return nil
+}
+
 // buildCoreRequest assembles a REGISTER/MESSAGE request toward the upper
 // platform on the cascade's own SIP listening port.
 func (s *Service) buildCoreRequest(u *upper, method sip.RequestMethod, localHost string, localPort int, body, contentType string) (sip.Request, error) {
@@ -663,8 +682,15 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 400, "Bad MANSCDP", "", nil)
 		return
 	}
-	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	u := s.upperOf(req)
+	if cmd == manscdp.CmdDeviceStatus {
+		u = s.upperForDeviceStatus(req)
+		if u == nil {
+			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+			return
+		}
+	}
+	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	switch cmd {
 	case manscdp.CmdCatalog:
 		// Queries (root <Query>) come from the upper platform; Response-root

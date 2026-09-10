@@ -141,10 +141,21 @@ func (m *DeviceStatus) normalize() {
 // DeviceStatusQuery is a platform-to-device request for a device or channel's
 // current status.
 type DeviceStatusQuery struct {
-	XMLName  xml.Name `xml:"Query"`
-	CmdType  CmdType  `xml:"CmdType"`
-	SN       int      `xml:"SN"`
-	DeviceID string   `xml:"DeviceID"`
+	XMLName     xml.Name `xml:"Query"`
+	CmdType     CmdType  `xml:"CmdType"`
+	SN          int      `xml:"SN"`
+	DeviceID    string   `xml:"DeviceID"`
+	CmdTypeAttr CmdType  `xml:"CmdType,attr,omitempty"`
+	SNAttr      int      `xml:"SN,attr,omitempty"`
+}
+
+func (m *DeviceStatusQuery) normalize() {
+	if m.CmdType == "" {
+		m.CmdType = m.CmdTypeAttr
+	}
+	if m.SN == 0 {
+		m.SN = m.SNAttr
+	}
 }
 
 // RecordInfo is a device's response to a platform RecordInfo query listing

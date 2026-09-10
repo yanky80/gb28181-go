@@ -10,6 +10,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -136,12 +137,13 @@ func TestLoopbackDeviceInfoQueryAnswer(t *testing.T) {
 }
 
 func TestLoopbackDeviceStatusQueryAnswer(t *testing.T) {
-	db := newCascadeTestDB(t)
 	src := &mutableStatusSource{
 		fakeSource: fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}},
 		statuses:   map[string]string{"cam-1": "OFF"},
 	}
-	svc, up := startLoopbackService(t, src, db)
+	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
+	svc, up := startLoopbackServiceWithConfig(t, cfg, src, nil)
 	gbLoc := time.FixedZone("GB", 8*60*60)
 	svc.SetGBTimezone(gbLoc)
 	_, err := svc.catalogItems()
@@ -169,6 +171,26 @@ func TestLoopbackDeviceStatusQueryAnswer(t *testing.T) {
 	require.Equal(t, "OFF", query(3, "34020099991320000099").Status)
 	src.SetCamera(CameraInfo{ID: "cam-1", Name: "Front", CascadeHidden: true})
 	require.Equal(t, "OFF", query(4, lbChannelOne).Status)
+}
+
+func TestSetGBTimezoneConcurrent(t *testing.T) {
+	svc := New(testCfg(), fakeSource{}, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			svc.SetGBTimezone(time.FixedZone("GB", i*3600))
+		}(i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_ = svc.gbTZ()
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // TestLoopbackMediaPump drives real frames through the hub and asserts RTP
