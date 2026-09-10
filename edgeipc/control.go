@@ -108,7 +108,7 @@ func ValidateControlMessage(message ControlMessage) error {
 			return errors.New("edgeipc: health requires status")
 		}
 	case MessageError:
-		if message.Code == "" || message.Message == "" {
+		if !validErrorCode(message.Code) || message.Message == "" {
 			return errors.New("edgeipc: error requires code and message")
 		}
 	default:
@@ -213,3 +213,14 @@ func codecName(codec Codec) (string, error) {
 }
 
 func validCameraID(cameraID uint16) bool { return cameraID >= 1 && cameraID <= 64 }
+
+func validErrorCode(code string) bool {
+	switch code {
+	case ErrorCodeInvalidJSON, ErrorCodeLineTooLong, ErrorCodeUnsupportedVersion,
+		ErrorCodeUnknownType, ErrorCodeInvalidCodec, ErrorCodeCodecMismatch,
+		ErrorCodeInvalidCameraID, ErrorCodeInvalidMedia:
+		return true
+	default:
+		return false
+	}
+}

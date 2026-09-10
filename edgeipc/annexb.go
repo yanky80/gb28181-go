@@ -1,11 +1,33 @@
 package edgeipc
 
-func validKeyframe(codec Codec, payload []byte) bool {
-	seen := make(map[byte]bool, 4)
-	for _, nal := range annexBNALs(payload) {
+func validAccessUnit(codec Codec, payload []byte) bool {
+	nals := annexBNALs(payload)
+	if len(nals) == 0 {
+		return false
+	}
+	for _, nal := range nals {
 		if len(nal) == 0 {
+			return false
+		}
+		if codec == CodecH264 {
+			if nal[0]&0x80 != 0 {
+				return false
+			}
 			continue
 		}
+		if len(nal) < 2 || nal[0]&0x80 != 0 || nal[1]&0x07 == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func validKeyframe(codec Codec, payload []byte) bool {
+	if !validAccessUnit(codec, payload) {
+		return false
+	}
+	seen := make(map[byte]bool, 4)
+	for _, nal := range annexBNALs(payload) {
 		var typ byte
 		if codec == CodecH264 {
 			typ = nal[0] & 0x1f
@@ -13,9 +35,6 @@ func validKeyframe(codec Codec, payload []byte) bool {
 				seen[typ] = true
 			}
 			continue
-		}
-		if len(nal) < 2 || nal[0]&0x80 != 0 || nal[1]&0x07 == 0 {
-			return false
 		}
 		typ = (nal[0] >> 1) & 0x3f
 		switch typ {

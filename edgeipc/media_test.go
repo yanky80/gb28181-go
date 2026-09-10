@@ -96,7 +96,7 @@ func TestMediaFrameRejectsInvalidHeaderBeforePayloadAllocation(t *testing.T) {
 		{name: "reserved", edit: func(b []byte) { b[10] = 1 }, want: ErrNonZeroReserved},
 		{name: "payload length", edit: func(b []byte) { binary.BigEndian.PutUint32(b[28:32], MaxMediaPayload+1) }, want: ErrPayloadTooLarge},
 	}
-	base, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: 1, Payload: []byte{1}})
+	base, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: 1, Payload: []byte{0, 0, 1, 0x41}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestMediaFrameRejectsInvalidHeaderBeforePayloadAllocation(t *testing.T) {
 }
 
 func TestMediaFrameRejectsTruncatedPayload(t *testing.T) {
-	encoded, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: 1, Payload: []byte{1, 2, 3}})
+	encoded, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: 1, Payload: []byte{0, 0, 1, 0x41}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +157,18 @@ func TestH264IDRRequiresAnIDRAnnexBNAL(t *testing.T) {
 	frame.Payload = []byte{0, 0, 1, 0x41}
 	if _, err := MarshalMediaFrame(frame); !errors.Is(err, ErrInvalidAccessUnit) {
 		t.Fatalf("error = %v, want invalid AU", err)
+	}
+	frame.Payload = []byte{0, 0, 1, 0xe5}
+	if _, err := MarshalMediaFrame(frame); !errors.Is(err, ErrInvalidAccessUnit) {
+		t.Fatalf("forbidden H.264 NAL error = %v, want invalid AU", err)
+	}
+}
+
+func TestMediaFrameRequiresAnnexBAccessUnit(t *testing.T) {
+	for _, codec := range []Codec{CodecH264, CodecH265} {
+		if _, err := MarshalMediaFrame(MediaFrame{Codec: codec, CameraID: 1, Payload: []byte{1, 2}}); !errors.Is(err, ErrInvalidAccessUnit) {
+			t.Fatalf("codec %d error = %v, want invalid AU", codec, err)
+		}
 	}
 }
 

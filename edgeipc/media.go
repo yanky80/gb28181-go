@@ -226,6 +226,9 @@ func writeMediaHeader(header []byte, frame MediaFrame) {
 func validCodec(codec Codec) bool { return codec == CodecH264 || codec == CodecH265 }
 
 func validateMediaAccessUnit(frame MediaFrame) error {
+	if !validAccessUnit(frame.Codec, frame.Payload) {
+		return ErrInvalidAccessUnit
+	}
 	if frame.Flags&FlagIDR != 0 && !validKeyframe(frame.Codec, frame.Payload) {
 		return ErrInvalidAccessUnit
 	}

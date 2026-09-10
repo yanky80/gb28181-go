@@ -90,7 +90,7 @@ func TestControlWriterRejectsOversizedMessageBeforeWriting(t *testing.T) {
 	err := WriteControlMessage(&wire, ControlMessage{
 		Type:    MessageError,
 		Version: ProtocolVersion,
-		Code:    "E",
+		Code:    ErrorCodeInvalidMedia,
 		Message: strings.Repeat("x", MaxControlLine),
 	})
 	if !errors.Is(err, ErrControlLineTooLong) {
@@ -98,6 +98,13 @@ func TestControlWriterRejectsOversizedMessageBeforeWriting(t *testing.T) {
 	}
 	if wire.Len() != 0 {
 		t.Fatalf("writer received %d bytes after rejection", wire.Len())
+	}
+}
+
+func TestControlErrorRejectsUnknownCode(t *testing.T) {
+	message := ControlMessage{Type: MessageError, Version: ProtocolVersion, Code: "BOGUS", Message: "bad"}
+	if err := ValidateControlMessage(message); err == nil {
+		t.Fatal("unknown protocol error code was accepted")
 	}
 }
 
@@ -123,7 +130,7 @@ func TestControlCodecValidationCoversHandshakeAndStart(t *testing.T) {
 }
 
 func TestControlLineLimitAcceptsExactLFAndEOFBoundaries(t *testing.T) {
-	message := ControlMessage{Type: MessageError, Version: ProtocolVersion, Code: "E", Message: "x"}
+	message := ControlMessage{Type: MessageError, Version: ProtocolVersion, Code: ErrorCodeInvalidMedia, Message: "x"}
 	for len(mustJSON(message))+1 < MaxControlLine {
 		message.Message += "x"
 	}
