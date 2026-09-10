@@ -105,6 +105,16 @@ type Service struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// admissionMu serializes INVITE admission with Stop. ponytail: one global
+	// lock keeps lifecycle ordering simple; per-camera admission if throughput
+	// ever makes serialized INVITEs measurable. stopping is set before Stop
+	// waits on the mutex, so new INVITEs reject while an in-flight acquire can
+	// still observe the cancelled service context.
+	admissionMu sync.Mutex
+	stopping    atomic.Bool
+	stopOnce    sync.Once
+	stopErr     error
+
 	srv gosip.Server
 
 	sn atomic.Int64 // MANSCDP sequence numbers
@@ -327,9 +337,19 @@ func (s *Service) Start(ctx context.Context) error {
 }
 
 func (s *Service) Stop() error {
+	s.stopOnce.Do(func() { s.stopErr = s.stop() })
+	return s.stopErr
+}
+
+func (s *Service) stop() error {
+	s.stopping.Store(true)
 	if s.cancel != nil {
 		s.cancel()
 	}
+	// Wait for an INVITE already in the admission critical section. New
+	// INVITEs observe stopping and reject before acquiring any lease.
+	s.admissionMu.Lock()
+	s.admissionMu.Unlock()
 	s.wg.Wait()
 
 	// Best-effort unregister (Expires 0) and BYE of active forwards/playbacks.

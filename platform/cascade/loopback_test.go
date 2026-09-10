@@ -12,6 +12,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -99,6 +100,25 @@ func (u *upperSocket) roundTrip(req sip.Request) sip.Response {
 		}
 	}
 	u.t.Fatalf("roundTrip: no final response for Call-ID %s within 5s", callID)
+	return nil
+}
+
+func (u *upperSocket) awaitResponse(callID string, seq uint) sip.Response {
+	u.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		msg := u.readMessage()
+		res, ok := msg.(sip.Response)
+		if !ok {
+			continue
+		}
+		gotID, idOK := res.CallID()
+		gotSeq, seqOK := res.CSeq()
+		if idOK && seqOK && gotID.String() == callID && uint(gotSeq.SeqNo) == seq && res.StatusCode() >= 200 {
+			return res
+		}
+	}
+	u.t.Fatalf("awaitResponse: no response for Call-ID %s CSeq %d within 5s", callID, seq)
 	return nil
 }
 
@@ -402,6 +422,108 @@ func TestLoopbackSourceOfflineStopsLiveLease(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return acq.releases.Load() == 1 && hub.ConsumerCount() == 0 && len(sessionIDs(svc)) == 0
 	}, 5*time.Second, 20*time.Millisecond, "OFF source must tear down the live session")
+}
+
+func TestLoopbackConcurrentSameCallIDAdmitsOnce(t *testing.T) {
+	hub := platform.NewFrameHub()
+	acq := &fakeMainAcquirer{hub: hub, entered: make(chan struct{}), allow: make(chan struct{})}
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc.SetMainStreamAcquirer(acq)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	invite := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	callID, ok := invite.CallID()
+	require.True(t, ok)
+	reinvite := up.requestDialog(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp", callID)
+	go up.send(invite)
+	select {
+	case <-acq.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first INVITE did not reach the acquirer")
+	}
+	go up.send(reinvite)
+
+	close(acq.allow)
+	up.awaitResponse(callID.String(), 2)
+	require.Eventually(t, func() bool {
+		return acq.calls.Load() == 1 && len(sessionIDs(svc)) == 1 && hub.ConsumerCount() == 1
+	}, 5*time.Second, 20*time.Millisecond, "same Call-ID must leave one admitted session")
+
+	up.send(up.requestDialog(sip.BYE, lbChannelOne, "", "", callID))
+	require.Eventually(t, func() bool {
+		return acq.releases.Load() == 1 && len(sessionIDs(svc)) == 0 && hub.ConsumerCount() == 0
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestLoopbackConcurrentReplacementReclaimsOldSession(t *testing.T) {
+	hub := platform.NewFrameHub()
+	acq := &fakeMainAcquirer{hub: hub}
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc.SetMainStreamAcquirer(acq)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	invite1 := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	invite2 := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	var sends sync.WaitGroup
+	sends.Add(2)
+	go func() { defer sends.Done(); up.send(invite1) }()
+	go func() { defer sends.Done(); up.send(invite2) }()
+	sends.Wait()
+
+	require.Eventually(t, func() bool {
+		return acq.calls.Load() == 2 && acq.releases.Load() == 1 && len(sessionIDs(svc)) == 1 && hub.ConsumerCount() == 1
+	}, 5*time.Second, 20*time.Millisecond, "concurrent replacement must reclaim exactly the old session")
+
+	if id, ok := invite1.CallID(); ok {
+		up.send(up.requestDialog(sip.BYE, lbChannelOne, "", "", id))
+	}
+	if id, ok := invite2.CallID(); ok {
+		up.send(up.requestDialog(sip.BYE, lbChannelOne, "", "", id))
+	}
+	require.Eventually(t, func() bool {
+		return acq.releases.Load() == 2 && len(sessionIDs(svc)) == 0 && hub.ConsumerCount() == 0
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestLoopbackStopWaitsForInFlightInvite(t *testing.T) {
+	hub := platform.NewFrameHub()
+	acq := &fakeMainAcquirer{hub: hub, entered: make(chan struct{}), allow: make(chan struct{}), ignoreCancel: true}
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc.SetMainStreamAcquirer(acq)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	up.send(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+	select {
+	case <-acq.entered:
+	case <-time.After(time.Second):
+		t.Fatal("INVITE did not reach the acquirer")
+	}
+	stopDone := make(chan struct{})
+	go func() {
+		_ = svc.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned before the in-flight INVITE completed")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(acq.allow)
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not complete after the in-flight INVITE was released")
+	}
+	require.Equal(t, int32(1), acq.releases.Load())
+	require.Empty(t, sessionIDs(svc))
+	require.Equal(t, 0, hub.ConsumerCount())
 }
 
 func TestLoopbackSubscribeCatalogNotify(t *testing.T) {
