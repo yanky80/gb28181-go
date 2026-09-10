@@ -76,6 +76,39 @@ func (m ControlMessage) MarshalJSON() ([]byte, error) {
 	return json.Marshal(fields)
 }
 
+func (m *ControlMessage) UnmarshalJSON(data []byte) error {
+	type plain ControlMessage
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for _, field := range requiredZeroValuedFields(decoded.Type) {
+		raw, ok := fields[field]
+		if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return fmt.Errorf("edgeipc: %s requires %s", decoded.Type, field)
+		}
+	}
+	*m = ControlMessage(decoded)
+	return nil
+}
+
+func requiredZeroValuedFields(messageType string) []string {
+	switch messageType {
+	case MessageStop:
+		return []string{"grace_ms"}
+	case MessageHealth:
+		return []string{"infer_fps"}
+	case MessageError:
+		return []string{"retryable"}
+	default:
+		return nil
+	}
+}
+
 func (c Codec) MarshalJSON() ([]byte, error) {
 	name, err := codecName(c)
 	if err != nil {

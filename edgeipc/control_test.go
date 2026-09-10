@@ -95,6 +95,18 @@ func TestControlValidationRejectsInvalidFields(t *testing.T) {
 	}
 }
 
+func TestControlReaderRejectsMissingRequiredZeroValuedFields(t *testing.T) {
+	for _, wire := range []string{
+		`{"type":"stop","version":1,"camera_id":"cam-1","request_id":1}`,
+		`{"type":"health","version":1,"rtsp":"ok","encode":"ok"}`,
+		`{"type":"error","version":1,"code":"failed"}`,
+	} {
+		if _, err := NewControlReader(strings.NewReader(wire + "\n")).Read(); err == nil {
+			t.Fatalf("accepted message with missing required field: %s", wire)
+		}
+	}
+}
+
 func TestControlReaderRejectsInvalidJSONAndOversizedLine(t *testing.T) {
 	if _, err := NewControlReader(strings.NewReader("{\"type\":\"hello\"\n")).Read(); !errors.Is(err, ErrInvalidJSON) {
 		t.Fatalf("invalid JSON error = %v", err)

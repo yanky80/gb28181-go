@@ -171,6 +171,14 @@ func TestMediaFrameRequiresAnnexBAccessUnit(t *testing.T) {
 	}
 }
 
+func TestMediaPayloadUpperBoundIsAccepted(t *testing.T) {
+	payload := make([]byte, MaxMediaPayload)
+	copy(payload, h264AU(0x41))
+	if _, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-1", Payload: payload}); err != nil {
+		t.Fatalf("exact payload limit rejected: %v", err)
+	}
+}
+
 func h264AU(nal byte) []byte { return []byte{0, 0, 1, nal} }
 
 func h265IDRAU() []byte {
