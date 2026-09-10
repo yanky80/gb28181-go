@@ -67,6 +67,24 @@ func TestControlRequiredZeroValuesStayOnWire(t *testing.T) {
 	}
 }
 
+func TestControlHealthZeroInferFPSRoundTrips(t *testing.T) {
+	message := ControlMessage{Type: MessageHealth, Version: ProtocolVersion, RTSP: "ok", InferFPS: 0, Encode: "ok"}
+	var wire bytes.Buffer
+	if err := WriteControlMessage(&wire, message); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(wire.String(), `"infer_fps":0`) {
+		t.Fatalf("health omitted zero infer_fps: %s", wire.String())
+	}
+	got, err := NewControlReader(bytes.NewReader(wire.Bytes())).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != MessageHealth || got.InferFPS != 0 {
+		t.Fatalf("round trip = %+v", got)
+	}
+}
+
 func TestControlRequestIDIsNumeric(t *testing.T) {
 	var wire bytes.Buffer
 	message := ControlMessage{Type: MessageStart, Version: ProtocolVersion, CameraID: "cam-1", RequestID: 7}

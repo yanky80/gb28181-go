@@ -67,6 +67,12 @@ func (m ControlMessage) MarshalJSON() ([]byte, error) {
 			return nil, err
 		}
 	}
+	if m.Type == MessageHealth {
+		fields["infer_fps"], err = json.Marshal(m.InferFPS)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if m.Type == MessageError {
 		fields["retryable"], err = json.Marshal(m.Retryable)
 		if err != nil {
