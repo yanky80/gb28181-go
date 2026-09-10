@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
+
+const MaxControlLine = 16 << 10
 
 const (
 	MessageHello      = "hello"
@@ -20,39 +23,59 @@ const (
 	MessageError      = "error"
 )
 
-const (
-	ErrorCodeInvalidJSON        = "INVALID_JSON"
-	ErrorCodeLineTooLong        = "LINE_TOO_LONG"
-	ErrorCodeUnsupportedVersion = "UNSUPPORTED_VERSION"
-	ErrorCodeUnknownType        = "UNKNOWN_TYPE"
-	ErrorCodeInvalidCodec       = "INVALID_CODEC"
-	ErrorCodeCodecMismatch      = "CODEC_MISMATCH"
-	ErrorCodeInvalidCameraID    = "INVALID_CAMERA_ID"
-	ErrorCodeInvalidMedia       = "INVALID_MEDIA"
-)
-
 var (
 	ErrInvalidJSON        = errors.New("edgeipc: invalid control JSON")
 	ErrControlLineTooLong = errors.New("edgeipc: control line exceeds 16 KiB")
 	ErrUnknownMessageType = errors.New("edgeipc: unknown control message type")
 )
 
-// ControlMessage is the v1 JSONL envelope. Fields not used by a message type
-// are omitted; unknown fields received from a peer are ignored for additive
-// compatibility within protocol version 1.
+// ControlMessage is the v1 JSONL envelope. RequestID is numeric on the wire;
+// CameraID is always a UTF-8 string.
 type ControlMessage struct {
-	Type      string `json:"type"`
-	Version   byte   `json:"version"`
-	RequestID string `json:"request_id,omitempty"`
-	CameraID  uint16 `json:"camera_id,omitempty"`
-	Codec     Codec  `json:"codec,omitempty"`
-	Status    string `json:"status,omitempty"`
-	Code      string `json:"code,omitempty"`
-	Message   string `json:"message,omitempty"`
+	Type        string  `json:"type"`
+	Version     byte    `json:"version"`
+	CameraID    string  `json:"camera_id,omitempty"`
+	PID         int64   `json:"pid,omitempty"`
+	Codecs      []Codec `json:"codecs,omitempty"`
+	StreamEpoch uint64  `json:"stream_epoch,omitempty"`
+	RequestID   uint64  `json:"request_id,omitempty"`
+	GraceMS     uint32  `json:"grace_ms,omitempty"`
+	State       string  `json:"state,omitempty"`
+	Codec       Codec   `json:"codec,omitempty"`
+	Width       uint32  `json:"width,omitempty"`
+	Height      uint32  `json:"height,omitempty"`
+	RTSP        string  `json:"rtsp,omitempty"`
+	InferFPS    float64 `json:"infer_fps,omitempty"`
+	Encode      string  `json:"encode,omitempty"`
+	Code        string  `json:"code,omitempty"`
+	Retryable   bool    `json:"retryable,omitempty"`
 }
 
-// MarshalJSON encodes codecs by their stable wire names rather than enum
-// numbers, keeping the control stream readable by the C++ peer.
+func (m ControlMessage) MarshalJSON() ([]byte, error) {
+	type plain ControlMessage
+	data, err := json.Marshal(plain(m))
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	if m.Type == MessageStop {
+		fields["grace_ms"], err = json.Marshal(m.GraceMS)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if m.Type == MessageError {
+		fields["retryable"], err = json.Marshal(m.Retryable)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(fields)
+}
+
 func (c Codec) MarshalJSON() ([]byte, error) {
 	name, err := codecName(c)
 	if err != nil {
@@ -77,39 +100,44 @@ func (c *Codec) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// ValidateControlMessage validates the common envelope and the required
-// fields for each v1 message type.
+// ValidateControlMessage validates all required fields for the v1 messages.
 func ValidateControlMessage(message ControlMessage) error {
 	if message.Version != ProtocolVersion {
 		return ErrUnsupportedVersion
 	}
 	switch message.Type {
-	case MessageHello, MessageReady:
-		if !validCodec(message.Codec) {
-			return ErrUnsupportedCodec
+	case MessageHello:
+		if !validCameraID(message.CameraID) || message.PID <= 0 || len(message.Codecs) == 0 || message.StreamEpoch == 0 {
+			return errors.New("edgeipc: invalid hello fields")
 		}
-	case MessageStart:
-		if !validCodec(message.Codec) {
-			return ErrUnsupportedCodec
+		for _, codec := range message.Codecs {
+			if !validCodec(codec) {
+				return ErrUnsupportedCodec
+			}
 		}
-		if !validCameraID(message.CameraID) {
-			return ErrInvalidCameraID
+	case MessageStart, MessageRequestIDR:
+		if !validCameraID(message.CameraID) || message.RequestID == 0 {
+			return errors.New("edgeipc: invalid request fields")
 		}
-	case MessageRequestIDR, MessageStop:
-		if !validCameraID(message.CameraID) {
-			return ErrInvalidCameraID
+	case MessageStop:
+		if !validCameraID(message.CameraID) || message.RequestID == 0 {
+			return errors.New("edgeipc: invalid stop fields")
 		}
 	case MessageAck:
-		if message.RequestID == "" {
-			return errors.New("edgeipc: ack requires request_id")
+		if message.RequestID == 0 || message.State == "" {
+			return errors.New("edgeipc: invalid ack fields")
+		}
+	case MessageReady:
+		if !validCodec(message.Codec) || message.Width == 0 || message.Height == 0 {
+			return errors.New("edgeipc: invalid ready fields")
 		}
 	case MessageHealth:
-		if message.Status == "" {
-			return errors.New("edgeipc: health requires status")
+		if message.RTSP == "" || message.Encode == "" || math.IsNaN(message.InferFPS) || math.IsInf(message.InferFPS, 0) || message.InferFPS < 0 {
+			return errors.New("edgeipc: invalid health fields")
 		}
 	case MessageError:
-		if !validErrorCode(message.Code) || message.Message == "" {
-			return errors.New("edgeipc: error requires code and message")
+		if message.Code == "" {
+			return errors.New("edgeipc: error requires code")
 		}
 	default:
 		return ErrUnknownMessageType
@@ -117,8 +145,7 @@ func ValidateControlMessage(message ControlMessage) error {
 	return nil
 }
 
-// ValidateCodecAgreement rejects a peer's attempt to change the configured
-// codec through a hello/ready message or a media frame.
+// ValidateCodecAgreement rejects a peer codec different from configuration.
 func ValidateCodecAgreement(configured, peer Codec) error {
 	if !validCodec(configured) || !validCodec(peer) {
 		return ErrUnsupportedCodec
@@ -129,13 +156,20 @@ func ValidateCodecAgreement(configured, peer Codec) error {
 	return nil
 }
 
-// ValidateControlCodec validates the codec-bearing control messages against
-// the locally configured codec. Other message types carry no codec choice.
+// ValidateControlCodec validates the codec-bearing hello and ready messages.
 func ValidateControlCodec(configured Codec, message ControlMessage) error {
 	if err := ValidateControlMessage(message); err != nil {
 		return err
 	}
-	if message.Type == MessageHello || message.Type == MessageReady || message.Type == MessageStart {
+	if message.Type == MessageHello {
+		for _, peer := range message.Codecs {
+			if err := ValidateCodecAgreement(configured, peer); err == nil {
+				return nil
+			}
+		}
+		return ErrCodecMismatch
+	}
+	if message.Type == MessageReady {
 		return ValidateCodecAgreement(configured, message.Codec)
 	}
 	return nil
@@ -153,12 +187,10 @@ func WriteControlMessage(w io.Writer, message ControlMessage) error {
 	if len(data)+1 > MaxControlLine {
 		return ErrControlLineTooLong
 	}
-	data = append(data, '\n')
-	return writeAll(w, data)
+	return writeAll(w, append(data, '\n'))
 }
 
-// ControlReader reads one JSONL message at a time. It reads directly from the
-// supplied stream so a call never consumes bytes belonging to the next line.
+// ControlReader reads one bounded JSONL message at a time.
 type ControlReader struct{ r *bufio.Reader }
 
 func NewControlReader(r io.Reader) *ControlReader { return &ControlReader{r: bufio.NewReader(r)} }
@@ -209,18 +241,5 @@ func codecName(codec Codec) (string, error) {
 		return "h265", nil
 	default:
 		return "", ErrUnsupportedCodec
-	}
-}
-
-func validCameraID(cameraID uint16) bool { return cameraID >= 1 && cameraID <= 64 }
-
-func validErrorCode(code string) bool {
-	switch code {
-	case ErrorCodeInvalidJSON, ErrorCodeLineTooLong, ErrorCodeUnsupportedVersion,
-		ErrorCodeUnknownType, ErrorCodeInvalidCodec, ErrorCodeCodecMismatch,
-		ErrorCodeInvalidCameraID, ErrorCodeInvalidMedia:
-		return true
-	default:
-		return false
 	}
 }

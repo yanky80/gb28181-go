@@ -8,67 +8,70 @@ import (
 	"testing"
 )
 
-func TestMediaFrameRoundTrip(t *testing.T) {
+func TestMediaFrameRoundTripUsesFrozenHeader(t *testing.T) {
 	want := MediaFrame{
 		Codec:    CodecH265,
-		Flags:    FlagIDR | FlagParameterSets,
-		CameraID: 7,
-		Epoch:    9,
-		Sequence: 42,
-		PTS:      123456789,
+		Flags:    FlagIDR | FlagDiscontinuity,
+		CameraID: "camera-7",
+		PTS90kHz: 123456789,
+		Sequence: 1<<40 + 42,
 		Payload:  h265IDRAU(),
 	}
-
-	encoded, err := MarshalMediaFrame(want)
+	wire, err := MarshalMediaFrame(want)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(encoded)-MediaHeaderSize != len(want.Payload) {
-		t.Fatalf("encoded length = %d, want header + %d", len(encoded), len(want.Payload))
+	if got := binary.BigEndian.Uint16(wire[8:10]); got != MediaHeaderSize {
+		t.Fatalf("header_len = %d, want %d", got, MediaHeaderSize)
 	}
-	if got := binary.BigEndian.Uint16(encoded[8:10]); got != want.CameraID {
-		t.Fatalf("camera id bytes = %d, want %d", got, want.CameraID)
+	if got := binary.BigEndian.Uint16(wire[10:12]); got != uint16(len(want.CameraID)) {
+		t.Fatalf("camera_id_len = %d, want %d", got, len(want.CameraID))
+	}
+	if got := binary.BigEndian.Uint32(wire[12:16]); got != uint32(len(want.Payload)) {
+		t.Fatalf("payload_len = %d, want %d", got, len(want.Payload))
+	}
+	if got := binary.BigEndian.Uint64(wire[16:24]); got != want.PTS90kHz {
+		t.Fatalf("pts = %d, want %d", got, want.PTS90kHz)
+	}
+	if got := binary.BigEndian.Uint64(wire[24:32]); got != want.Sequence {
+		t.Fatalf("sequence = %d, want %d", got, want.Sequence)
 	}
 
-	got, err := ParseMediaFrame(encoded)
+	got, err := ParseMediaFrame(wire)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Codec != want.Codec || got.Flags != want.Flags || got.CameraID != want.CameraID ||
-		got.Epoch != want.Epoch || got.Sequence != want.Sequence || got.PTS != want.PTS ||
-		!bytes.Equal(got.Payload, want.Payload) {
+		got.PTS90kHz != want.PTS90kHz || got.Sequence != want.Sequence || !bytes.Equal(got.Payload, want.Payload) {
 		t.Fatalf("round trip = %+v, want %+v", got, want)
 	}
 }
 
-func TestReadMediaFrameHandlesShortReadsAndKeepsPipelinedFrame(t *testing.T) {
-	first := MediaFrame{Codec: CodecH264, CameraID: 1, Sequence: 1, Payload: []byte{0, 0, 1, 0x65}}
-	second := MediaFrame{Codec: CodecH264, CameraID: 2, Sequence: 2, Payload: []byte{0, 0, 1, 0x41}}
-	one, err := MarshalMediaFrame(first)
+func TestMediaReaderHandlesShortReadsAndPipelining(t *testing.T) {
+	first, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-a", Sequence: 1, Payload: h264AU(0x41)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	two, err := MarshalMediaFrame(second)
+	second, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-b", Sequence: 2, Payload: h264AU(0x41)})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	r := NewMediaReader(&chunkReader{data: append(one, two...), size: 1})
-	gotOne, err := r.Read()
+	reader := NewMediaReader(&chunkReader{data: append(first, second...), size: 1})
+	gotFirst, err := reader.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
-	gotTwo, err := r.Read()
+	gotSecond, err := reader.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotOne.CameraID != first.CameraID || gotTwo.CameraID != second.CameraID {
-		t.Fatalf("read frames = %+v, %+v", gotOne, gotTwo)
+	if gotFirst.CameraID != "cam-a" || gotSecond.CameraID != "cam-b" {
+		t.Fatalf("frames = %+v, %+v", gotFirst, gotSecond)
 	}
 }
 
 func TestConfiguredMediaReaderRejectsPeerCodecBeforePayloadRead(t *testing.T) {
-	wire, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: 1, Payload: []byte{0, 0, 1, 0x41}})
+	wire, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-1", Payload: h264AU(0x41)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,23 +85,24 @@ func TestConfiguredMediaReaderRejectsPeerCodecBeforePayloadRead(t *testing.T) {
 }
 
 func TestMediaFrameRejectsInvalidHeaderBeforePayloadAllocation(t *testing.T) {
+	base, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-1", Payload: h264AU(0x41)})
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name string
 		edit func([]byte)
 		want error
 	}{
-		{name: "magic", edit: func(b []byte) { b[0] = 'x' }, want: ErrInvalidMagic},
-		{name: "version", edit: func(b []byte) { b[4] = 2 }, want: ErrUnsupportedVersion},
-		{name: "header length", edit: func(b []byte) { b[5] = 31 }, want: ErrInvalidHeader},
-		{name: "codec", edit: func(b []byte) { b[6] = 3 }, want: ErrUnsupportedCodec},
-		{name: "flags", edit: func(b []byte) { b[7] = 0x80 }, want: ErrInvalidFlags},
-		{name: "camera", edit: func(b []byte) { binary.BigEndian.PutUint16(b[8:10], 65) }, want: ErrInvalidCameraID},
-		{name: "reserved", edit: func(b []byte) { b[10] = 1 }, want: ErrNonZeroReserved},
-		{name: "payload length", edit: func(b []byte) { binary.BigEndian.PutUint32(b[28:32], MaxMediaPayload+1) }, want: ErrPayloadTooLarge},
-	}
-	base, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: 1, Payload: []byte{0, 0, 1, 0x41}})
-	if err != nil {
-		t.Fatal(err)
+		{"magic", func(b []byte) { b[0] = 'x' }, ErrInvalidMagic},
+		{"version", func(b []byte) { b[4] = 2 }, ErrUnsupportedVersion},
+		{"flags", func(b []byte) { b[5] = 0x04 }, ErrInvalidFlags},
+		{"codec", func(b []byte) { b[6] = 3 }, ErrUnsupportedCodec},
+		{"reserved", func(b []byte) { b[7] = 1 }, ErrNonZeroReserved},
+		{"header length", func(b []byte) { binary.BigEndian.PutUint16(b[8:10], 31) }, ErrInvalidHeader},
+		{"camera length zero", func(b []byte) { binary.BigEndian.PutUint16(b[10:12], 0) }, ErrInvalidCameraID},
+		{"camera length", func(b []byte) { binary.BigEndian.PutUint16(b[10:12], 65) }, ErrInvalidCameraID},
+		{"payload length", func(b []byte) { binary.BigEndian.PutUint32(b[12:16], MaxMediaPayload+1) }, ErrPayloadTooLarge},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -111,74 +115,66 @@ func TestMediaFrameRejectsInvalidHeaderBeforePayloadAllocation(t *testing.T) {
 		})
 	}
 
-	data := append([]byte(nil), base[:MediaHeaderSize]...)
-	binary.BigEndian.PutUint32(data[28:32], MaxMediaPayload+1)
-	_, err = NewMediaReader(bytes.NewReader(data)).Read()
-	if !errors.Is(err, ErrPayloadTooLarge) {
+	headerOnly := append([]byte(nil), base[:MediaHeaderSize]...)
+	binary.BigEndian.PutUint32(headerOnly[12:16], MaxMediaPayload+1)
+	if _, err := NewMediaReader(bytes.NewReader(headerOnly)).Read(); !errors.Is(err, ErrPayloadTooLarge) {
 		t.Fatalf("stream error = %v, want %v", err, ErrPayloadTooLarge)
 	}
 }
 
-func TestMediaFrameRejectsTruncatedPayload(t *testing.T) {
-	encoded, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: 1, Payload: []byte{0, 0, 1, 0x41}})
+func TestMediaFrameRejectsInvalidCameraUTF8AndTruncatedPayload(t *testing.T) {
+	wire, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-1", Payload: h264AU(0x41)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = NewMediaReader(bytes.NewReader(encoded[:len(encoded)-1])).Read()
-	if !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatalf("error = %v, want unexpected EOF", err)
+	badUTF8 := append([]byte(nil), wire...)
+	badUTF8[MediaHeaderSize] = 0xff
+	if _, err := ParseMediaFrame(badUTF8); !errors.Is(err, ErrInvalidUTF8) {
+		t.Fatalf("UTF-8 error = %v, want invalid UTF-8", err)
+	}
+	if _, err := NewMediaReader(bytes.NewReader(wire[:len(wire)-1])).Read(); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated error = %v, want unexpected EOF", err)
 	}
 }
 
-func TestH265IDRRequiresAnnexBParameterSetsAndIDR(t *testing.T) {
-	good := MediaFrame{Codec: CodecH265, Flags: FlagIDR | FlagParameterSets, CameraID: 1, Payload: h265IDRAU()}
-	if _, err := MarshalMediaFrame(good); err != nil {
-		t.Fatalf("valid H.265 IDR rejected: %v", err)
-	}
-	good.Payload = []byte{0, 0, 1, 0x40, 0, 0, 1, 0x42, 0, 0, 1, 0x44, 0, 0, 1, 0x02}
-	if _, err := MarshalMediaFrame(good); !errors.Is(err, ErrInvalidAccessUnit) {
-		t.Fatalf("non-IDR H.265 AU error = %v, want invalid AU", err)
-	}
-	good.Payload = []byte{0, 0, 1, 0x26, 0}
-	if _, err := MarshalMediaFrame(good); !errors.Is(err, ErrInvalidAccessUnit) {
-		t.Fatalf("H.265 IDR without parameter sets error = %v, want invalid AU", err)
-	}
-	good.Payload = []byte{0, 0, 1, 0x40, 1, 0, 0, 1, 0x42, 1, 0, 0, 1, 0x44, 1, 0, 0, 1, 0x26}
-	if _, err := MarshalMediaFrame(good); !errors.Is(err, ErrInvalidAccessUnit) {
-		t.Fatalf("truncated H.265 NAL header error = %v, want invalid AU", err)
-	}
-}
-
-func TestH264IDRRequiresAnIDRAnnexBNAL(t *testing.T) {
-	frame := MediaFrame{Codec: CodecH264, Flags: FlagIDR, CameraID: 1, Payload: []byte{0, 0, 1, 0x65}}
+func TestH265IDRRequiresVPSPSPPSAndIDR(t *testing.T) {
+	frame := MediaFrame{Codec: CodecH265, Flags: FlagIDR, CameraID: "cam-1", Payload: h265IDRAU()}
 	if _, err := MarshalMediaFrame(frame); err != nil {
 		t.Fatal(err)
 	}
-	frame.Payload = []byte{0, 0, 1, 0x41}
+	frame.Payload = []byte{0, 0, 1, 0x40, 1, 0, 0, 1, 0x42, 1, 0, 0, 1, 0x44, 1, 0, 0, 1, 0x02}
+	if _, err := MarshalMediaFrame(frame); !errors.Is(err, ErrInvalidAccessUnit) {
+		t.Fatalf("missing IDR error = %v", err)
+	}
+	frame.Payload = []byte{0, 0, 1, 0x40, 1, 0, 0, 1, 0x42, 1, 0, 0, 1, 0x44, 1, 0, 0, 1, 0x26}
+	if _, err := MarshalMediaFrame(frame); !errors.Is(err, ErrInvalidAccessUnit) {
+		t.Fatalf("truncated H.265 header error = %v", err)
+	}
+}
+
+func TestH264IDRRejectsForbiddenNAL(t *testing.T) {
+	frame := MediaFrame{Codec: CodecH264, Flags: FlagIDR, CameraID: "cam-1", Payload: h264AU(0x65)}
+	if _, err := MarshalMediaFrame(frame); err != nil {
+		t.Fatal(err)
+	}
+	frame.Payload = h264AU(0xe5)
 	if _, err := MarshalMediaFrame(frame); !errors.Is(err, ErrInvalidAccessUnit) {
 		t.Fatalf("error = %v, want invalid AU", err)
-	}
-	frame.Payload = []byte{0, 0, 1, 0xe5}
-	if _, err := MarshalMediaFrame(frame); !errors.Is(err, ErrInvalidAccessUnit) {
-		t.Fatalf("forbidden H.264 NAL error = %v, want invalid AU", err)
 	}
 }
 
 func TestMediaFrameRequiresAnnexBAccessUnit(t *testing.T) {
 	for _, codec := range []Codec{CodecH264, CodecH265} {
-		if _, err := MarshalMediaFrame(MediaFrame{Codec: codec, CameraID: 1, Payload: []byte{1, 2}}); !errors.Is(err, ErrInvalidAccessUnit) {
+		if _, err := MarshalMediaFrame(MediaFrame{Codec: codec, CameraID: "cam-1", Payload: []byte{1, 2}}); !errors.Is(err, ErrInvalidAccessUnit) {
 			t.Fatalf("codec %d error = %v, want invalid AU", codec, err)
 		}
 	}
 }
 
+func h264AU(nal byte) []byte { return []byte{0, 0, 1, nal} }
+
 func h265IDRAU() []byte {
-	return []byte{
-		0, 0, 1, 0x40, 1,
-		0, 0, 1, 0x42, 1,
-		0, 0, 1, 0x44, 1,
-		0, 0, 1, 0x26, 1,
-	}
+	return []byte{0, 0, 1, 0x40, 1, 0, 0, 1, 0x42, 1, 0, 0, 1, 0x44, 1, 0, 0, 1, 0x26, 1}
 }
 
 type chunkReader struct {
