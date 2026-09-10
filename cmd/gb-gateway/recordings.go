@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,6 +64,7 @@ type recordingIndexEvent struct {
 
 type recordingObservation struct {
 	Size        int64
+	ModTime     time.Time
 	StableScans int
 }
 
@@ -175,7 +177,7 @@ func (s *RecordingStore) scanAt(ctx context.Context, now time.Time) error {
 			}
 			id := filepath.ToSlash(rel)
 			seen[id] = true
-			if err := s.indexFile(ctx, id, path, camera.Name(), info.Size()); err != nil {
+			if err := s.indexFile(ctx, id, path, camera.Name(), info); err != nil {
 				return err
 			}
 		}
@@ -193,11 +195,12 @@ func (s *RecordingStore) scanAt(ctx context.Context, now time.Time) error {
 	return nil
 }
 
-func (s *RecordingStore) indexFile(ctx context.Context, id, path, cameraID string, size int64) error {
+func (s *RecordingStore) indexFile(ctx context.Context, id, path, cameraID string, info os.FileInfo) error {
+	size := info.Size()
 	s.mu.Lock()
 	obs, observed := s.observed[id]
-	if !observed || obs.Size != size {
-		obs = recordingObservation{Size: size, StableScans: 1}
+	if !observed || obs.Size != size || !obs.ModTime.Equal(info.ModTime()) {
+		obs = recordingObservation{Size: size, ModTime: info.ModTime(), StableScans: 1}
 	} else {
 		obs.StableScans++
 	}
@@ -211,6 +214,15 @@ func (s *RecordingStore) indexFile(ctx context.Context, id, path, cameraID strin
 		return nil
 	}
 
+	target, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer target.Close()
+	targetInfo, err := target.Stat()
+	if err != nil || !targetInfo.Mode().IsRegular() || targetInfo.Size() != size || !os.SameFile(info, targetInfo) {
+		return nil
+	}
 	metadata, err := s.probe(ctx, path)
 	if err != nil {
 		// A file can still be written or removed between directory enumeration
@@ -223,14 +235,16 @@ func (s *RecordingStore) indexFile(ctx context.Context, id, path, cameraID strin
 	if err := validateProbeResult(metadata); err != nil {
 		return nil
 	}
-	if _, err := os.Stat(path); err != nil {
+	currentInfo, err := os.Stat(path)
+	if err != nil || !currentInfo.Mode().IsRegular() || currentInfo.Size() != size ||
+		!os.SameFile(targetInfo, currentInfo) || !currentInfo.ModTime().Equal(targetInfo.ModTime()) {
 		return nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, ok := s.observed[id]
-	if !ok || current.Size != size || current.StableScans < 2 {
+	if !ok || current.Size != size || !current.ModTime.Equal(targetInfo.ModTime()) || current.StableScans < 2 {
 		return nil
 	}
 	entry := recordingIndexEntry{
@@ -383,7 +397,7 @@ func (s *RecordingStore) Compact(ctx context.Context) error {
 }
 
 func (s *RecordingStore) load() error {
-	f, err := os.Open(s.indexPath)
+	f, err := os.OpenFile(s.indexPath, os.O_RDWR, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -391,15 +405,26 @@ func (s *RecordingStore) load() error {
 		return fmt.Errorf("read recording index: %w", err)
 	}
 	defer f.Close()
-	reader := bufio.NewReader(f)
-	for {
-		line, readErr := reader.ReadBytes('\n')
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("read recording index: %w", err)
+	}
+	lastComplete := 0
+	lines := bytes.SplitAfter(data, []byte{'\n'})
+	for i, line := range lines {
+		complete := len(line) > 0 && line[len(line)-1] == '\n'
 		if len(bytes.TrimSpace(line)) != 0 {
 			var event recordingIndexEvent
 			decodeErr := json.Unmarshal(bytes.TrimSpace(line), &event)
 			if decodeErr != nil {
-				if errors.Is(readErr, io.EOF) {
-					break // crash left a partial final event
+				if i == len(lines)-1 && !complete {
+					if err := f.Truncate(int64(lastComplete)); err != nil {
+						return fmt.Errorf("repair recording index tail: %w", err)
+					}
+					if err := f.Sync(); err != nil {
+						return fmt.Errorf("sync repaired recording index: %w", err)
+					}
+					return nil // crash left a partial final event
 				}
 				return fmt.Errorf("%w: %v", ErrRecordingIndexCorrupt, decodeErr)
 			}
@@ -407,11 +432,17 @@ func (s *RecordingStore) load() error {
 				return err
 			}
 		}
-		if errors.Is(readErr, io.EOF) {
-			break
+		if complete {
+			lastComplete += len(line)
+			continue
 		}
-		if readErr != nil {
-			return fmt.Errorf("read recording index: %w", readErr)
+		if len(bytes.TrimSpace(line)) != 0 {
+			if _, err := f.WriteAt([]byte{'\n'}, int64(len(data))); err != nil {
+				return fmt.Errorf("repair recording index terminator: %w", err)
+			}
+			if err := f.Sync(); err != nil {
+				return fmt.Errorf("sync repaired recording index: %w", err)
+			}
 		}
 	}
 	return nil
@@ -481,16 +512,29 @@ func validateEvent(event recordingIndexEvent) error {
 		return fmt.Errorf("%w: invalid file path for %q", ErrRecordingIndexCorrupt, event.ID)
 	}
 	if event.CameraID == "" || (event.Format != cascade.FormatH264 && event.Format != cascade.FormatH265) ||
-		event.Timescale == 0 || event.Frames < 1 || event.Keyframes == nil ||
+		event.Timescale == 0 || event.Frames < 1 || !validKeyframes(event.Keyframes) ||
 		event.StartedAt.IsZero() || !event.EndedAt.After(event.StartedAt) {
 		return fmt.Errorf("%w: invalid recording %q", ErrRecordingIndexCorrupt, event.ID)
 	}
 	return nil
 }
 
+func validKeyframes(keyframes []recordingKeyframe) bool {
+	if len(keyframes) == 0 {
+		return false
+	}
+	for _, keyframe := range keyframes {
+		if keyframe.TimeMS < 0 || keyframe.Offset < 0 || keyframe.Size <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func validateProbeResult(result recordingProbeResult) error {
 	if (result.Codec != string(cascade.FormatH264) && result.Codec != string(cascade.FormatH265)) ||
-		result.Timescale == 0 || result.Frames < 1 || result.StartedAt.IsZero() || !result.EndedAt.After(result.StartedAt) {
+		result.Timescale == 0 || result.Frames < 1 || result.Keyframes < 1 || len(result.KeyframeAt) != result.Keyframes || !validKeyframes(result.KeyframeAt) ||
+		result.StartedAt.IsZero() || !result.EndedAt.After(result.StartedAt) {
 		return ErrRecordingProbe
 	}
 	return nil
@@ -537,6 +581,10 @@ func probeRecording(ctx context.Context, path string) (recordingProbeResult, err
 	if err != nil {
 		return recordingProbeResult{}, fmt.Errorf("%w: %v", ErrRecordingProbe, err)
 	}
+	return parseRecordingProbeOutput(data)
+}
+
+func parseRecordingProbeOutput(data []byte) (recordingProbeResult, error) {
 	var output ffprobeOutput
 	if err := json.Unmarshal(data, &output); err != nil {
 		return recordingProbeResult{}, fmt.Errorf("%w: invalid JSON: %v", ErrRecordingProbe, err)
@@ -545,7 +593,7 @@ func probeRecording(ctx context.Context, path string) (recordingProbeResult, err
 		return recordingProbeResult{}, fmt.Errorf("%w: no video stream", ErrRecordingProbe)
 	}
 	stream := output.Streams[0]
-	result := recordingProbeResult{Codec: strings.ToLower(stream.CodecName)}
+	result := recordingProbeResult{Codec: normalizeRecordingCodec(stream.CodecName)}
 	if parts := strings.Split(stream.TimeBase, "/"); len(parts) == 2 {
 		if denominator, err := strconv.ParseUint(parts[1], 10, 32); err == nil {
 			result.Timescale = uint32(denominator)
@@ -555,9 +603,18 @@ func probeRecording(ctx context.Context, path string) (recordingProbeResult, err
 	for _, frame := range output.Frames {
 		if frame.KeyFrame == 1 {
 			result.Keyframes++
-			at, _ := strconv.ParseFloat(frame.Time, 64)
-			offset, _ := strconv.ParseInt(frame.Offset, 10, 64)
-			size, _ := strconv.ParseInt(frame.Size, 10, 64)
+			at, err := parseNonNegativeFloat(frame.Time)
+			if err != nil {
+				return recordingProbeResult{}, fmt.Errorf("%w: invalid keyframe time", ErrRecordingProbe)
+			}
+			offset, err := parseNonNegativeInt(frame.Offset)
+			if err != nil {
+				return recordingProbeResult{}, fmt.Errorf("%w: invalid keyframe offset", ErrRecordingProbe)
+			}
+			size, err := parsePositiveInt(frame.Size)
+			if err != nil {
+				return recordingProbeResult{}, fmt.Errorf("%w: invalid keyframe size", ErrRecordingProbe)
+			}
 			result.KeyframeAt = append(result.KeyframeAt, recordingKeyframe{TimeMS: int64(at * 1000), Offset: offset, Size: size})
 		}
 	}
@@ -581,7 +638,45 @@ func probeRecording(ctx context.Context, path string) (recordingProbeResult, err
 		return recordingProbeResult{}, fmt.Errorf("%w: missing absolute timing", ErrRecordingProbe)
 	}
 	result.EndedAt = result.StartedAt.Add(time.Duration(duration * float64(time.Second)))
+	if err := validateProbeResult(result); err != nil {
+		return recordingProbeResult{}, fmt.Errorf("%w: invalid metadata", ErrRecordingProbe)
+	}
 	return result, nil
+}
+
+func normalizeRecordingCodec(codec string) string {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "h264", "avc":
+		return string(cascade.FormatH264)
+	case "h265", "hevc":
+		return string(cascade.FormatH265)
+	default:
+		return ""
+	}
+}
+
+func parseNonNegativeFloat(value string) (float64, error) {
+	v, ok := parseSeconds(value)
+	if !ok || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0, errors.New("not a finite non-negative number")
+	}
+	return v, nil
+}
+
+func parseNonNegativeInt(value string) (int64, error) {
+	v, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || v < 0 {
+		return 0, errors.New("not a non-negative integer")
+	}
+	return v, nil
+}
+
+func parsePositiveInt(value string) (int64, error) {
+	v, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || v <= 0 {
+		return 0, errors.New("not a positive integer")
+	}
+	return v, nil
 }
 
 func parseSeconds(value string) (float64, bool) {

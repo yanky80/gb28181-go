@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -63,6 +62,105 @@ func TestRecordingStoreIndexesOnlyAfterTwoStableScans(t *testing.T) {
 	}
 }
 
+func TestRecordingStoreDoesNotPublishProbeForChangedTarget(t *testing.T) {
+	for _, mutate := range []struct {
+		name string
+		fn   func(string) error
+	}{
+		{"growth", func(path string) error { return os.WriteFile(path, []byte("changed-size"), 0o644) }},
+		{"replacement", func(path string) error {
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+			if err := os.WriteFile(path, []byte("segment"), 0o644); err != nil {
+				return err
+			}
+			stamp := time.Unix(2_000_000_000, 0)
+			return os.Chtimes(path, stamp, stamp)
+		}},
+		{"deletion", os.Remove},
+	} {
+		t.Run(mutate.name, func(t *testing.T) {
+			root := t.TempDir()
+			now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+			path := filepath.Join(root, "front", now.Format("20060102"), "front.mp4")
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("segment"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var probes int
+			probe := func(_ context.Context, _ string) (recordingProbeResult, error) {
+				probes++
+				if probes == 1 {
+					close(started)
+					<-release
+				}
+				start := now
+				if probes > 1 {
+					start = now.Add(time.Minute)
+				}
+				return recordingProbeResult{
+					Codec: "h265", Timescale: 90000, Frames: 1, Keyframes: 1,
+					KeyframeAt: []recordingKeyframe{{TimeMS: 0, Offset: 0, Size: 7}},
+					StartedAt:  start, EndedAt: start.Add(time.Minute),
+				}, nil
+			}
+			store, err := newRecordingStore(filepath.Join(root, "recordings.jsonl"), root, probe)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.scanAt(context.Background(), now); err != nil {
+				t.Fatal(err)
+			}
+			scanDone := make(chan error, 1)
+			go func() { scanDone <- store.scanAt(context.Background(), now) }()
+			<-started
+			if err := mutate.fn(path); err != nil {
+				t.Fatal(err)
+			}
+			close(release)
+			if err := <-scanDone; err != nil {
+				t.Fatal(err)
+			}
+			filter := cascade.RecordingFilter{CameraID: "front", StartTime: now.Add(-time.Minute), EndTime: now.Add(time.Hour)}
+			got, err := store.ListRecordings(context.Background(), filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("changed target published stale metadata: %#v", got)
+			}
+			if mutate.name == "deletion" {
+				return
+			}
+			if err := store.scanAt(context.Background(), now); err != nil {
+				t.Fatal(err)
+			}
+			got, err = store.ListRecordings(context.Background(), filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("changed target indexed before second stable scan: %#v", got)
+			}
+			if err := store.scanAt(context.Background(), now); err != nil {
+				t.Fatal(err)
+			}
+			got, err = store.ListRecordings(context.Background(), filter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 || !got[0].StartedAt.Equal(now.Add(time.Minute)) {
+				t.Fatalf("recording after two new stable scans = %#v", got)
+			}
+		})
+	}
+}
+
 func TestRecordingStoreReloadsWithoutDuplicateAndIgnoresCrashTail(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
@@ -112,6 +210,36 @@ func TestRecordingStoreReloadsWithoutDuplicateAndIgnoresCrashTail(t *testing.T) 
 	if len(got) != 1 {
 		t.Fatalf("reloaded recordings = %#v, want one complete event", got)
 	}
+	if err := restarted.Remove(context.Background(), got[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	restartedAgain, err := newRecordingStore(indexPath, root, probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = restartedAgain.ListRecordings(context.Background(), cascade.RecordingFilter{
+		CameraID: "front", StartTime: now.Add(-time.Minute), EndTime: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("recordings after restart, append, restart = %#v", got)
+	}
+}
+
+func TestRecordingStoreRejectsCompleteMiddleBadLine(t *testing.T) {
+	root := t.TempDir()
+	indexPath := filepath.Join(root, "recordings.jsonl")
+	valid := `{"version":1,"op":"upsert","id":"front/20260911/front.mp4","camera_id":"front","file":"front/20260911/front.mp4","format":"h264","size":7,"started_at":"2026-09-11T04:00:00Z","ended_at":"2026-09-11T04:01:00Z","duration":60,"timescale":90000,"frames":1,"keyframes":[{"time_ms":0,"offset":0,"size":7}]}`
+	if err := os.WriteFile(indexPath, []byte(valid+"\nnot-json\n"+valid+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newRecordingStore(indexPath, root, func(context.Context, string) (recordingProbeResult, error) {
+		return recordingProbeResult{}, errors.New("must not probe corrupt index")
+	}); !errors.Is(err, ErrRecordingIndexCorrupt) {
+		t.Fatalf("newRecordingStore() error = %v, want corrupt index", err)
+	}
 }
 
 func TestRecordingStoreQueryIncludesOverlapSortsAndLimits(t *testing.T) {
@@ -144,7 +272,9 @@ func TestRecordingStoreQueryIncludesOverlapSortsAndLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var probedPaths []string
 	probe := func(_ context.Context, path string) (recordingProbeResult, error) {
+		probedPaths = append(probedPaths, path)
 		name := filepath.Base(path)
 		for _, file := range files {
 			if file.name == name {
@@ -182,6 +312,11 @@ func TestRecordingStoreQueryIncludesOverlapSortsAndLimits(t *testing.T) {
 	}
 	if filepath.Base(got[0].FilePath) != "front_old.mp4" || filepath.Base(got[1].FilePath) != "front_a.mp4" {
 		t.Fatalf("recording order = %q, %q", filepath.Base(got[0].FilePath), filepath.Base(got[1].FilePath))
+	}
+	for _, path := range probedPaths {
+		if path == yesterday {
+			t.Fatalf("yesterday recording was probed: %s", path)
+		}
 	}
 }
 
@@ -281,32 +416,38 @@ func TestRecordingStoreConcurrentCleanupDoesNotAffectOtherResults(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	var wg sync.WaitGroup
-	cleanerDone := make(chan error, 1)
-	wg.Add(1)
+	queryReady := make(chan struct{})
+	startQuery := make(chan struct{})
+	queryResult := make(chan struct {
+		got []cascade.Recording
+		err error
+	}, 1)
 	go func() {
-		defer wg.Done()
-		cleanerDone <- store.Remove(context.Background(), oneID)
+		close(queryReady)
+		<-startQuery
+		got, err := store.ListRecordings(context.Background(), cascade.RecordingFilter{
+			CameraID: "front", StartTime: now.Add(-time.Hour), EndTime: now.Add(time.Hour),
+		})
+		queryResult <- struct {
+			got []cascade.Recording
+			err error
+		}{got: got, err: err}
 	}()
-	filter := cascade.RecordingFilter{CameraID: "front", StartTime: now.Add(-time.Hour), EndTime: now.Add(time.Hour)}
-	for i := 0; i < 100; i++ {
-		got, err := store.ListRecordings(context.Background(), filter)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(got) > 2 {
-			t.Fatalf("concurrent query returned duplicate results: %#v", got)
-		}
-		for _, recording := range got {
-			if recording.ID != oneID && recording.ID != twoID {
-				t.Fatalf("unexpected recording during cleanup: %#v", recording)
-			}
-		}
-	}
-	wg.Wait()
+	<-queryReady
+	cleanerDone := make(chan error, 1)
+	go func() { cleanerDone <- store.Remove(context.Background(), oneID) }()
 	if err := <-cleanerDone; err != nil {
 		t.Fatal(err)
 	}
+	close(startQuery)
+	result := <-queryResult
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if len(result.got) != 1 || result.got[0].ID != twoID {
+		t.Fatalf("barriered concurrent query = %#v, want only %s", result.got, twoID)
+	}
+	filter := cascade.RecordingFilter{CameraID: "front", StartTime: now.Add(-time.Hour), EndTime: now.Add(time.Hour)}
 	got, err := store.ListRecordings(context.Background(), filter)
 	if err != nil {
 		t.Fatal(err)
@@ -319,12 +460,15 @@ func TestRecordingStoreConcurrentCleanupDoesNotAffectOtherResults(t *testing.T) 
 func TestProbeRecordingUsesArgumentAndReadsMetadata(t *testing.T) {
 	dir := t.TempDir()
 	ffprobe := filepath.Join(dir, "ffprobe")
-	output := `{"format":{"start_time":"0","duration":"2","tags":{"creation_time":"2026-09-11T04:00:00Z"}},"streams":[{"codec_name":"h265","time_base":"1/90000","start_time":"0","duration":"2"}],"frames":[{"key_frame":1,"best_effort_timestamp_time":"0","pkt_pos":"100","pkt_size":"42"},{"key_frame":0,"best_effort_timestamp_time":"1","pkt_pos":"142","pkt_size":"20"}]}`
-	if err := os.WriteFile(ffprobe, []byte("#!/bin/sh\nprintf '%s' '"+output+"'\n"), 0o700); err != nil {
+	argsPath := filepath.Join(dir, "args.log")
+	output := `{"format":{"start_time":"0","duration":"2","tags":{"creation_time":"2026-09-11T04:00:00Z"}},"streams":[{"codec_name":"hevc","time_base":"1/90000","start_time":"0","duration":"2"}],"frames":[{"key_frame":1,"best_effort_timestamp_time":"0","pkt_pos":"100","pkt_size":"42"},{"key_frame":0,"best_effort_timestamp_time":"1","pkt_pos":"142","pkt_size":"20"}]}`
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FFPROBE_ARGS_LOG\"\nprintf '%s' '" + output + "'\n"
+	if err := os.WriteFile(ffprobe, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	path := filepath.Join(dir, "clip;not-a-command.mp4")
+	t.Setenv("FFPROBE_ARGS_LOG", argsPath)
+	path := filepath.Join(dir, "clip with spaces;not-a-command.mp4")
 	got, err := probeRecording(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
@@ -334,5 +478,50 @@ func TestProbeRecordingUsesArgumentAndReadsMetadata(t *testing.T) {
 	}
 	if !got.StartedAt.Equal(time.Date(2026, 9, 11, 4, 0, 0, 0, time.UTC)) || !got.EndedAt.Equal(got.StartedAt.Add(2*time.Second)) {
 		t.Fatalf("probe timing = %s..%s", got.StartedAt, got.EndedAt)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := strings.Split(strings.TrimSuffix(string(args), "\n"), "\n")
+	if len(argv) < 1 || argv[len(argv)-1] != path {
+		t.Fatalf("ffprobe argv tail = %q, want literal %q", argv, path)
+	}
+	h264Output := strings.Replace(output, `"codec_name":"hevc"`, `"codec_name":"h264"`, 1)
+	if h264, err := parseRecordingProbeOutput([]byte(h264Output)); err != nil {
+		t.Fatalf("parse h264 probe output: %v", err)
+	} else if h264.Codec != "h264" {
+		t.Fatalf("h264 codec = %q, want h264", h264.Codec)
+	}
+}
+
+func TestRecordingCodecNormalizationKeepsH264AndAcceptsHEVCNames(t *testing.T) {
+	for _, test := range []struct {
+		input, want string
+	}{
+		{"h264", "h264"}, {"avc", "h264"}, {"hevc", "h265"}, {"h265", "h265"},
+	} {
+		if got := normalizeRecordingCodec(test.input); got != test.want {
+			t.Errorf("normalizeRecordingCodec(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
+func TestRecordingProbeRejectsInvalidKeyframeMetadata(t *testing.T) {
+	base := `{"format":{"start_time":"0","duration":"2","tags":{"creation_time":"2026-09-11T04:00:00Z"}},"streams":[{"codec_name":"h264","time_base":"1/90000","start_time":"0","duration":"2"}],"frames":[{"key_frame":1,"best_effort_timestamp_time":"0","pkt_pos":"100","pkt_size":"42"}]}`
+	for _, test := range []struct {
+		name, frame string
+	}{
+		{"bad time", `{"key_frame":1,"best_effort_timestamp_time":"nope","pkt_pos":"100","pkt_size":"42"}`},
+		{"negative offset", `{"key_frame":1,"best_effort_timestamp_time":"0","pkt_pos":"-1","pkt_size":"42"}`},
+		{"negative size", `{"key_frame":1,"best_effort_timestamp_time":"0","pkt_pos":"100","pkt_size":"-1"}`},
+		{"missing keyframe", `{"key_frame":0,"best_effort_timestamp_time":"0","pkt_pos":"100","pkt_size":"42"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := strings.Replace(base, `{"key_frame":1,"best_effort_timestamp_time":"0","pkt_pos":"100","pkt_size":"42"}`, test.frame, 1)
+			if _, err := parseRecordingProbeOutput([]byte(data)); !errors.Is(err, ErrRecordingProbe) {
+				t.Fatalf("parseRecordingProbeOutput() error = %v, want %v", err, ErrRecordingProbe)
+			}
+		})
 	}
 }
