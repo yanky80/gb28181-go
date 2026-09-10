@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,6 +51,8 @@ func TestLoadConfigRejectsInvalidInput(t *testing.T) {
 		{"bad GB id", "gb.server_domain=123\n", "server_domain"},
 		{"bad address", "gb.server_addr=example.com:0\n", "server_addr"},
 		{"bad duration", "gb.heartbeat_interval=0s\n", "heartbeat_interval"},
+		{"stop grace integer overflow", "gb.stop_grace_ms=9223372036854775807\n", "stop_grace_ms"},
+		{"IDR timeout integer overflow", "gb.idr_timeout_ms=9223372036854775807\n", "idr_timeout_ms"},
 		{"bad AU limit", "ipc.max_au_bytes=8388609\n", "max_au_bytes"},
 		{"bad camera id", "cam1.camera_id=../cam\n", "camera_id"},
 		{"bad status dir", "ipc.status_dir=relative/status\n", "status_dir"},
@@ -114,6 +117,16 @@ func TestLoadCredentialsRequires0600AndDoesNotLeakSecret(t *testing.T) {
 	}
 	if _, err := LoadCredentials(path); err == nil || !strings.Contains(err.Error(), "0600") {
 		t.Fatalf("permissions error = %v", err)
+	}
+}
+
+func TestCredentialsFormattingIsRedacted(t *testing.T) {
+	creds := Credentials{values: map[string]string{"sip.password": "top-secret"}}
+	for _, format := range []string{"%v", "%+v", "%#v"} {
+		got := fmt.Sprintf(format, creds)
+		if strings.Contains(got, "top-secret") || !strings.Contains(got, "redacted") {
+			t.Errorf("fmt.Sprintf(%q) = %q, want redacted output", format, got)
+		}
 	}
 }
 

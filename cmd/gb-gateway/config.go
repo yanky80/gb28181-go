@@ -17,6 +17,8 @@ import (
 
 const maxAUBytes = 8 * 1024 * 1024
 
+const maxGatewayTimeoutMS = int64(time.Minute / time.Millisecond)
+
 // Config is the gateway's non-secret configuration. Credentials are loaded
 // separately so ordinary config exports can never contain passwords.
 type Config struct {
@@ -65,6 +67,16 @@ type CameraConfig struct {
 // making accidental config/log serialization possible.
 type Credentials struct {
 	values map[string]string
+}
+
+// Format prevents fmt's map formatting from exposing credential values in
+// logs or exports, including %#v where Stringer would not be sufficient.
+func (c Credentials) Format(state fmt.State, verb rune) {
+	if verb == 'v' && state.Flag('#') {
+		_, _ = io.WriteString(state, "main.Credentials{values:<redacted>}")
+		return
+	}
+	_, _ = io.WriteString(state, "Credentials{<redacted>}")
 }
 
 func (c Credentials) Lookup(key string) (string, bool) {
@@ -216,12 +228,12 @@ func parseTopLevelField(c *Config, key, value string) error {
 	case "gb.media_transport":
 		c.GB.MediaTransport = value
 	case "gb.stop_grace_ms":
-		v, err := strconv.Atoi(value)
-		c.GB.StopGrace = time.Duration(v) * time.Millisecond
+		v, err := parseMilliseconds(value, 0, maxGatewayTimeoutMS)
+		c.GB.StopGrace = v
 		return withFieldError(key, err)
 	case "gb.idr_timeout_ms":
-		v, err := strconv.Atoi(value)
-		c.GB.IDRTimeout = time.Duration(v) * time.Millisecond
+		v, err := parseMilliseconds(value, 1, maxGatewayTimeoutMS)
+		c.GB.IDRTimeout = v
 		return withFieldError(key, err)
 	case "gb.record_playback":
 		v, err := parseBool(value)
@@ -295,6 +307,14 @@ func withFieldError(key string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("invalid %s", key)
+}
+
+func parseMilliseconds(value string, min, max int64) (time.Duration, error) {
+	ms, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || ms < min || ms > max {
+		return 0, errors.New("out of range")
+	}
+	return time.Duration(ms) * time.Millisecond, nil
 }
 
 func configLineError(line int, message string) error {
@@ -477,7 +497,12 @@ func validHostname(host string) bool {
 // LoadCredentials reads key=value secrets from a regular file with exactly
 // 0600 permissions. It never includes credential values in returned errors.
 func LoadCredentials(path string) (Credentials, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return Credentials{}, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
 	if err != nil {
 		return Credentials{}, err
 	}
@@ -487,11 +512,6 @@ func LoadCredentials(path string) (Credentials, error) {
 	if info.Mode().Perm() != 0600 {
 		return Credentials{}, fmt.Errorf("credentials file must have 0600 permissions")
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return Credentials{}, err
-	}
-	defer f.Close()
 	values := make(map[string]string)
 	s := bufio.NewScanner(f)
 	lineNo := 0
