@@ -30,6 +30,14 @@ type CameraSource interface {
     Hub(cameraID string) *platform.FrameHub // 每台相机的实时帧
 }
 
+type CameraStatusSource interface {
+    CameraStatus(cameraID string) string // "ON" 保持直播；其他值收敛直播会话
+}
+
+type MainStreamAcquirer interface {
+    AcquireMainHub(ctx context.Context, cameraID string) (hub *platform.FrameHub, release func(), err error)
+}
+
 type Store interface {
     UpsertCascadeChannel(ctx, CascadeChannel) error
     ListCascadeChannels(ctx) ([]CascadeChannel, error)
@@ -41,6 +49,8 @@ type Store interface {
 
 ```go
 svc := cascade.New(cfg, cameraSource, store)
+// 可选：按每个直播会话 acquire/release 主直播输出
+svc.SetMainStreamAcquirer(mainAcquirer)
 // 可选:按需子码流层
 svc.SetSubStreamAcquirer(subAcquirer)
 // 从录像段回放:

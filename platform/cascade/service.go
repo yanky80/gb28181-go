@@ -64,6 +64,19 @@ type SubStreamAcquirer interface {
 	AcquireSubHub(ctx context.Context, cameraID string) (hub *platform.FrameHub, release func(), err error)
 }
 
+// MainStreamAcquirer grants one live dialog a main-stream lease. Nil keeps the
+// legacy CameraSource.Hub path, where the host owns the stream lifetime.
+type MainStreamAcquirer interface {
+	AcquireMainHub(ctx context.Context, cameraID string) (hub *platform.FrameHub, release func(), err error)
+}
+
+// CameraStatusSource is the optional status seam supplied by hosts that can
+// observe source health. Without it, existing CameraSource implementations
+// retain their historical always-available behavior.
+type CameraStatusSource interface {
+	CameraStatus(cameraID string) string
+}
+
 // upper is one upper-platform registration session (#370): its own REGISTER /
 // keepalive loop and online state over the shared SIP listener. The single
 // legacy config form becomes uppers[0]; gb28181_cascade.upstreams appends
@@ -85,6 +98,8 @@ type Service struct {
 	segParser SegmentParser
 	// subAcq serves sub-stream forwardings (#512); nil = main-only.
 	subAcq SubStreamAcquirer
+	// mainAcq serves live main-stream leases; nil preserves the legacy Hub path.
+	mainAcq MainStreamAcquirer
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -153,6 +168,10 @@ func buildUppers(cfg Config) []*upper {
 // once at wiring time, before Start.
 func (s *Service) SetSubStreamAcquirer(a SubStreamAcquirer) { s.subAcq = a }
 
+// SetMainStreamAcquirer wires the host's main-stream lease provider. Call once
+// at wiring time, before Start.
+func (s *Service) SetMainStreamAcquirer(a MainStreamAcquirer) { s.mainAcq = a }
+
 func New(cfg Config, src CameraSource, db Store) *Service {
 	return &Service{
 		cfg: cfg, src: src, db: db,
@@ -213,6 +232,50 @@ func (s *Service) gbTZ() *time.Location {
 		return s.gbLoc
 	}
 	return time.Local
+}
+
+func (s *Service) cameraStatus(cameraID string) string {
+	src, ok := s.src.(CameraStatusSource)
+	if !ok {
+		return "ON"
+	}
+	if strings.EqualFold(strings.TrimSpace(src.CameraStatus(cameraID)), "ON") {
+		return "ON"
+	}
+	return "OFF"
+}
+
+func (s *Service) cameraAvailable(cameraID string) bool {
+	cam, ok := s.cameraInfo(cameraID)
+	if !ok || cam.CascadeHidden || s.cameraStatus(cameraID) != "ON" {
+		return false
+	}
+	return s.mainAcq != nil || s.src.Hub(cameraID) != nil
+}
+
+func (s *Service) acquireMainHub(cameraID string) (*platform.FrameHub, func(), error) {
+	if s.mainAcq != nil {
+		ctx := context.Background()
+		if s.ctx != nil {
+			ctx = s.ctx
+		}
+		hub, release, err := s.mainAcq.AcquireMainHub(ctx, cameraID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if hub == nil {
+			return nil, nil, errors.New("main stream unavailable")
+		}
+		if release == nil {
+			release = func() {}
+		}
+		return hub, release, nil
+	}
+	hub := s.src.Hub(cameraID)
+	if hub == nil {
+		return nil, nil, errors.New("main stream unavailable")
+	}
+	return hub, func() {}, nil
 }
 
 func (s *Service) Name() string { return "gb28181-cascade" }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,66 @@ func fakeSegmentParser(p string) (*SegmentInfo, error) {
 
 func (f fakeSource) Cameras() []CameraInfo         { return f.cams }
 func (f fakeSource) Hub(string) *platform.FrameHub { return nil }
+
+type fakeMainAcquirer struct {
+	hub      *platform.FrameHub
+	err      error
+	calls    atomic.Int32
+	releases atomic.Int32
+}
+
+func (f *fakeMainAcquirer) AcquireMainHub(context.Context, string) (*platform.FrameHub, func(), error) {
+	f.calls.Add(1)
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	return f.hub, func() { f.releases.Add(1) }, nil
+}
+
+type mutableAvailabilitySource struct {
+	mu     sync.RWMutex
+	cam    CameraInfo
+	hub    *platform.FrameHub
+	status string
+}
+
+func (s *mutableAvailabilitySource) Cameras() []CameraInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return []CameraInfo{s.cam}
+}
+
+func (s *mutableAvailabilitySource) Hub(string) *platform.FrameHub { return s.hub }
+
+func (s *mutableAvailabilitySource) CameraStatus(string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.status
+}
+
+func (s *mutableAvailabilitySource) SetStatus(status string) {
+	s.mu.Lock()
+	s.status = status
+	s.mu.Unlock()
+}
+
+func TestMediaSessionMainLeaseReleasedOnceConcurrently(t *testing.T) {
+	var releases atomic.Int32
+	svc := New(testCfg(), fakeSource{}, nil)
+	ms := &mediaSession{
+		svc:         svc,
+		callID:      "lease-race",
+		channel:     "channel",
+		releaseMain: func() { releases.Add(1) },
+	}
+
+	done := make(chan struct{}, 2)
+	go func() { ms.close(); done <- struct{}{} }()
+	go func() { ms.teardown("concurrent failure"); done <- struct{}{} }()
+	<-done
+	<-done
+	require.Equal(t, int32(1), releases.Load())
+}
 
 func newCascadeTestDB(t *testing.T) *fakeCascadeStore {
 	t.Helper()
