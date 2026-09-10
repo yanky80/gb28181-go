@@ -94,6 +94,10 @@ type RecordingStore struct {
 	probe     recordingProbe
 	entries   map[string]recordingIndexEntry
 	observed  map[string]recordingObservation
+	// snapshotStep is a test-only seam for holding the read snapshot open.
+	snapshotStep func()
+	// removeBeforeLock is a test-only seam for proving Remove overlaps a snapshot.
+	removeBeforeLock func()
 }
 
 // NewRecordingStore loads indexPath, accepting an incomplete final JSONL line
@@ -279,6 +283,9 @@ func (s *RecordingStore) ListRecordings(ctx context.Context, filter cascade.Reco
 		}
 		entry.Keyframes = nil
 		entries = append(entries, entry)
+		if len(entries) == 1 && s.snapshotStep != nil {
+			s.snapshotStep()
+		}
 	}
 	s.mu.RUnlock()
 	if err := ctx.Err(); err != nil {
@@ -310,6 +317,9 @@ func (s *RecordingStore) ListRecordings(ctx context.Context, filter cascade.Reco
 func (s *RecordingStore) Remove(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if s.removeBeforeLock != nil {
+		s.removeBeforeLock()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

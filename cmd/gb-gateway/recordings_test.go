@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -382,7 +383,7 @@ func TestRecordingStoreConcurrentCleanupDoesNotAffectOtherResults(t *testing.T) 
 	root := t.TempDir()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
 	day := now.Format("20060102")
-	for _, name := range []string{"one.mp4", "two.mp4"} {
+	for _, name := range []string{"one.mp4", "two.mp4", "three.mp4"} {
 		path := filepath.Join(root, "front", day, name)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
@@ -395,6 +396,8 @@ func TestRecordingStoreConcurrentCleanupDoesNotAffectOtherResults(t *testing.T) 
 		start := now
 		if filepath.Base(path) == "two.mp4" {
 			start = now.Add(time.Minute)
+		} else if filepath.Base(path) == "three.mp4" {
+			start = now.Add(2 * time.Minute)
 		}
 		return recordingProbeResult{
 			Codec: "h265", Timescale: 90000, Frames: 1, Keyframes: 1,
@@ -416,15 +419,17 @@ func TestRecordingStoreConcurrentCleanupDoesNotAffectOtherResults(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	queryReady := make(chan struct{})
-	startQuery := make(chan struct{})
+	snapshotEntered := make(chan struct{})
+	releaseSnapshot := make(chan struct{})
+	store.snapshotStep = func() {
+		close(snapshotEntered)
+		<-releaseSnapshot
+	}
 	queryResult := make(chan struct {
 		got []cascade.Recording
 		err error
 	}, 1)
 	go func() {
-		close(queryReady)
-		<-startQuery
 		got, err := store.ListRecordings(context.Background(), cascade.RecordingFilter{
 			CameraID: "front", StartTime: now.Add(-time.Hour), EndTime: now.Add(time.Hour),
 		})
@@ -433,28 +438,69 @@ func TestRecordingStoreConcurrentCleanupDoesNotAffectOtherResults(t *testing.T) 
 			err error
 		}{got: got, err: err}
 	}()
-	<-queryReady
-	cleanerDone := make(chan error, 1)
-	go func() { cleanerDone <- store.Remove(context.Background(), oneID) }()
-	if err := <-cleanerDone; err != nil {
-		t.Fatal(err)
+	<-snapshotEntered
+	if store.mu.TryLock() {
+		store.mu.Unlock()
+		t.Fatal("ListRecordings did not hold its read snapshot lock")
 	}
-	close(startQuery)
+	removeAttempted := make(chan struct{})
+	store.removeBeforeLock = func() { close(removeAttempted) }
+	cleanerDone := make(chan error, 1)
+	go func() {
+		cleanerDone <- store.Remove(context.Background(), oneID)
+	}()
+	<-removeAttempted
+	select {
+	case err := <-cleanerDone:
+		t.Fatalf("Remove completed while ListRecordings held its snapshot: %v", err)
+	default:
+	}
+	close(releaseSnapshot)
 	result := <-queryResult
 	if result.err != nil {
 		t.Fatal(result.err)
 	}
-	if len(result.got) != 1 || result.got[0].ID != twoID {
-		t.Fatalf("barriered concurrent query = %#v, want only %s", result.got, twoID)
+	if err := assertRecordingIDs(result.got, oneID, twoID, filepath.ToSlash(filepath.Join("front", day, "three.mp4"))); err != nil {
+		if errAfter := assertRecordingIDs(result.got, twoID, filepath.ToSlash(filepath.Join("front", day, "three.mp4"))); errAfter != nil {
+			t.Fatalf("overlapping query returned neither before nor after snapshot: %v; after check: %v; got %#v", err, errAfter, result.got)
+		}
 	}
+	if err := <-cleanerDone; err != nil {
+		t.Fatal(err)
+	}
+	store.snapshotStep = nil
+	store.removeBeforeLock = nil
 	filter := cascade.RecordingFilter{CameraID: "front", StartTime: now.Add(-time.Hour), EndTime: now.Add(time.Hour)}
 	got, err := store.ListRecordings(context.Background(), filter)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0].ID != twoID {
-		t.Fatalf("remaining recordings = %#v, want %s", got, twoID)
+	if err := assertRecordingIDs(got, twoID, filepath.ToSlash(filepath.Join("front", day, "three.mp4"))); err != nil {
+		t.Fatalf("remaining recordings: %v; got %#v", err, got)
 	}
+}
+
+func assertRecordingIDs(got []cascade.Recording, want ...string) error {
+	if len(got) != len(want) {
+		return fmt.Errorf("got %d recordings, want %d", len(got), len(want))
+	}
+	wantSet := make(map[string]struct{}, len(want))
+	for _, id := range want {
+		if _, exists := wantSet[id]; exists {
+			return fmt.Errorf("duplicate expected ID %s", id)
+		}
+		wantSet[id] = struct{}{}
+	}
+	for _, recording := range got {
+		if _, exists := wantSet[recording.ID]; !exists {
+			return fmt.Errorf("unexpected ID %s", recording.ID)
+		}
+		delete(wantSet, recording.ID)
+	}
+	if len(wantSet) != 0 {
+		return fmt.Errorf("missing IDs %v", wantSet)
+	}
+	return nil
 }
 
 func TestProbeRecordingUsesArgumentAndReadsMetadata(t *testing.T) {
@@ -513,6 +559,10 @@ func TestRecordingProbeRejectsInvalidKeyframeMetadata(t *testing.T) {
 		name, frame string
 	}{
 		{"bad time", `{"key_frame":1,"best_effort_timestamp_time":"nope","pkt_pos":"100","pkt_size":"42"}`},
+		{"N/A time", `{"key_frame":1,"best_effort_timestamp_time":"N/A","pkt_pos":"100","pkt_size":"42"}`},
+		{"negative time", `{"key_frame":1,"best_effort_timestamp_time":"-0.001","pkt_pos":"100","pkt_size":"42"}`},
+		{"NaN time", `{"key_frame":1,"best_effort_timestamp_time":"NaN","pkt_pos":"100","pkt_size":"42"}`},
+		{"Inf time", `{"key_frame":1,"best_effort_timestamp_time":"Inf","pkt_pos":"100","pkt_size":"42"}`},
 		{"negative offset", `{"key_frame":1,"best_effort_timestamp_time":"0","pkt_pos":"-1","pkt_size":"42"}`},
 		{"negative size", `{"key_frame":1,"best_effort_timestamp_time":"0","pkt_pos":"100","pkt_size":"-1"}`},
 		{"missing keyframe", `{"key_frame":0,"best_effort_timestamp_time":"0","pkt_pos":"100","pkt_size":"42"}`},
