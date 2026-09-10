@@ -11,6 +11,30 @@ are released out of band.
 
 ## [Unreleased]
 
+## [v0.9.0] — 2026-09-10
+
+The device-snapshot capability package (mibee-eye-raspi#28): one
+complete user-valuable feature with tests and bilingual docs.
+
+- `feat(device)` snapshot command execution (mibee-eye-raspi#28 / GB/T
+  28181-2022 A.2.1.24 + A.2.5.7): a DeviceControl(SnapShot) MESSAGE is
+  answered 200, handed to the new `device.SnapshotExecutor` seam
+  (`SetSnapshotExecutor`), and completes asynchronously with an
+  UploadSnapShotFinished notify echoing the SessionID plus one
+  SnapShotFileID per uploaded file — an empty list reports the exchange
+  as wholly/partially failed. The executor owns the product side
+  (capture + POST each JPEG body to the command's `UploadURL`
+  verbatim). Without an executor — or over a non-UDP transport — the
+  control is now explicitly rejected (parity with the Rust twin; a
+  fast failure for the platform, where previously the body fell
+  through parseQueryDual's parse-warn + silence).
+
+## [v0.8.0] — 2026-09-09
+
+The snapshot-event capability package (requested by downstream MiBeeNvr
+pin hygiene, issue #66): one complete user-valuable feature with tests
+and bilingual docs.
+
 - `feat(sip)` snapshot-finished event (#54): the 2022 UploadSnapShotFinished
   notify (MESSAGE, A.2.5.7) now publishes `gb28181.snapshot.finished` with
   DeviceID, SessionID, and the SnapShotList — hosts close their pending
@@ -18,7 +42,7 @@ are released out of band.
   failed wholly or partly. Event-bus reads now go through
   `eventBusSnapshot()` (subMu) — `SetEventBus` after Start no longer
   races gosip handler goroutines; the alarm publish path got the same
-  fix.
+  fix. Bilingual topic table in docs/en/platform.md + docs/zh/platform.md.
 
 - `docs` no spec-example password in quickstart (#34): the READMEs and the
   device-register / platform-uas examples pass a placeholder instead of
