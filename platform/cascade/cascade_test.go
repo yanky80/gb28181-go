@@ -52,6 +52,12 @@ func (s *mutableStatusSource) SetCamera(camera CameraInfo) {
 	}
 }
 
+func (s *mutableStatusSource) SetCameras(cams []CameraInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fakeSource.cams = append([]CameraInfo(nil), cams...)
+}
+
 // segByPath backs the injected fake segment parser: tests write raw sample
 // files and register their SegmentInfo here (replaces the source repo's
 // fMP4 writer+parser fixture pair with equivalent pump inputs).
@@ -238,6 +244,37 @@ func TestCatalogItemsWithoutStoreResolvesPublishedChannel(t *testing.T) {
 	cameraID, ok := svc.cameraOfChannel(items[0].DeviceID)
 	require.True(t, ok)
 	require.Equal(t, "front", cameraID)
+}
+
+func TestNilStoreChannelBindingsSurviveHideAndReorder(t *testing.T) {
+	src := &mutableStatusSource{
+		fakeSource: fakeSource{cams: []CameraInfo{
+			{ID: "a", Name: "A"},
+			{ID: "b", Name: "B"},
+		}},
+		statuses: map[string]string{"a": "ON", "b": "ON"},
+	}
+	svc := New(testCfg(), src, nil)
+	items, err := svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "34020000001320000001", items[0].DeviceID)
+	require.Equal(t, "34020000001320000002", items[1].DeviceID)
+
+	src.SetCameras([]CameraInfo{
+		{ID: "b", Name: "B"},
+		{ID: "a", Name: "A", CascadeHidden: true},
+	})
+
+	cameraID, ok := svc.cameraOfChannel("34020000001320000001")
+	require.True(t, ok)
+	require.Equal(t, "a", cameraID)
+	cameraID, ok = svc.cameraOfChannel("34020000001320000002")
+	require.True(t, ok)
+	require.Equal(t, "b", cameraID)
+
+	cam, ok := svc.cameraInfo("a")
+	require.True(t, ok)
+	require.True(t, cam.CascadeHidden)
 }
 
 func TestUpperForDeviceStatusRejectsUnknownSource(t *testing.T) {

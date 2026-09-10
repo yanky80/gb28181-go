@@ -45,11 +45,16 @@ func (s *Service) catalogItems() ([]manscdp.Item, error) {
 			// same channel code (upper-side bindings survive).
 			continue
 		}
-		chID, ok := alloc[cam.ID]
-		if !ok {
-			maxSerial++
-			chID = fmt.Sprintf("%s%07d", prefix, maxSerial)
-			if s.db != nil {
+		var chID string
+		if s.db == nil {
+			chID = s.nilStoreChannelID(cam.ID, prefix)
+		}
+		if s.db != nil {
+			var ok bool
+			chID, ok = alloc[cam.ID]
+			if !ok {
+				maxSerial++
+				chID = fmt.Sprintf("%s%07d", prefix, maxSerial)
 				if err := s.db.UpsertCascadeChannel(context.Background(), CascadeChannel{
 					CameraID: cam.ID, GBChannelID: chID, Name: cam.Name, UpdatedAt: time.Now(),
 				}); err != nil {
@@ -90,18 +95,27 @@ func (s *Service) cameraOfChannel(channelID string) (string, bool) {
 		return "", false
 	}
 
-	serial := 0
-	prefix := cascadeChannelPrefix(s.cfg.LocalDeviceID)
-	for _, cam := range s.src.Cameras() {
-		if cam.CascadeHidden {
-			continue
-		}
-		serial++
-		if fmt.Sprintf("%s%07d", prefix, serial) == channelID {
-			return cam.ID, true
+	s.channelMu.RLock()
+	cameraID, ok := s.channelBindings[channelID]
+	s.channelMu.RUnlock()
+	return cameraID, ok
+}
+
+func (s *Service) nilStoreChannelID(cameraID, prefix string) string {
+	s.channelMu.Lock()
+	defer s.channelMu.Unlock()
+	if s.channelBindings == nil {
+		s.channelBindings = make(map[string]string)
+	}
+	for channelID, id := range s.channelBindings {
+		if id == cameraID {
+			return channelID
 		}
 	}
-	return "", false
+	s.nextChannelSerial++
+	channelID := fmt.Sprintf("%s%07d", prefix, s.nextChannelSerial)
+	s.channelBindings[channelID] = cameraID
+	return channelID
 }
 
 func cascadeChannelPrefix(localDeviceID string) string {

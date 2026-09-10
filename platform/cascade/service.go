@@ -115,6 +115,10 @@ type Service struct {
 	ptzForward PTZForwarder
 	tzMu       sync.RWMutex
 	gbLoc      *time.Location // GB naive-clock zone (nil → time.Local)
+	channelMu  sync.RWMutex
+	// nil-Store channel bindings live for this Service's lifetime.
+	channelBindings   map[string]string // GB channel ID → camera ID
+	nextChannelSerial int
 }
 
 // buildUppers resolves the configured upper platforms: the legacy single form
@@ -164,12 +168,13 @@ func (s *Service) SetSubStreamAcquirer(a SubStreamAcquirer) { s.subAcq = a }
 func New(cfg Config, src CameraSource, db Store) *Service {
 	return &Service{
 		cfg: cfg, src: src, db: db,
-		retryBase: parseRetryDuration(cfg.RegisterRetryBase, registerRetryBaseDefault),
-		retryMax:  parseRetryDuration(cfg.RegisterRetryMax, registerRetryMaxDefault),
-		uppers:    buildUppers(cfg),
-		sessions:  make(map[string]*mediaSession),
-		playbacks: make(map[string]*playbackSession),
-		subs:      make(map[string]*catalogSub),
+		retryBase:       parseRetryDuration(cfg.RegisterRetryBase, registerRetryBaseDefault),
+		retryMax:        parseRetryDuration(cfg.RegisterRetryMax, registerRetryMaxDefault),
+		uppers:          buildUppers(cfg),
+		sessions:        make(map[string]*mediaSession),
+		playbacks:       make(map[string]*playbackSession),
+		subs:            make(map[string]*catalogSub),
+		channelBindings: make(map[string]string),
 	}
 }
 
