@@ -633,6 +633,8 @@ func (s *Service) onBye(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 		return
 	}
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()

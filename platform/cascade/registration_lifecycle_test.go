@@ -427,6 +427,26 @@ type blockingPlaybackStore struct {
 	once    sync.Once
 }
 
+type releasePlaybackStore struct {
+	*fakeCascadeStore
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *releasePlaybackStore) ListRecordings(context.Context, RecordingFilter) ([]Recording, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	start := time.Now().Add(-10 * time.Minute)
+	return []Recording{{
+		CameraID:  "cam-1",
+		FilePath:  "blocked-segment",
+		Format:    FormatH264,
+		StartedAt: start,
+		EndedAt:   start.Add(5 * time.Minute),
+	}}, nil
+}
+
 func (s *blockingPlaybackStore) ListRecordings(ctx context.Context, _ RecordingFilter) ([]Recording, error) {
 	s.once.Do(func() { close(s.entered) })
 	<-ctx.Done()
@@ -467,6 +487,90 @@ func TestPlaybackStoreCancellationLetsStopReleaseAdmission(t *testing.T) {
 		t.Fatal("cancelled Store query did not return")
 	}
 	require.Empty(t, playbackIDs(svc), "cancelled playback must not be admitted")
+}
+
+func TestByeAdmissionPreventsBlockedPlaybackReplacement(t *testing.T) {
+	store := &releasePlaybackStore{
+		fakeCascadeStore: newFakeCascadeStore(),
+		entered:          make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, store)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	call := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp")
+	callID, ok := call.CallID()
+	require.True(t, ok)
+	oldConn, oldPeer := net.Pipe()
+	liveConn, livePeer := net.Pipe()
+	t.Cleanup(func() {
+		_ = oldPeer.Close()
+		_ = livePeer.Close()
+	})
+	old := &playbackSession{
+		svc: svc, callID: callID.String(), upper: svc.uppers[0], conn: oldConn,
+		start: time.Unix(100, 0), end: time.Unix(200, 0), done: make(chan struct{}),
+	}
+	live := &mediaSession{svc: svc, callID: callID.String(), upper: svc.uppers[0], conn: liveConn}
+	svc.mu.Lock()
+	svc.playbacks[old.callID] = old
+	svc.sessions[live.callID] = live
+	svc.mu.Unlock()
+	parserRelease := make(chan struct{})
+	t.Cleanup(func() { close(parserRelease) })
+	svc.SetSegmentParser(func(string) (*SegmentInfo, error) {
+		<-parserRelease
+		return &SegmentInfo{Codec: "h264", Timescale: 1000, Samples: []SegmentSample{{Size: 1, Duration: 1, IsKeyFrame: true}}}, nil
+	})
+
+	reinvite := up.requestDialog(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp", callID)
+	up.send(reinvite)
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("replacement INVITE did not reach the blocking Store")
+	}
+
+	bye := up.requestDialog(sip.BYE, lbChannelOne, "", "", callID)
+	cseq, ok := bye.CSeq()
+	require.True(t, ok)
+	cseq.SeqNo = 3
+	up.send(bye)
+	close(store.release)
+	responses := make(map[uint]sip.Response)
+	for len(responses) < 2 {
+		msg := up.readMessage()
+		res, ok := msg.(sip.Response)
+		if !ok {
+			continue
+		}
+		gotID, idOK := res.CallID()
+		gotSeq, seqOK := res.CSeq()
+		if idOK && seqOK && gotID.String() == callID.String() && res.StatusCode() >= 200 {
+			responses[uint(gotSeq.SeqNo)] = res
+		}
+	}
+	require.Equal(t, 200, int(responses[2].StatusCode()))
+	require.Equal(t, 200, int(responses[3].StatusCode()))
+	require.Eventually(t, func() bool { return len(playbackIDs(svc)) == 0 }, time.Second, time.Millisecond,
+		"BYE must remove the replacement before returning")
+	require.Empty(t, sessionIDs(svc), "BYE must also remove the same Call-ID live dialog")
+}
+
+func TestStartWithoutUpperReleasesListener(t *testing.T) {
+	port := freeUDPPort(t)
+	cfg := testCfg()
+	cfg.ServerAddr = ""
+	cfg.Upstreams = nil
+	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(port))
+	svc := New(cfg, fakeSource{}, newCascadeTestDB(t))
+	require.Error(t, svc.Start(context.Background()))
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(lbLocalHost), Port: port})
+	require.NoError(t, err, "failed Start must shut down its listener")
+	_ = conn.Close()
 }
 
 func TestUnknownMultiUpperSenderIsRejectedByEveryHandler(t *testing.T) {

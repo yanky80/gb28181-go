@@ -440,7 +440,9 @@ func (ps *playbackSession) finish(reason string, bye bool) {
 	}
 	close(ps.done)
 	ps.svc.mu.Lock()
-	delete(ps.svc.playbacks, ps.callID)
+	if current := ps.svc.playbacks[ps.callID]; current == ps {
+		delete(ps.svc.playbacks, ps.callID)
+	}
 	ps.svc.mu.Unlock()
 	_ = ps.conn.Close()
 	if bye {

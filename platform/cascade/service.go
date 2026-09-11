@@ -362,6 +362,11 @@ func (s *Service) Start(ctx context.Context) error {
 	_ = srv.OnRequest(sip.INFO, s.onInfo)
 
 	if len(s.uppers) == 0 {
+		s.stopping.Store(true)
+		if s.cancel != nil {
+			s.cancel()
+		}
+		srv.Shutdown()
 		return fmt.Errorf("gb28181-cascade: no upper platform configured (server_addr / upstreams)")
 	}
 	for _, u := range s.uppers {
