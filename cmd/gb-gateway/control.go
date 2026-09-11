@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mickeyzzc/gb28181-go/edgeipc"
+	"github.com/mickeyzzc/gb28181-go/metrics"
 	"github.com/mickeyzzc/gb28181-go/platform"
 )
 
@@ -39,6 +40,7 @@ type ControlServer struct {
 	writeTimeout   time.Duration
 	maxConnections int
 	writeQueueSize int
+	metrics        metrics.Hooks
 	nextRequestID  atomic.Uint64
 	nextConnection atomic.Uint64
 	helloMu        sync.Mutex
@@ -94,6 +96,21 @@ func NewControlServer(path string, registry *CameraRegistry, grace time.Duration
 		writeQueueSize: controlWriteQueueSize,
 		peers:          make(map[string]*controlPeer), leases: make(map[string]*leaseState),
 		connections: make(map[uint64]net.Conn),
+		metrics:     metrics.NoopHooks{},
+	}
+}
+
+// SetMetricsHooks installs the gateway's optional observability seam.
+func (s *ControlServer) SetMetricsHooks(h metrics.Hooks) {
+	if h == nil {
+		h = metrics.NoopHooks{}
+	}
+	s.metrics = h
+}
+
+func (s *ControlServer) observe(event metrics.GatewayEvent) {
+	if h, ok := s.metrics.(metrics.GatewayHooks); ok {
+		h.ObserveGateway(event)
 	}
 }
 
@@ -187,18 +204,21 @@ func (s *ControlServer) acceptLoop() {
 
 func (s *ControlServer) trackConnection(sequence uint64, conn net.Conn) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.ctx != nil {
 		select {
 		case <-s.ctx.Done():
+			s.mu.Unlock()
 			return false
 		default:
 		}
 	}
 	if s.maxConnections > 0 && len(s.connections) >= s.maxConnections {
+		s.mu.Unlock()
 		return false
 	}
 	s.connections[sequence] = conn
+	s.mu.Unlock()
+	s.observe(metrics.GatewayEvent{Name: "ipc_connection"})
 	return true
 }
 
@@ -206,6 +226,7 @@ func (s *ControlServer) untrackConnection(sequence uint64) {
 	s.mu.Lock()
 	delete(s.connections, sequence)
 	s.mu.Unlock()
+	s.observe(metrics.GatewayEvent{Name: "ipc_disconnect"})
 }
 
 func (s *ControlServer) listener() net.Listener {
@@ -394,7 +415,11 @@ func (s *ControlServer) handlePeerMessage(peer *controlPeer, message edgeipc.Con
 	}
 	switch message.Type {
 	case edgeipc.MessageHealth:
-		return s.registry.HandleHealth(peer.cameraID, peer.epoch, message)
+		err := s.registry.HandleHealth(peer.cameraID, peer.epoch, message)
+		if err == nil {
+			s.observe(metrics.GatewayEvent{Name: "health", CameraID: peer.cameraID, StreamEpoch: peer.epoch})
+		}
+		return err
 	case edgeipc.MessageAck:
 		return nil // ACKs are observations; desired state never rolls back.
 	case edgeipc.MessageReady:
@@ -440,6 +465,7 @@ func (p *controlPeer) writeLoop() {
 	for {
 		select {
 		case command := <-p.commands:
+			p.server.observe(metrics.GatewayEvent{Name: "queue_depth", CameraID: p.cameraID, RequestID: command.message.RequestID, Value: int64(len(p.commands))})
 			if !p.server.commandCurrent(p, command) {
 				continue
 			}
@@ -483,8 +509,10 @@ func (p *controlPeer) enqueue(command controlCommand) error {
 	case <-p.done:
 		return ErrControlUnavailable
 	case p.commands <- command:
+		p.server.observe(metrics.GatewayEvent{Name: "queue_depth", CameraID: p.cameraID, RequestID: command.message.RequestID, Value: int64(len(p.commands))})
 		return nil
 	default:
+		p.server.observe(metrics.GatewayEvent{Name: "queue_drop", CameraID: p.cameraID, RequestID: command.message.RequestID})
 		return errors.New("gateway: control write queue full")
 	}
 }
@@ -498,10 +526,12 @@ func (p *controlPeer) enqueuePair(first, second controlCommand) error {
 	default:
 	}
 	if cap(p.commands)-len(p.commands) < 2 {
+		p.server.observe(metrics.GatewayEvent{Name: "queue_drop", CameraID: p.cameraID})
 		return errors.New("gateway: control write queue full")
 	}
 	p.commands <- first
 	p.commands <- second
+	p.server.observe(metrics.GatewayEvent{Name: "queue_depth", CameraID: p.cameraID, RequestID: second.message.RequestID, Value: int64(len(p.commands))})
 	return nil
 }
 
@@ -578,6 +608,7 @@ func (s *ControlServer) RequestIDR(cameraID string) {
 	}}
 	err := peer.enqueue(command)
 	s.mu.Unlock()
+	s.observe(metrics.GatewayEvent{Name: "idr_request", CameraID: cameraID, RequestID: command.message.RequestID})
 	if err != nil {
 		peer.close()
 	}

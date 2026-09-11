@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mickeyzzc/gb28181-go/edgeipc"
+	"github.com/mickeyzzc/gb28181-go/metrics"
 )
 
 var (
@@ -35,6 +36,7 @@ type MediaHostConfig struct {
 	// OnIDRTimeoutEpoch is the epoch-safe timeout callback used by the
 	// gateway lifecycle. OnIDRTimeout remains for callers without that need.
 	OnIDRTimeoutEpoch func(cameraID string, streamEpoch uint64, err error)
+	Metrics           metrics.Hooks
 }
 
 // MediaHost accepts one Edge IPC media stream per connection and publishes
@@ -68,6 +70,12 @@ func NewMediaHost(registry *CameraRegistry, config MediaHostConfig) *MediaHost {
 		connections: make(map[string]*mediaConnection),
 		active:      make(map[*mediaConnection]struct{}),
 		closeDone:   make(chan struct{}),
+	}
+}
+
+func (s *MediaHost) observe(event metrics.GatewayEvent) {
+	if h, ok := s.config.Metrics.(metrics.GatewayHooks); ok {
+		h.ObserveGateway(event)
 	}
 }
 
@@ -165,6 +173,7 @@ func (s *MediaHost) ServeConn(conn net.Conn) error {
 	defer func() {
 		c.close()
 		s.removeConnection(c)
+		s.observe(metrics.GatewayEvent{Name: "ipc_disconnect", CameraID: c.cameraID, StreamEpoch: c.epoch, Codec: codecName(c.codec)})
 		_ = conn.Close()
 	}()
 
@@ -295,6 +304,7 @@ func (c *mediaConnection) handle(frame edgeipc.MediaFrame) error {
 		discontinuous = true
 	}
 	if discontinuous {
+		c.server.observe(metrics.GatewayEvent{Name: "discontinuity", CameraID: c.cameraID, StreamEpoch: c.epoch, Codec: codecName(c.codec)})
 		c.waitForIDR()
 	}
 	if c.isWaiting() {
@@ -315,11 +325,19 @@ func (c *mediaConnection) publish(frame edgeipc.MediaFrame) error {
 		return edgeipc.ErrInvalidAccessUnit
 	}
 	c.server.mu.Lock()
-	defer c.server.mu.Unlock()
 	if c.server.closed || c.server.connections[c.cameraID] != c || c.isClosed() {
+		c.server.mu.Unlock()
 		return ErrMediaConnectionReplaced
 	}
-	c.server.registry.Publish(c.cameraID, c.epoch, int64(frame.PTS90kHz), nals, frame.Flags&edgeipc.FlagIDR != 0)
+	dropped := !c.server.registry.Publish(c.cameraID, c.epoch, int64(frame.PTS90kHz), nals, frame.Flags&edgeipc.FlagIDR != 0)
+	c.server.mu.Unlock()
+	if dropped {
+		c.server.observe(metrics.GatewayEvent{Name: "frame_drop", CameraID: c.cameraID, StreamEpoch: c.epoch, Codec: codecName(c.codec)})
+	}
+	c.server.observe(metrics.GatewayEvent{
+		Name: "access_unit", CameraID: c.cameraID, StreamEpoch: c.epoch,
+		Codec: codecName(c.codec), Value: int64(len(frame.Payload)),
+	})
 	return nil
 }
 
@@ -335,6 +353,7 @@ func (c *mediaConnection) waitForIDR() {
 	deadline := c.deadline
 	c.timer = time.AfterFunc(c.server.config.IDRTimeout, func() { c.idrTimeout(deadline) })
 	c.mu.Unlock()
+	c.server.observe(metrics.GatewayEvent{Name: "idr_wait", CameraID: c.cameraID, StreamEpoch: c.epoch, Codec: codecName(c.codec)})
 	if c.server.config.RequestIDR != nil {
 		c.server.config.RequestIDR(c.cameraID)
 	}
@@ -384,6 +403,7 @@ func (c *mediaConnection) idrTimeout(deadline uint64) {
 		c.server.config.OnIDRTimeout(c.cameraID, context.DeadlineExceeded)
 	}
 	c.server.mu.Unlock()
+	c.server.observe(metrics.GatewayEvent{Name: "idr_timeout", CameraID: c.cameraID, StreamEpoch: c.epoch, Codec: codecName(c.codec), ErrorCode: "deadline_exceeded"})
 }
 
 func (c *mediaConnection) keepTimeoutAfterClose() {
@@ -468,11 +488,13 @@ func (s *MediaHost) removeConnection(c *mediaConnection) {
 
 func (s *MediaHost) trackConnection(c *mediaConnection) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return errors.New("gateway: media host is closed")
 	}
 	s.active[c] = struct{}{}
+	s.mu.Unlock()
+	s.observe(metrics.GatewayEvent{Name: "ipc_connection"})
 	return nil
 }
 

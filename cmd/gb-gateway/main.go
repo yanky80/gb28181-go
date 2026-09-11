@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mickeyzzc/gb28181-go/edgeipc"
+	"github.com/mickeyzzc/gb28181-go/metrics"
 	"github.com/mickeyzzc/gb28181-go/platform/cascade"
 	"github.com/mickeyzzc/gb28181-go/platform/mp4"
 )
@@ -28,7 +29,12 @@ type Gateway struct {
 	media    *MediaHost
 	cascade  *cascade.Service
 
-	recordings *RecordingStore
+	recordings    *RecordingStore
+	observability *GatewayObservability
+	state         *gatewayState
+	statusPath    string
+	watchdog      WatchdogNotifier
+	watchdogEvery time.Duration
 
 	mu       sync.Mutex
 	cancel   context.CancelFunc
@@ -95,7 +101,9 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 	}
 
 	store := &gatewayStore{channels: channels, recordings: recordings}
+	observability := NewGatewayObservability(observabilityQueue, nil)
 	control := NewControlServer(cfg.IPC.ControlSocket, registry, cfg.GB.StopGrace)
+	control.SetMetricsHooks(observability)
 	gbPassword, _ := credentials.Lookup("sip.password")
 	cascadeService := cascade.New(cascade.Config{
 		Enabled:           cfg.GB.Enabled,
@@ -118,6 +126,7 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 		MaxAUBytes: cfg.IPC.MaxAUBytes,
 		IDRTimeout: cfg.GB.IDRTimeout,
 		RequestIDR: control.RequestIDR,
+		Metrics:    observability,
 		OnIDRTimeoutEpoch: func(cameraID string, streamEpoch uint64, _ error) {
 			if registry.HandleDisconnect(cameraID, streamEpoch) {
 				cascadeService.NotifyCameraUnavailable(cameraID)
@@ -125,10 +134,36 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 		},
 	})
 
-	return &Gateway{
+	gateway := &Gateway{
 		cfg: cfg, registry: registry, store: store, control: control,
 		media: media, cascade: cascadeService, recordings: recordings,
-	}, nil
+		observability: observability, statusPath: filepath.Join(cfg.IPC.StatusDir, gatewayStatusFile),
+		watchdogEvery: systemdWatchdogInterval(),
+	}
+	gateway.state = newGatewayState(GatewaySnapshot{
+		ProtocolVersion: cfg.GB.ProtocolVersion,
+		Codec: func() string {
+			if len(cfg.Cameras) == 0 {
+				return ""
+			}
+			return cfg.Cameras[0].Codec
+		}(),
+	})
+	gateway.refreshSnapshot()
+	return gateway, nil
+}
+
+// SetMetricsHooks installs a nonblocking host hook. It is normally called
+// before Start; replacing it while running is safe for future observations.
+func (g *Gateway) SetMetricsHooks(h metrics.Hooks) { g.observability.SetHooks(h) }
+
+// SetWatchdogNotifier injects the service-manager heartbeat seam.
+func (g *Gateway) SetWatchdogNotifier(notifier WatchdogNotifier) { g.watchdog = notifier }
+
+// Snapshot returns one immutable local health view.
+func (g *Gateway) Snapshot() GatewaySnapshot {
+	g.refreshSnapshot()
+	return g.state.Load()
 }
 
 func configuredCodec(codec string) edgeipc.Codec {
@@ -188,19 +223,36 @@ func (g *Gateway) Start(ctx context.Context) error {
 		defer g.wg.Done()
 		_ = g.media.Serve(runCtx)
 	}()
+	g.wg.Add(1)
+	go g.observabilityLoop(runCtx)
 	if g.recordings != nil {
 		g.wg.Add(1)
 		go g.recordingLoop(runCtx)
 	}
 
 	if g.cfg.GB.Enabled {
+		g.observability.RegisterAttempt()
 		if err := g.cascade.Start(runCtx); err != nil {
+			g.observability.RegisterFail()
 			_ = g.Stop()
 			g.recordStartError(err)
 			return err
 		}
 	}
-	slog.Info("gb-gateway started", "control_socket", g.cfg.IPC.ControlSocket, "media_socket", g.cfg.IPC.MediaSocket)
+	if g.watchdog == nil {
+		g.watchdog = NewSystemdWatchdogNotifier()
+	}
+	if g.watchdog != nil {
+		interval := g.watchdogEvery
+		if interval <= 0 {
+			interval = time.Second
+		}
+		g.wg.Add(1)
+		go func() { defer g.wg.Done(); newGatewayWatchdog(g.watchdog, interval).Run(runCtx) }()
+	}
+	logGateway(slog.LevelInfo, "gb-gateway started", gatewayLogContext{
+		protocolVersion: g.cfg.GB.ProtocolVersion, transport: g.cfg.GB.Transport,
+	})
 	return nil
 }
 
@@ -224,8 +276,44 @@ func (g *Gateway) Stop() error {
 			g.stopErr = err
 		}
 		g.wg.Wait()
+		g.observability.Close()
 	})
 	return g.stopErr
+}
+
+func (g *Gateway) observabilityLoop(ctx context.Context) {
+	defer g.wg.Done()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var previousDialogs int
+	var previousRegistration string
+	for {
+		snapshot := g.refreshSnapshot()
+		if snapshot.Registration == cascade.StatusOnline && previousRegistration != cascade.StatusOnline {
+			g.observability.RegisterOK()
+		}
+		if previousRegistration == cascade.StatusOnline && snapshot.Registration == cascade.StatusOffline {
+			g.observability.KeepaliveFail()
+		}
+		if snapshot.ActiveDialogs > previousDialogs {
+			for i := previousDialogs; i < snapshot.ActiveDialogs; i++ {
+				g.observability.InviteSessionStarted()
+			}
+		} else if snapshot.ActiveDialogs < previousDialogs {
+			for i := snapshot.ActiveDialogs; i < previousDialogs; i++ {
+				g.observability.InviteSessionStopped()
+			}
+		}
+		previousDialogs, previousRegistration = snapshot.ActiveDialogs, snapshot.Registration
+		if err := writeGatewaySnapshot(g.statusPath, snapshot); err != nil {
+			logGateway(slog.LevelWarn, "gateway status snapshot failed", gatewayLogContext{err: err, protocolVersion: g.cfg.GB.ProtocolVersion, transport: g.cfg.GB.Transport})
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Wait is the signal-friendly shutdown entrypoint.
@@ -243,7 +331,7 @@ func (g *Gateway) recordingLoop(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			if err := g.recordings.Scan(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				slog.Warn("gb-gateway recording scan failed", "error", err)
+				logGateway(slog.LevelWarn, "gb-gateway recording scan failed", gatewayLogContext{err: err, protocolVersion: g.cfg.GB.ProtocolVersion, transport: g.cfg.GB.Transport})
 			}
 		case <-ctx.Done():
 			return
@@ -289,7 +377,7 @@ var _ cascade.CascadeChannelAllocator = (*gatewayStore)(nil)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		slog.Error("gb-gateway failed", "error", err)
+		logGateway(slog.LevelError, "gb-gateway failed", gatewayLogContext{err: err})
 		os.Exit(1)
 	}
 }
