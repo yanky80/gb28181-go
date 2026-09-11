@@ -162,8 +162,9 @@ type RecordingFilter struct {
 }
 
 // Store persists cascade channel assignments and indexes recordings. The
-// host implements it (MiBeeNvr adapts its storage.DB); nil disables
-// RecordInfo answers and channel-ID stability (IDs are re-derived per boot).
+// host implements it (MiBeeNvr adapts its storage.DB); nil makes RecordInfo
+// return an empty diagnostic response and channel-ID stability remains
+// in-memory (IDs are re-derived per boot).
 type Store interface {
 	UpsertCascadeChannel(ctx context.Context, ch CascadeChannel) error
 	ListCascadeChannels(ctx context.Context) ([]CascadeChannel, error)

@@ -95,17 +95,21 @@ type Service struct {
 	src CameraSource
 	db  Store
 	// segParser reads recorded segment files for playback forwarding; injected
-	// via SetSegmentParser, nil disables playback media (RecordInfo answers
-	// still work off the Store).
+	// via SetSegmentParser, nil makes Playback/Download INVITEs fail closed
+	// (RecordInfo answers still work off the Store).
 	segParser SegmentParser
+	capMu     sync.RWMutex
 	// subAcq serves sub-stream forwardings (#512); nil = main-only.
 	subAcq SubStreamAcquirer
 	// mainAcq serves live main-stream leases; nil preserves the legacy Hub path.
 	mainAcq MainStreamAcquirer
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	storeMu     sync.RWMutex
+	storeCtx    context.Context
+	storeCancel context.CancelFunc
 
 	// admissionMu serializes INVITE admission with Stop. ponytail: one global
 	// lock keeps lifecycle ordering simple; per-camera admission if throughput
@@ -202,6 +206,48 @@ func New(cfg Config, src CameraSource, db Store) *Service {
 	}
 }
 
+func (s *Service) storeContext() context.Context {
+	s.storeMu.RLock()
+	ctx := s.storeCtx
+	if ctx == nil {
+		ctx = s.ctx
+	}
+	s.storeMu.RUnlock()
+	if ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
+func (s *Service) cancelStoreContext() {
+	s.storeMu.RLock()
+	cancel := s.storeCancel
+	s.storeMu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *Service) resetStoreContext() {
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
+	if s.storeCancel != nil {
+		s.storeCancel()
+	}
+	if s.ctx != nil {
+		s.storeCtx, s.storeCancel = context.WithCancel(s.ctx)
+	} else {
+		s.storeCtx, s.storeCancel = nil, nil
+	}
+}
+
+// NotifyNetworkChange cancels in-flight Store work and gives later work a
+// fresh context after the host's network identity changes.
+func (s *Service) NotifyNetworkChange() {
+	s.cancelStoreContext()
+	s.resetStoreContext()
+}
+
 // REGISTER retry backoff bounds (issue #44): base doubles per
 // consecutive failure, capped; a successful registration resets.
 const (
@@ -223,15 +269,28 @@ func parseRetryDuration(v string, def time.Duration) time.Duration {
 }
 
 // SetSegmentParser injects the host's recorded-segment reader (fMP4 or
-// otherwise). Without it, playback INVITEs are answered but carry no media.
-func (s *Service) SetSegmentParser(p SegmentParser) { s.segParser = p }
+// otherwise). Without it, playback INVITEs are rejected as unavailable.
+func (s *Service) SetSegmentParser(p SegmentParser) {
+	s.capMu.Lock()
+	s.segParser = p
+	s.capMu.Unlock()
+}
 
 // parseSegment reads one segment file through the injected parser.
 func (s *Service) parseSegment(path string) (*SegmentInfo, error) {
-	if s.segParser == nil {
+	s.capMu.RLock()
+	parser := s.segParser
+	s.capMu.RUnlock()
+	if parser == nil {
 		return nil, errors.New("cascade: no segment parser configured")
 	}
-	return s.segParser(path)
+	return parser(path)
+}
+
+func (s *Service) segmentParserConfigured() bool {
+	s.capMu.RLock()
+	defer s.capMu.RUnlock()
+	return s.segParser != nil
 }
 
 // SetGBTimezone pins the zone used for GB/T 28181 naive timestamps (RecordInfo
@@ -305,7 +364,13 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := s.validateProtocolProfiles(); err != nil {
 		return fmt.Errorf("gb28181-cascade: %w", err)
 	}
-	s.ctx, s.cancel = context.WithCancel(context.Background())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.storeMu.Lock()
+	s.storeCtx, s.storeCancel = context.WithCancel(s.ctx)
+	s.storeMu.Unlock()
 
 	listen := s.cfg.SIPListen
 	if listen == "" {
@@ -354,6 +419,7 @@ func (s *Service) Stop() error {
 
 func (s *Service) stop() error {
 	s.stopping.Store(true)
+	s.cancelStoreContext()
 	if s.cancel != nil {
 		s.cancel()
 	}
@@ -883,7 +949,18 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 		// RecordInfoQuery); the Response-root form is a device answer that
 		// never reaches the cascade.
 		if q, ok := payload.(manscdp.RecordInfoQuery); ok && q.SN > 0 {
-			go s.answerRecordInfo(u, q)
+			s.admissionMu.Lock()
+			if s.stopping.Load() || s.storeContext().Err() != nil {
+				s.admissionMu.Unlock()
+				return
+			}
+			ctx := s.storeContext()
+			s.wg.Add(1)
+			s.admissionMu.Unlock()
+			go func() {
+				defer s.wg.Done()
+				s.answerRecordInfo(ctx, u, q)
+			}()
 		}
 	case manscdp.CmdDeviceControl:
 		if dc, ok := payload.(manscdp.DeviceControl); ok {
