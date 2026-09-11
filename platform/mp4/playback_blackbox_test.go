@@ -106,7 +106,7 @@ func freeBlackBoxUDPPort(t *testing.T) int {
 func blackBoxPlaybackInvite(t *testing.T, channelID string, viaPort, rtpPort int, start, end time.Time) (sip.Request, string) {
 	t.Helper()
 	const host = "127.0.0.1"
-	const upperID = "34020000002000000002"
+	const upperID = "34020000002000000001"
 	callID := fmt.Sprintf("mp4-playback-%d", time.Now().UnixNano())
 	rb := sip.NewRequestBuilder()
 	rb.SetMethod(sip.INVITE)
@@ -121,7 +121,7 @@ func blackBoxPlaybackInvite(t *testing.T, channelID string, viaPort, rtpPort int
 	rb.SetSeqNo(1)
 	mf := sip.MaxForwards(70)
 	rb.SetMaxForwards(&mf)
-	body := fmt.Sprintf("v=0\r\no=%s 0 0 IN IP4 %s\r\ns=Playback\r\nc=IN IP4 %s\r\nt=%d %d\r\nm=video %d RTP/AVP 96\r\ny=12345678\r\n", upperID, host, host, start.Unix(), end.Unix(), rtpPort)
+	body := fmt.Sprintf("v=0\r\no=%s 0 0 IN IP4 %s\r\ns=Playback\r\nc=IN IP4 %s\r\nt=%d %d\r\nm=video %d RTP/AVP 96\r\na=recvonly\r\na=rtpmap:96 PS/90000\r\ny=12345678\r\n", upperID, host, host, start.Unix(), end.Unix(), rtpPort)
 	rb.SetBody(body)
 	contentType := sip.ContentType("application/sdp")
 	rb.SetContentType(&contentType)

@@ -201,7 +201,7 @@ func playSDP(t *testing.T, name string, withT bool) string {
 	}
 	return "v=0\r\no=" + lbUpperDevice + " 0 0 IN IP4 " + lbLocalHost + "\r\ns=" + name + "\r\n" +
 		"c=IN IP4 " + lbLocalHost + "\r\n" + tline +
-		"m=video " + strconv.Itoa(freeUDPPort(t)) + " RTP/AVP 96\r\ny=12345678\r\n"
+		"m=video " + strconv.Itoa(freeUDPPort(t)) + " RTP/AVP 96\r\na=recvonly\r\na=rtpmap:96 PS/90000\r\ny=12345678\r\n"
 }
 
 // startLoopbackService boots the cascade against a fake upper socket and
@@ -209,6 +209,7 @@ func playSDP(t *testing.T, name string, withT bool) string {
 func startLoopbackService(t *testing.T, src CameraSource, db Store) (*Service, *upperSocket) {
 	t.Helper()
 	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
 	return startLoopbackServiceWithConfig(t, cfg, src, db)
 }
 
@@ -276,8 +277,18 @@ func TestLoopbackInviteLiveForwardAndBye(t *testing.T) {
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
 
+	// A valid SDP from an unknown upper ID is rejected before channel lookup.
+	forged := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	from, ok := forged.From()
+	require.True(t, ok)
+	uri, ok := from.Address.(*sip.SipUri)
+	require.True(t, ok)
+	uri.SetUser(sip.String{Str: "99999999999999999999"})
+	res := up.roundTrip(forged)
+	require.Equal(t, 403, int(res.StatusCode()), "unknown upper ID must be forbidden")
+
 	// Unknown channel → 404.
-	res := up.roundTrip(up.request(sip.INVITE, "34020099991320000099", playSDP(t, "Play", false), "application/sdp"))
+	res = up.roundTrip(up.request(sip.INVITE, "34020099991320000099", playSDP(t, "Play", false), "application/sdp"))
 	require.Equal(t, 404, int(res.StatusCode()), "INVITE for unknown channel must 404")
 
 	// Bad SDP → 400.

@@ -106,15 +106,19 @@ func TestUpperOfResolution(t *testing.T) {
 	require.Len(t, svc.uppers, 2)
 
 	// Request routing keys on the From user (the upper's server ID): a
-	// request from the second upper's domain resolves to uppers[1]; an
-	// unknown sender falls back to the first.
-	require.Equal(t, svc.uppers[1], svc.upperOf(newFromRequest(t, "34020000002000000002")))
-	require.Equal(t, svc.uppers[0], svc.upperOf(newFromRequest(t, "99999999999999999999")))
+	// request from the second upper's domain and source resolves to uppers[1];
+	// an unknown sender is rejected rather than falling back to the first.
+	second := newFromRequest(t, "34020000002000000002")
+	second.SetSource("10.0.0.2:40000")
+	require.Equal(t, svc.uppers[1], svc.upperOf(second))
+	unknown := newFromRequest(t, "99999999999999999999")
+	unknown.SetSource("10.0.0.1:40000")
+	require.Nil(t, svc.upperOf(unknown))
 
 	// Single-upper deployments short-circuit.
 	svc2 := New(testCfg(), fakeSource{}, newCascadeTestDB(t))
 	require.Len(t, svc2.uppers, 1)
-	require.Equal(t, svc2.uppers[0], svc2.upperOf(newFromRequest(t, "anything")))
+	require.Nil(t, svc2.upperOf(newFromRequest(t, "anything")))
 }
 
 // newFromRequest assembles a minimal SIP request with the given From user.

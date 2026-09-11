@@ -106,7 +106,7 @@ func newPlaybackHarness(t *testing.T) (*playbackSession, func() [][]byte) {
 
 	ps := &playbackSession{
 		svc: svc, callID: "test-call", channel: "34020000001320000001", camera: "front",
-		conn: conn, dst: dst, ssrc: 0x10000009,
+		conn: conn, ssrc: 0x10000009,
 		mux:  psmux.New(),
 		rtp:  psmux.NewRTPPacketizer(conn, dst, 0x10000009, 7),
 		ctrl: make(chan pbCtrl, 8),
