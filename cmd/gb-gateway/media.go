@@ -156,6 +156,7 @@ func (s *MediaHost) ServeConn(conn net.Conn) error {
 		if err != nil {
 			if c.bound && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				c.waitForIDR()
+				c.keepTimeoutAfterClose()
 			}
 			if errors.Is(err, edgeipc.ErrInvalidAccessUnit) {
 				continue
@@ -214,6 +215,7 @@ type mediaConnection struct {
 	waiting      bool
 	notified     bool
 	closed       bool
+	keepTimer    bool
 	timer        *time.Timer
 }
 
@@ -262,8 +264,6 @@ func (c *mediaConnection) handle(frame edgeipc.MediaFrame) error {
 	if c.havePTS && frame.PTS90kHz <= c.lastPTS {
 		discontinuous = true
 	}
-	c.lastSequence, c.haveSequence = frame.Sequence, true
-	c.lastPTS, c.havePTS = frame.PTS90kHz, true
 	if discontinuous {
 		c.waitForIDR()
 	}
@@ -273,6 +273,8 @@ func (c *mediaConnection) handle(frame edgeipc.MediaFrame) error {
 		}
 		c.recover()
 	}
+	c.lastSequence, c.haveSequence = frame.Sequence, true
+	c.lastPTS, c.havePTS = frame.PTS90kHz, true
 
 	return c.publish(frame)
 }
@@ -328,15 +330,22 @@ func (c *mediaConnection) isWaiting() bool {
 
 func (c *mediaConnection) idrTimeout() {
 	c.mu.Lock()
-	if c.closed || !c.waiting || c.notified {
+	if (c.closed && !c.keepTimer) || !c.waiting || c.notified {
 		c.mu.Unlock()
 		return
 	}
 	c.notified = true
+	c.timer = nil
 	c.mu.Unlock()
 	if c.server.config.OnIDRTimeout != nil {
 		c.server.config.OnIDRTimeout(c.cameraID, context.DeadlineExceeded)
 	}
+}
+
+func (c *mediaConnection) keepTimeoutAfterClose() {
+	c.mu.Lock()
+	c.keepTimer = true
+	c.mu.Unlock()
 }
 
 func (c *mediaConnection) close() {
@@ -346,7 +355,7 @@ func (c *mediaConnection) close() {
 		return
 	}
 	c.closed = true
-	if c.timer != nil {
+	if c.timer != nil && !c.keepTimer {
 		c.timer.Stop()
 		c.timer = nil
 	}

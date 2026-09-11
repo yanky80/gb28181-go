@@ -5,21 +5,29 @@ func validAccessUnit(codec Codec, payload []byte) bool {
 	if len(nals) == 0 {
 		return false
 	}
+	seenVCL := false
 	for _, nal := range nals {
 		if len(nal) == 0 {
 			return false
 		}
 		if codec == CodecH264 {
-			if nal[0]&0x80 != 0 {
+			typ := nal[0] & 0x1f
+			if nal[0]&0x80 != 0 || typ == 0 || typ > 23 {
 				return false
 			}
+			seenVCL = seenVCL || typ <= 5
 			continue
 		}
 		if len(nal) < 2 || nal[0]&0x80 != 0 || nal[1]&0x07 == 0 {
 			return false
 		}
+		typ := (nal[0] >> 1) & 0x3f
+		if typ > 40 {
+			return false
+		}
+		seenVCL = seenVCL || typ <= 31
 	}
-	return true
+	return seenVCL
 }
 
 func validKeyframe(codec Codec, payload []byte) bool {
@@ -31,7 +39,8 @@ func validKeyframe(codec Codec, payload []byte) bool {
 		var typ byte
 		if codec == CodecH264 {
 			typ = nal[0] & 0x1f
-			if typ == 5 {
+			switch typ {
+			case 5, 7, 8:
 				seen[typ] = true
 			}
 			continue
@@ -43,7 +52,7 @@ func validKeyframe(codec Codec, payload []byte) bool {
 		}
 	}
 	if codec == CodecH264 {
-		return seen[5]
+		return seen[5] && seen[7] && seen[8]
 	}
 	return (seen[19] || seen[20]) && seen[32] && seen[33] && seen[34]
 }

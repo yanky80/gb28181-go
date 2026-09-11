@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -133,6 +134,40 @@ func TestMediaHostPTSRegressionWaitsForIDR(t *testing.T) {
 	peer.Close()
 	if err := <-done; err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("ServeConn error = %v", err)
+	}
+}
+
+func TestMediaHostWaitIDRDoesNotAdvanceDroppedTimeline(t *testing.T) {
+	r := onlineRegistry(t, edgeipc.CodecH265)
+	s := NewMediaHost(r, MediaHostConfig{IDRTimeout: time.Second})
+	c := &mediaConnection{
+		server:       s,
+		cameraID:     "cam-a",
+		epoch:        1,
+		codec:        edgeipc.CodecH265,
+		bound:        true,
+		haveSequence: true,
+		lastSequence: 2,
+		havePTS:      true,
+		lastPTS:      12000,
+		waiting:      true,
+	}
+	s.mu.Lock()
+	s.connections["cam-a"] = c
+	s.active[c] = struct{}{}
+	s.mu.Unlock()
+
+	if err := c.handle(mediaFrame(edgeipc.CodecH265, 99, 99000, 0, h265PFrame())); err != nil {
+		t.Fatal(err)
+	}
+	if c.lastSequence != 2 || c.lastPTS != 12000 {
+		t.Fatalf("dropped WAIT_IDR frame advanced timeline to seq=%d pts=%d", c.lastSequence, c.lastPTS)
+	}
+	if err := c.handle(mediaFrame(edgeipc.CodecH265, 3, 15000, edgeipc.FlagIDR, h265IDR())); err != nil {
+		t.Fatal(err)
+	}
+	if c.waiting || c.lastSequence != 3 || c.lastPTS != 15000 {
+		t.Fatalf("recovery state = waiting %v, seq=%d, pts=%d", c.waiting, c.lastSequence, c.lastPTS)
 	}
 }
 
@@ -328,6 +363,50 @@ func TestMediaHostParserFailureEntersRecovery(t *testing.T) {
 	peer.Close()
 	if err := <-done; err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("ServeConn error = %v", err)
+	}
+}
+
+func TestMediaHostOverflowNotifiesTimeoutAfterRequest(t *testing.T) {
+	r := onlineRegistry(t, edgeipc.CodecH265)
+	var requests atomic.Int32
+	failures := make(chan string, 1)
+	s := NewMediaHost(r, MediaHostConfig{
+		MaxAUBytes: 1024,
+		IDRTimeout: 20 * time.Millisecond,
+		RequestIDR: func(string) { requests.Add(1) },
+		OnIDRTimeout: func(cameraID string, err error) {
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("timeout error = %v", err)
+			}
+			failures <- cameraID
+		},
+	})
+	serverConn, peer := net.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- s.ServeConn(serverConn) }()
+	writeMedia(t, peer, mediaFrame(edgeipc.CodecH265, 1, 9000, edgeipc.FlagIDR, h265IDR()))
+	var header [edgeipc.MediaHeaderSize]byte
+	header[0], header[1], header[2], header[3] = 'E', 'G', 'A', 'U'
+	header[4], header[6] = edgeipc.ProtocolVersion, byte(edgeipc.CodecH265)
+	binary.BigEndian.PutUint16(header[8:10], edgeipc.MediaHeaderSize)
+	binary.BigEndian.PutUint16(header[10:12], 5)
+	binary.BigEndian.PutUint32(header[12:16], 1025)
+	if _, err := peer.Write(header[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, edgeipc.ErrPayloadTooLarge) {
+		t.Fatalf("overflow error = %v, want payload-too-large", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("IDR requests = %d, want initial request plus overflow recovery", got)
+	}
+	select {
+	case cameraID := <-failures:
+		if cameraID != "cam-a" {
+			t.Fatalf("failure camera = %q, want cam-a", cameraID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("overflow timeout notification did not arrive")
 	}
 }
 
