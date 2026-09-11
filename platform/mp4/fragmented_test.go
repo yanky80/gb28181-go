@@ -3,6 +3,7 @@ package mp4
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -82,6 +83,76 @@ func TestParseSegmentStandardVersion1Tkhd(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint32(1000), got.Timescale)
 	require.Len(t, got.Samples, 1)
+}
+
+func TestParseSegmentStandardVersion1Mdhd(t *testing.T) {
+	data := fragmentedFileWithMoov(moovVersions([][]byte{avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2}))}, 0, 1, nil))
+
+	got, err := ParseSegment(writeSegment(t, data))
+	require.NoError(t, err)
+	require.Equal(t, uint32(1000), got.Timescale)
+}
+
+func TestParseSegmentRejectsShortStandardFixedBoxes(t *testing.T) {
+	codec := avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2}))
+	tests := []struct {
+		name                      string
+		tkhdVersion, mdhdVersion  byte
+		tkhdLen, mdhdLen, hdlrLen int
+	}{
+		{"tkhd-v0", 0, 0, 79, 20, 27},
+		{"tkhd-v1", 1, 0, 91, 20, 27},
+		{"mdhd-v0", 0, 0, 80, 19, 27},
+		{"mdhd-v1", 0, 1, 80, 31, 27},
+		{"hdlr", 0, 0, 80, 20, 19},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := fragmentedFileWithMoov(moovVersionsWithLengths(
+				[][]byte{codec}, tt.tkhdVersion, tt.mdhdVersion, nil,
+				tt.tkhdLen, tt.mdhdLen, tt.hdlrLen))
+			_, err := ParseSegment(writeSegment(t, data))
+			require.Error(t, err)
+			require.True(t, errors.Is(err, ErrTruncated) || errors.Is(err, ErrInvalid), "%v", err)
+		})
+	}
+}
+
+func TestParseSegmentValidatesStsdEntriesAfterFirstCodec(t *testing.T) {
+	first := avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2}))
+	second := makeBox("hvc1", make([]byte, 10))
+	data := fragmentedFileWithMoov(moovVersions([][]byte{first, second}, 0, 0, nil))
+
+	_, err := ParseSegment(writeSegment(t, data))
+	require.ErrorIs(t, err, ErrInvalid)
+}
+
+func TestParseSegmentRejectsStsdTrailingBytes(t *testing.T) {
+	codec := avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2}))
+	data := fragmentedFileWithMoov(moovVersions([][]byte{codec}, 0, 0, []byte{0}))
+
+	_, err := ParseSegment(writeSegment(t, data))
+	require.ErrorIs(t, err, ErrInvalid)
+}
+
+func TestParseSegmentRejectsNonFourByteNALLength(t *testing.T) {
+	h264 := h264Segment([]byte{0x67, 1}, []byte{0x68, 2}, [][]sample{{
+		{duration: 40, data: []byte{0, 0, 0, 1, 0x65}, key: true},
+	}})
+	idx := bytes.Index(h264, []byte("avcC"))
+	require.NotEqual(t, -1, idx)
+	h264[idx+8] &^= 3
+	_, err := ParseSegment(writeSegment(t, h264))
+	require.ErrorIs(t, err, ErrInvalid)
+
+	h265 := h265Segment([]byte{0x40, 1}, []byte{0x42, 1}, []byte{0x44, 1}, [][]sample{{
+		{duration: 40, data: []byte{0, 0, 0, 2, 0x26, 9}, key: true},
+	}})
+	idx = bytes.Index(h265, []byte("hvcC"))
+	require.NotEqual(t, -1, idx)
+	h265[idx+4+21] &^= 3
+	_, err = ParseSegment(writeSegment(t, h265))
+	require.ErrorIs(t, err, ErrInvalid)
 }
 
 func TestParseSegmentImplicitTfhdBase(t *testing.T) {
@@ -252,7 +323,17 @@ func fragmentedFile(codecBox []byte, fragments [][]sample) []byte {
 }
 
 func fragmentedFileVersion(codecBox []byte, fragments [][]sample, tkhdVersion byte) []byte {
-	data := append(makeBox("ftyp", []byte("isom\x00\x00\x02\x00isomiso6")), moovVersion(codecBox, tkhdVersion)...)
+	return fragmentedFileWithMoovSamples(moovVersion(codecBox, tkhdVersion), fragments)
+}
+
+func fragmentedFileWithMoov(moovBox []byte) []byte {
+	return fragmentedFileWithMoovSamples(moovBox, [][]sample{{
+		{duration: 40, data: []byte{0, 0, 0, 1, 0x65}, key: true},
+	}})
+}
+
+func fragmentedFileWithMoovSamples(moovBox []byte, fragments [][]sample) []byte {
+	data := append(makeBox("ftyp", []byte("isom\x00\x00\x02\x00isomiso6")), moovBox...)
 	for i, samples := range fragments {
 		moof, offset := moof(i+1, samples)
 		mdatData := flattenSamples(samples)
@@ -268,23 +349,50 @@ func moov(codecBox []byte) []byte {
 }
 
 func moovVersion(codecBox []byte, tkhdVersion byte) []byte {
+	return moovVersions([][]byte{codecBox}, tkhdVersion, 0, nil)
+}
+
+func moovVersions(entries [][]byte, tkhdVersion, mdhdVersion byte, stsdTail []byte) []byte {
+	tkhdLen := 80
+	if tkhdVersion == 1 {
+		tkhdLen = 92
+	}
+	mdhdLen := 20
+	if mdhdVersion == 1 {
+		mdhdLen = 32
+	}
+	return moovVersionsWithLengths(entries, tkhdVersion, mdhdVersion, stsdTail, tkhdLen, mdhdLen, 27)
+}
+
+func moovVersionsWithLengths(entries [][]byte, tkhdVersion, mdhdVersion byte, stsdTail []byte, tkhdLen, mdhdLen, hdlrLen int) []byte {
 	mvhd := fullBox("mvhd", 0, 0, make([]byte, 16))
 	binary.BigEndian.PutUint32(mvhd[20:24], 1000)
-	mdhd := fullBox("mdhd", 0, 0, make([]byte, 16))
-	binary.BigEndian.PutUint32(mdhd[20:24], 1000)
-	hdlrPayload := make([]byte, 24)
-	copy(hdlrPayload[4:8], "vide")
-	copy(hdlrPayload[16:], "camera")
-	hdlr := fullBox("hdlr", 0, 0, hdlrPayload)
-	stsdPayload := append(make([]byte, 4), codecBox...)
-	binary.BigEndian.PutUint32(stsdPayload, 1)
-	stsd := fullBox("stsd", 0, 0, stsdPayload)
-	tkhdPayload := make([]byte, 80)
-	if tkhdVersion == 1 {
-		tkhdPayload = make([]byte, 92)
-		binary.BigEndian.PutUint32(tkhdPayload[16:20], 1)
+	mdhdPayload := make([]byte, mdhdLen)
+	mdhd := fullBox("mdhd", uint32(mdhdVersion), 0, mdhdPayload)
+	if mdhdVersion == 1 {
+		binary.BigEndian.PutUint32(mdhd[28:32], 1000)
+	} else {
+		binary.BigEndian.PutUint32(mdhd[20:24], 1000)
 	}
-	if tkhdVersion == 0 {
+	hdlrPayload := make([]byte, hdlrLen)
+	if len(hdlrPayload) >= 8 {
+		copy(hdlrPayload[4:8], "vide")
+	}
+	if len(hdlrPayload) >= 27 {
+		copy(hdlrPayload[20:27], "camera\x00")
+	}
+	hdlr := fullBox("hdlr", 0, 0, hdlrPayload)
+	stsdPayload := make([]byte, 4)
+	binary.BigEndian.PutUint32(stsdPayload, uint32(len(entries)))
+	for _, entry := range entries {
+		stsdPayload = append(stsdPayload, entry...)
+	}
+	stsdPayload = append(stsdPayload, stsdTail...)
+	stsd := fullBox("stsd", 0, 0, stsdPayload)
+	tkhdPayload := make([]byte, tkhdLen)
+	if tkhdVersion == 1 {
+		binary.BigEndian.PutUint32(tkhdPayload[16:20], 1)
+	} else if tkhdVersion == 0 {
 		binary.BigEndian.PutUint32(tkhdPayload[8:12], 1)
 	}
 	tkhd := fullBox("tkhd", uint32(tkhdVersion), 0, tkhdPayload)

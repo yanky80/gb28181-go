@@ -230,22 +230,24 @@ func (p *parser) parseTrak(trak box) (*trackInfo, bool, error) {
 		}
 		switch b.typ {
 		case "tkhd":
-			v, err := p.readPrefix(b, 24)
+			v, err := p.readPrefix(b, 4)
 			if err != nil {
 				return nil, false, err
-			}
-			if len(v) < 16 {
-				return nil, false, invalid("short tkhd")
 			}
 			if v[0] != 0 && v[0] != 1 {
 				return nil, false, invalid("unsupported tkhd version")
 			}
 			if v[0] == 1 {
-				if len(v) < 24 {
-					return nil, false, invalid("short version 1 tkhd")
+				v, err = p.readPrefix(b, 96)
+				if err != nil {
+					return nil, false, err
 				}
 				id = binary.BigEndian.Uint32(v[20:24])
 			} else {
+				v, err = p.readPrefix(b, 84)
+				if err != nil {
+					return nil, false, err
+				}
 				id = binary.BigEndian.Uint32(v[12:16])
 			}
 		case "mdia":
@@ -267,31 +269,42 @@ func (p *parser) parseTrak(trak box) (*trackInfo, bool, error) {
 		}
 		switch b.typ {
 		case "mdhd":
-			v, err := p.readSmall(b, 36)
+			v, err := p.readPrefix(b, 4)
 			if err != nil {
 				return nil, false, err
-			}
-			if len(v) < 16 {
-				return nil, false, invalid("short mdhd")
 			}
 			if v[0] != 0 && v[0] != 1 {
 				return nil, false, invalid("unsupported mdhd version")
 			}
 			if v[0] == 1 {
-				if len(v) < 24 {
-					return nil, false, invalid("short version 1 mdhd")
+				v, err = p.readPrefix(b, 36)
+				if err != nil {
+					return nil, false, err
 				}
 				timescale = binary.BigEndian.Uint32(v[20:24])
 			} else {
+				v, err = p.readPrefix(b, 24)
+				if err != nil {
+					return nil, false, err
+				}
 				timescale = binary.BigEndian.Uint32(v[12:16])
 			}
 		case "hdlr":
-			v, err := p.readPrefix(b, 12)
+			v, err := p.readPrefix(b, 24)
 			if err != nil {
 				return nil, false, err
 			}
-			if len(v) < 12 {
-				return nil, false, invalid("short hdlr")
+			if b.end-b.payload > 24 {
+				var terminator [1]byte
+				if _, err := p.r.ReadAt(terminator[:], b.end-1); err != nil {
+					if errors.Is(err, io.EOF) {
+						return nil, false, truncated("short hdlr name")
+					}
+					return nil, false, err
+				}
+				if terminator[0] != 0 {
+					return nil, false, invalid("hdlr name is not null-terminated")
+				}
 			}
 			handler = string(v[8:12])
 		case "minf":
@@ -344,6 +357,7 @@ func (p *parser) parseStsd(stsd box) (*trackInfo, error) {
 		return nil, invalid("invalid stsd entry count")
 	}
 	off := int64(8)
+	var first *trackInfo
 	for i := uint32(0); i < count; i++ {
 		if off+8 > int64(len(v)) {
 			return nil, truncated("short stsd entry")
@@ -364,11 +378,20 @@ func (p *parser) parseStsd(stsd box) (*trackInfo, error) {
 			off += sz
 			continue
 		}
-		info := &trackInfo{codec: codec}
-		if err := p.parseCodecConfig(v[off+86:off+sz], configType, info); err != nil {
-			return nil, err
+		if first == nil {
+			info := &trackInfo{codec: codec}
+			if err := p.parseCodecConfig(v[off+86:off+sz], configType, info); err != nil {
+				return nil, err
+			}
+			first = info
 		}
-		return info, nil
+		off += sz
+	}
+	if off != int64(len(v)) {
+		return nil, invalid("stsd has trailing data")
+	}
+	if first != nil {
+		return first, nil
 	}
 	return nil, invalid("unsupported video codec")
 }

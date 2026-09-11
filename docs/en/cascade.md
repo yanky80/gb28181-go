@@ -57,6 +57,8 @@ a thin wrapper (field names already match).
 
 For recorded segments in the supported fragmented MP4 format,
 `platform/mp4.ParseSegment` can be passed directly to `SetSegmentParser`.
+Its H.264/H.265 samples use 4-byte big-endian NAL length prefixes;
+other `lengthSizeMinusOne` values are rejected.
 
 ## What the upper platform sees
 
