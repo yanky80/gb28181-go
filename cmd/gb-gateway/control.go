@@ -40,6 +40,7 @@ type ControlServer struct {
 	writeTimeout   time.Duration
 	maxConnections int
 	writeQueueSize int
+	queued         atomic.Int64 // aggregate pending commands across all peers
 	metrics        metrics.Hooks
 	nextRequestID  atomic.Uint64
 	nextConnection atomic.Uint64
@@ -465,7 +466,8 @@ func (p *controlPeer) writeLoop() {
 	for {
 		select {
 		case command := <-p.commands:
-			p.server.observe(metrics.GatewayEvent{Name: "queue_depth", CameraID: p.cameraID, RequestID: command.message.RequestID, Value: int64(len(p.commands))})
+			p.server.queued.Add(-1)
+			p.server.observe(metrics.GatewayEvent{Name: "queue_depth", CameraID: p.cameraID, RequestID: command.message.RequestID, Value: p.server.queued.Load()})
 			if !p.server.commandCurrent(p, command) {
 				continue
 			}
@@ -484,6 +486,16 @@ func (p *controlPeer) writeLoop() {
 				return
 			}
 		case <-p.done:
+			p.queueMu.Lock()
+			pending := len(p.commands)
+			for i := 0; i < pending; i++ {
+				select {
+				case <-p.commands:
+				default:
+				}
+			}
+			p.queueMu.Unlock()
+			p.server.queued.Add(-int64(pending))
 			return
 		}
 	}
@@ -505,13 +517,16 @@ func (s *ControlServer) commandCurrent(peer *controlPeer, command controlCommand
 func (p *controlPeer) enqueue(command controlCommand) error {
 	p.queueMu.Lock()
 	defer p.queueMu.Unlock()
+	p.server.queued.Add(1)
 	select {
 	case <-p.done:
+		p.server.queued.Add(-1)
 		return ErrControlUnavailable
 	case p.commands <- command:
-		p.server.observe(metrics.GatewayEvent{Name: "queue_depth", CameraID: p.cameraID, RequestID: command.message.RequestID, Value: int64(len(p.commands))})
+		p.server.observe(metrics.GatewayEvent{Name: "queue_depth", CameraID: p.cameraID, RequestID: command.message.RequestID, Value: p.server.queued.Load()})
 		return nil
 	default:
+		p.server.queued.Add(-1)
 		p.server.observe(metrics.GatewayEvent{Name: "queue_drop", CameraID: p.cameraID, RequestID: command.message.RequestID})
 		return errors.New("gateway: control write queue full")
 	}
@@ -529,9 +544,10 @@ func (p *controlPeer) enqueuePair(first, second controlCommand) error {
 		p.server.observe(metrics.GatewayEvent{Name: "queue_drop", CameraID: p.cameraID})
 		return errors.New("gateway: control write queue full")
 	}
+	p.server.queued.Add(2)
 	p.commands <- first
 	p.commands <- second
-	p.server.observe(metrics.GatewayEvent{Name: "queue_depth", CameraID: p.cameraID, RequestID: second.message.RequestID, Value: int64(len(p.commands))})
+	p.server.observe(metrics.GatewayEvent{Name: "queue_depth", CameraID: p.cameraID, RequestID: second.message.RequestID, Value: p.server.queued.Load()})
 	return nil
 }
 

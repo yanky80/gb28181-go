@@ -80,3 +80,13 @@ is:
 ```sh
 go test ./cmd/gb-gateway -run TestGatewayStartsSocketsBeforeCascadeAndStopsCleanly -count=1
 ```
+
+## Gateway status consumer contract
+
+`gateway-status.json` is replaced atomically with mode `0640`. Consumers may
+read it at any time and must tolerate a missing file during startup or
+shutdown. `channels[].last_health` is omitted until the first health message,
+and `metrics.queue_depth` is the aggregate number of pending control commands
+across all connected peers. The file is change-driven with a bounded
+one-second publication cadence; consumers should not interpret its timestamp
+as a heartbeat.

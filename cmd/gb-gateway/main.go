@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"syscall"
 	"time"
@@ -140,6 +141,7 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 		observability: observability, statusPath: filepath.Join(cfg.IPC.StatusDir, gatewayStatusFile),
 		watchdogEvery: systemdWatchdogInterval(),
 	}
+	cascadeService.SetMetricsHooks(observability)
 	gateway.state = newGatewayState(GatewaySnapshot{
 		ProtocolVersion: cfg.GB.ProtocolVersion,
 		Codec: func() string {
@@ -158,7 +160,11 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 func (g *Gateway) SetMetricsHooks(h metrics.Hooks) { g.observability.SetHooks(h) }
 
 // SetWatchdogNotifier injects the service-manager heartbeat seam.
-func (g *Gateway) SetWatchdogNotifier(notifier WatchdogNotifier) { g.watchdog = notifier }
+func (g *Gateway) SetWatchdogNotifier(notifier WatchdogNotifier) {
+	g.mu.Lock()
+	g.watchdog = notifier
+	g.mu.Unlock()
+}
 
 // Snapshot returns one immutable local health view.
 func (g *Gateway) Snapshot() GatewaySnapshot {
@@ -231,24 +237,25 @@ func (g *Gateway) Start(ctx context.Context) error {
 	}
 
 	if g.cfg.GB.Enabled {
-		g.observability.RegisterAttempt()
 		if err := g.cascade.Start(runCtx); err != nil {
-			g.observability.RegisterFail()
 			_ = g.Stop()
 			g.recordStartError(err)
 			return err
 		}
 	}
+	g.mu.Lock()
 	if g.watchdog == nil {
 		g.watchdog = NewSystemdWatchdogNotifier()
 	}
-	if g.watchdog != nil {
+	watchdog := g.watchdog
+	g.mu.Unlock()
+	if watchdog != nil {
 		interval := g.watchdogEvery
 		if interval <= 0 {
 			interval = time.Second
 		}
 		g.wg.Add(1)
-		go func() { defer g.wg.Done(); newGatewayWatchdog(g.watchdog, interval).Run(runCtx) }()
+		go func() { defer g.wg.Done(); newGatewayWatchdog(watchdog, interval).Run(runCtx) }()
 	}
 	logGateway(slog.LevelInfo, "gb-gateway started", gatewayLogContext{
 		protocolVersion: g.cfg.GB.ProtocolVersion, transport: g.cfg.GB.Transport,
@@ -283,31 +290,21 @@ func (g *Gateway) Stop() error {
 
 func (g *Gateway) observabilityLoop(ctx context.Context) {
 	defer g.wg.Done()
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	var previousDialogs int
-	var previousRegistration string
+	var previous GatewaySnapshot
+	first := true
 	for {
 		snapshot := g.refreshSnapshot()
-		if snapshot.Registration == cascade.StatusOnline && previousRegistration != cascade.StatusOnline {
-			g.observability.RegisterOK()
-		}
-		if previousRegistration == cascade.StatusOnline && snapshot.Registration == cascade.StatusOffline {
-			g.observability.KeepaliveFail()
-		}
-		if snapshot.ActiveDialogs > previousDialogs {
-			for i := previousDialogs; i < snapshot.ActiveDialogs; i++ {
-				g.observability.InviteSessionStarted()
-			}
-		} else if snapshot.ActiveDialogs < previousDialogs {
-			for i := snapshot.ActiveDialogs; i < previousDialogs; i++ {
-				g.observability.InviteSessionStopped()
+		if first || snapshot.Registration != previous.Registration ||
+			snapshot.ActiveDialogs != previous.ActiveDialogs ||
+			snapshot.Metrics != previous.Metrics ||
+			!reflect.DeepEqual(snapshot.Channels, previous.Channels) {
+			if err := writeGatewaySnapshot(g.statusPath, snapshot); err != nil {
+				logGateway(slog.LevelWarn, "gateway status snapshot failed", gatewayLogContext{err: err, protocolVersion: g.cfg.GB.ProtocolVersion, transport: g.cfg.GB.Transport})
 			}
 		}
-		previousDialogs, previousRegistration = snapshot.ActiveDialogs, snapshot.Registration
-		if err := writeGatewaySnapshot(g.statusPath, snapshot); err != nil {
-			logGateway(slog.LevelWarn, "gateway status snapshot failed", gatewayLogContext{err: err, protocolVersion: g.cfg.GB.ProtocolVersion, transport: g.cfg.GB.Transport})
-		}
+		previous, first = snapshot, false
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():

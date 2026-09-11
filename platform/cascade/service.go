@@ -28,6 +28,7 @@ import (
 	"github.com/ghettovoice/gosip/sip"
 	"github.com/mickeyzzc/gb28181-go/backoff"
 	"github.com/mickeyzzc/gb28181-go/manscdp"
+	"github.com/mickeyzzc/gb28181-go/metrics"
 	"github.com/mickeyzzc/gb28181-go/platform"
 	mbsip "github.com/mickeyzzc/gb28181-go/platform/sip"
 )
@@ -98,9 +99,10 @@ type upper struct {
 
 // Service is the cascade client (pkg/app.Service "gb28181-cascade").
 type Service struct {
-	cfg Config
-	src CameraSource
-	db  Store
+	cfg     Config
+	src     CameraSource
+	db      Store
+	metrics metrics.Hooks
 	// segParser reads recorded segment files for playback forwarding; injected
 	// via SetSegmentParser, nil makes Playback/Download INVITEs fail closed
 	// (RecordInfo answers still work off the Store).
@@ -225,6 +227,7 @@ func New(cfg Config, src CameraSource, db Store) *Service {
 	}
 	return &Service{
 		cfg: cfg, src: src, db: db,
+		metrics:         metrics.NoopHooks{},
 		retryBase:       retryBase,
 		retryMax:        retryMax,
 		retryRand:       rand.Int63n,
@@ -240,6 +243,44 @@ func New(cfg Config, src CameraSource, db Store) *Service {
 		ptzLease:        lease,
 		stopDone:        make(chan struct{}),
 	}
+}
+
+// SetMetricsHooks wires the optional event sink. It is a setup-time seam;
+// legacy Hooks implementations remain supported when GatewayHooks is absent.
+func (s *Service) SetMetricsHooks(h metrics.Hooks) {
+	if h == nil {
+		h = metrics.NoopHooks{}
+	}
+	s.metrics = h
+}
+
+func (s *Service) observe(event metrics.GatewayEvent, legacy func(metrics.Hooks)) {
+	hooks := s.metrics
+	if hooks == nil {
+		hooks = metrics.NoopHooks{}
+	}
+	if h, ok := hooks.(metrics.GatewayHooks); ok {
+		h.ObserveGateway(event)
+		return
+	}
+	if legacy != nil {
+		legacy(hooks)
+	}
+}
+
+func (s *Service) observeInviteFailure(callID, channelID, code string) {
+	s.observe(metrics.GatewayEvent{
+		Name: "invite_failure", CallID: callID, GBChannelID: channelID, ErrorCode: code,
+	}, func(h metrics.Hooks) { h.InviteFail() })
+}
+
+func (s *Service) upperVersion(u *upper) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u == nil {
+		return ""
+	}
+	return u.protocolVersion
 }
 
 func (s *Service) storeContext(ctxs ...context.Context) context.Context {
@@ -545,10 +586,19 @@ func (s *Service) registerLoop(u *upper) {
 			return
 		}
 		generation := u.generation.Load()
+		s.observe(metrics.GatewayEvent{
+			Name: "register_attempt", ProtocolVersion: s.cfg.EffectiveProtocolVersion(),
+			PeerGBVersion: s.upperVersion(u), Transport: "udp",
+		}, func(h metrics.Hooks) { h.RegisterAttempt() })
 		if err := s.sendRegister(u, expires); err != nil {
 			wait := s.jitterRetry(retry.Next())
+			s.observe(metrics.GatewayEvent{
+				Name: "register_failure", ProtocolVersion: s.cfg.EffectiveProtocolVersion(),
+				PeerGBVersion: s.upperVersion(u), Transport: "udp", ErrorCode: safeErrorCode(err),
+			}, func(h metrics.Hooks) { h.RegisterFail() })
 			slog.Warn("gb28181-cascade: register failed, retrying",
-				"upper", u.cfg.ServerAddr, "retry_in", wait.String(), "error", err)
+				"upper", u.cfg.ServerAddr, "retry_in", wait.String(),
+				"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 			s.setOnline(u, false)
 			if !s.wait(s.ctx, wait, u.wake) {
 				return
@@ -562,6 +612,10 @@ func (s *Service) registerLoop(u *upper) {
 		if !s.setOnlineForGeneration(u, true, generation) {
 			continue
 		}
+		s.observe(metrics.GatewayEvent{
+			Name: "register_ok", ProtocolVersion: s.cfg.EffectiveProtocolVersion(),
+			PeerGBVersion: s.upperVersion(u), Transport: "udp",
+		}, func(h metrics.Hooks) { h.RegisterOK() })
 		retry.Reset()
 		// Keepalive cadence while registered.
 		hb := 60 * time.Second
@@ -576,16 +630,29 @@ func (s *Service) registerLoop(u *upper) {
 			if u.generation.Load() != generation {
 				break
 			}
+			s.observe(metrics.GatewayEvent{
+				Name: "heartbeat_attempt", ProtocolVersion: s.cfg.EffectiveProtocolVersion(),
+				PeerGBVersion: s.upperVersion(u), Transport: "udp",
+			}, nil)
 			if err := s.sendKeepalive(u); err != nil {
 				// A keepalive failure usually means the upper platform
 				// restarted (403 Device not registered) or vanished —
 				// re-REGISTER immediately instead of waiting out the
 				// Expires window.
+				s.observe(metrics.GatewayEvent{
+					Name: "heartbeat_failure", ProtocolVersion: s.cfg.EffectiveProtocolVersion(),
+					PeerGBVersion: s.upperVersion(u), Transport: "udp", ErrorCode: safeErrorCode(err),
+				}, func(h metrics.Hooks) { h.KeepaliveFail() })
 				slog.Warn("gb28181-cascade: keepalive failed — re-registering",
-					"upper", u.cfg.ServerAddr, "error", err)
+					"upper", u.cfg.ServerAddr, "error_code", safeErrorCode(err),
+					"diagnostic", safeDiagnostic(err))
 				s.setOnline(u, false)
 				break
 			}
+			s.observe(metrics.GatewayEvent{
+				Name: "heartbeat_ok", ProtocolVersion: s.cfg.EffectiveProtocolVersion(),
+				PeerGBVersion: s.upperVersion(u), Transport: "udp",
+			}, nil)
 		}
 	}
 }
@@ -1201,7 +1268,9 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 func (s *Service) answerCatalog(u *upper, sn int) {
 	items, err := s.catalogItems()
 	if err != nil {
-		slog.Warn("gb28181-cascade: catalog build failed", "error", err)
+		s.observe(metrics.GatewayEvent{Name: "catalog_failure", ErrorCode: safeErrorCode(err)}, nil)
+		slog.Warn("gb28181-cascade: catalog build failed",
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		return
 	}
 	body, err := manscdp.Encode(manscdp.Catalog{
@@ -1212,11 +1281,15 @@ func (s *Service) answerCatalog(u *upper, sn int) {
 		Item:     items,
 	})
 	if err != nil {
+		s.observe(metrics.GatewayEvent{Name: "catalog_failure", ErrorCode: safeErrorCode(err)}, nil)
 		return
 	}
 	if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
-		slog.Warn("gb28181-cascade: catalog response failed", "channels", len(items), "error", err)
+		s.observe(metrics.GatewayEvent{Name: "catalog_failure", ErrorCode: safeErrorCode(err)}, nil)
+		slog.Warn("gb28181-cascade: catalog response failed", "channels", len(items),
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 	} else {
+		s.observe(metrics.GatewayEvent{Name: "catalog_success", Value: int64(len(items))}, nil)
 		slog.Info("gb28181-cascade: catalog response sent", "channels", len(items))
 	}
 }
@@ -1232,7 +1305,8 @@ func (s *Service) answerDeviceInfo(u *upper, sn int) {
 	})
 	if err == nil {
 		if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
-			slog.Warn("gb28181-cascade: deviceinfo response failed", "error", err)
+			slog.Warn("gb28181-cascade: deviceinfo response failed",
+				"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		}
 	}
 }
@@ -1255,7 +1329,8 @@ func (s *Service) answerDeviceStatus(u *upper, sn int, deviceID string) {
 	})
 	if err == nil {
 		if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
-			slog.Warn("gb28181-cascade: device status response failed", "device", deviceID, "error", err)
+			slog.Warn("gb28181-cascade: device status response failed", "device", deviceID,
+				"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		}
 	}
 }

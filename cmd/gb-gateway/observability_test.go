@@ -118,6 +118,39 @@ func TestGatewaySnapshotJSONContainsNoSecrets(t *testing.T) {
 	}
 }
 
+func TestGatewayMetricsSemanticEvents(t *testing.T) {
+	obs := NewGatewayObservability(32, nil)
+	defer obs.Close()
+	for _, event := range []metrics.GatewayEvent{
+		{Name: "register_attempt"}, {Name: "register_ok"}, {Name: "register_failure"},
+		{Name: "heartbeat_attempt"}, {Name: "heartbeat_ok"}, {Name: "heartbeat_failure"},
+		{Name: "catalog_success"}, {Name: "catalog_failure"},
+		{Name: "invite_started"}, {Name: "invite_stopped"}, {Name: "invite_failure"},
+		{Name: "rtp_send", Value: 17}, {Name: "frame_drop", Value: 3},
+		{Name: "playback_success"}, {Name: "playback_failure"},
+	} {
+		obs.Record(event)
+	}
+	got := obs.Snapshot()
+	if got.RegisterAttempts != 1 || got.RegisterOK != 1 || got.RegisterFailures != 1 ||
+		got.HeartbeatAttempts != 1 || got.HeartbeatOK != 1 || got.HeartbeatFailures != 1 ||
+		got.CatalogResults != 2 || got.CatalogFailures != 1 || got.InviteStarted != 1 ||
+		got.InviteStopped != 1 || got.InviteFailures != 1 || got.FrameDrops != 3 || got.RTPSends != 1 ||
+		got.RTPBytes != 17 || got.PlaybackSuccesses != 1 || got.PlaybackFailures != 1 {
+		t.Fatalf("event semantics lost: %+v", got)
+	}
+}
+
+func TestGatewaySnapshotOmitsZeroHealth(t *testing.T) {
+	data, err := json.Marshal(GatewaySnapshot{Channels: []GatewayChannelSnapshot{{CameraID: "front"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "last_health") {
+		t.Fatalf("zero health was serialized: %s", data)
+	}
+}
+
 func TestWriteGatewaySnapshotReplacesFileAtomically(t *testing.T) {
 	path := filepath.Join(t.TempDir(), gatewayStatusFile)
 	snapshot := GatewaySnapshot{ProtocolVersion: "2022", Codec: "h265"}
@@ -154,6 +187,37 @@ func TestGatewayWatchdogNotifierRunsOutsideBusinessPath(t *testing.T) {
 	if notifier.calls.Load() == 0 {
 		t.Fatal("watchdog call was not recorded")
 	}
+}
+
+func TestGatewayWatchdogNotifierIsSerialized(t *testing.T) {
+	notifier := &serialNotifier{}
+	watchdog := newGatewayWatchdog(notifier, time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); watchdog.Run(ctx) }()
+	}
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	wg.Wait()
+	if got := notifier.overlap.Load(); got != 0 {
+		t.Fatalf("watchdog notifications overlapped %d times", got)
+	}
+}
+
+type serialNotifier struct {
+	active  atomic.Int64
+	overlap atomic.Int64
+}
+
+func (n *serialNotifier) Notify() error {
+	if n.active.Add(1) > 1 {
+		n.overlap.Add(1)
+	}
+	time.Sleep(time.Millisecond)
+	n.active.Add(-1)
+	return nil
 }
 
 type countingNotifier struct {

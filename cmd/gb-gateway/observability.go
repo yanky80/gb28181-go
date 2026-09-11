@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,14 +25,17 @@ const (
 	observabilityQueue = 256
 )
 
+var gatewaySecretRE = regexp.MustCompile(`(?i)(authorization|password|passwd|secret|token|credential|api[_-]?key)(\s*[:=]\s*|\s+)[^\s,;]+`)
+var gatewayURLRE = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s,;]+`)
+
 // GatewayChannelSnapshot is the immutable local view of one GB channel.
 type GatewayChannelSnapshot struct {
-	CameraID    string    `json:"camera_id"`
-	GBChannelID string    `json:"gb_channel_id,omitempty"`
-	Status      string    `json:"status"`
-	LastHealth  time.Time `json:"last_health,omitempty"`
-	StreamEpoch uint64    `json:"stream_epoch"`
-	Codec       string    `json:"codec"`
+	CameraID    string     `json:"camera_id"`
+	GBChannelID string     `json:"gb_channel_id,omitempty"`
+	Status      string     `json:"status"`
+	LastHealth  *time.Time `json:"last_health,omitempty"`
+	StreamEpoch uint64     `json:"stream_epoch"`
+	Codec       string     `json:"codec"`
 }
 
 // GatewaySnapshot is the atomically published gateway health view. Slices
@@ -51,24 +55,28 @@ type GatewaySnapshot struct {
 // GatewayMetricsSnapshot contains monotonic counters and the current IPC
 // command queue depth. All fields are safe to read while the gateway runs.
 type GatewayMetricsSnapshot struct {
-	IPCConnections     int64 `json:"ipc_connections"`
-	IPCDisconnects     int64 `json:"ipc_disconnects"`
-	AccessUnits        int64 `json:"access_units"`
-	AUBytes            int64 `json:"au_bytes"`
-	QueueDepth         int64 `json:"queue_depth"`
-	QueueDrops         int64 `json:"queue_drops"`
-	FrameDrops         int64 `json:"frame_drops"`
-	Discontinuities    int64 `json:"discontinuities"`
-	IDRWaits           int64 `json:"idr_waits"`
-	RegisterAttempts   int64 `json:"register_attempts"`
-	RegisterOK         int64 `json:"register_ok"`
-	RegisterFailures   int64 `json:"register_failures"`
-	HeartbeatFailures  int64 `json:"heartbeat_failures"`
-	CatalogResults     int64 `json:"catalog_results"`
-	InviteStarted      int64 `json:"invite_started"`
-	InviteStopped      int64 `json:"invite_stopped"`
-	InviteFailures     int64 `json:"invite_failures"`
-	RTPPackets         int64 `json:"rtp_packets"`
+	IPCConnections    int64 `json:"ipc_connections"`
+	IPCDisconnects    int64 `json:"ipc_disconnects"`
+	AccessUnits       int64 `json:"access_units"`
+	AUBytes           int64 `json:"au_bytes"`
+	QueueDepth        int64 `json:"queue_depth"`
+	QueueDrops        int64 `json:"queue_drops"`
+	FrameDrops        int64 `json:"frame_drops"`
+	Discontinuities   int64 `json:"discontinuities"`
+	IDRWaits          int64 `json:"idr_waits"`
+	RegisterAttempts  int64 `json:"register_attempts"`
+	RegisterOK        int64 `json:"register_ok"`
+	RegisterFailures  int64 `json:"register_failures"`
+	HeartbeatAttempts int64 `json:"heartbeat_attempts"`
+	HeartbeatOK       int64 `json:"heartbeat_ok"`
+	HeartbeatFailures int64 `json:"heartbeat_failures"`
+	CatalogResults    int64 `json:"catalog_results"`
+	CatalogFailures   int64 `json:"catalog_failures"`
+	InviteStarted     int64 `json:"invite_started"`
+	InviteStopped     int64 `json:"invite_stopped"`
+	InviteFailures    int64 `json:"invite_failures"`
+	// RTPSends counts successful PS bursts handed to the RTP packetizer.
+	RTPSends           int64 `json:"rtp_sends"`
 	RTPBytes           int64 `json:"rtp_bytes"`
 	PlaybackSuccesses  int64 `json:"playback_successes"`
 	PlaybackFailures   int64 `json:"playback_failures"`
@@ -76,12 +84,14 @@ type GatewayMetricsSnapshot struct {
 }
 
 type gatewayMetricCounters struct {
-	ipcConnections, ipcDisconnects, accessUnits, auBytes              atomic.Int64
-	queueDepth, queueDrops, frameDrops, discontinuities, idrWaits     atomic.Int64
-	registerAttempts, registerOK, registerFailures, heartbeatFailures atomic.Int64
-	catalogResults, inviteStarted, inviteStopped, inviteFailures      atomic.Int64
-	rtpPackets, rtpBytes, playbackSuccesses, playbackFailures         atomic.Int64
-	observabilityDrops                                                atomic.Int64
+	ipcConnections, ipcDisconnects, accessUnits, auBytes          atomic.Int64
+	queueDepth, queueDrops, frameDrops, discontinuities, idrWaits atomic.Int64
+	registerAttempts, registerOK, registerFailures                atomic.Int64
+	heartbeatAttempts, heartbeatOK, heartbeatFailures             atomic.Int64
+	catalogResults, catalogFailures, inviteStarted, inviteStopped atomic.Int64
+	inviteFailures, rtpSends, rtpBytes, playbackSuccesses         atomic.Int64
+	playbackFailures                                              atomic.Int64
+	observabilityDrops                                            atomic.Int64
 }
 
 func (c *gatewayMetricCounters) snapshot() GatewayMetricsSnapshot {
@@ -91,10 +101,11 @@ func (c *gatewayMetricCounters) snapshot() GatewayMetricsSnapshot {
 		QueueDrops: c.queueDrops.Load(), FrameDrops: c.frameDrops.Load(),
 		Discontinuities: c.discontinuities.Load(), IDRWaits: c.idrWaits.Load(),
 		RegisterAttempts: c.registerAttempts.Load(), RegisterOK: c.registerOK.Load(),
-		RegisterFailures: c.registerFailures.Load(), HeartbeatFailures: c.heartbeatFailures.Load(),
-		CatalogResults: c.catalogResults.Load(), InviteStarted: c.inviteStarted.Load(),
+		RegisterFailures: c.registerFailures.Load(), HeartbeatAttempts: c.heartbeatAttempts.Load(),
+		HeartbeatOK: c.heartbeatOK.Load(), HeartbeatFailures: c.heartbeatFailures.Load(),
+		CatalogResults: c.catalogResults.Load(), CatalogFailures: c.catalogFailures.Load(), InviteStarted: c.inviteStarted.Load(),
 		InviteStopped: c.inviteStopped.Load(), InviteFailures: c.inviteFailures.Load(),
-		RTPPackets: c.rtpPackets.Load(), RTPBytes: c.rtpBytes.Load(),
+		RTPSends: c.rtpSends.Load(), RTPBytes: c.rtpBytes.Load(),
 		PlaybackSuccesses: c.playbackSuccesses.Load(), PlaybackFailures: c.playbackFailures.Load(),
 		ObservabilityDrops: c.observabilityDrops.Load(),
 	}
@@ -150,6 +161,8 @@ func (o *GatewayObservability) Record(event metrics.GatewayEvent) {
 	switch metric {
 	case "register_attempt", "register_ok", "register_failure", "heartbeat_failure",
 		"invite_started", "invite_stopped", "invite_failure", "ps_bytes_out":
+	case "rtp_send":
+		metric = "ps_bytes_out"
 	default:
 		metric = ""
 	}
@@ -199,7 +212,11 @@ func (o *GatewayObservability) count(event metrics.GatewayEvent) {
 	case "queue_drop":
 		o.counters.queueDrops.Add(1)
 	case "frame_drop":
-		o.counters.frameDrops.Add(1)
+		dropped := event.Value
+		if dropped <= 0 {
+			dropped = 1
+		}
+		o.counters.frameDrops.Add(dropped)
 	case "discontinuity":
 		o.counters.discontinuities.Add(1)
 	case "idr_wait":
@@ -212,16 +229,23 @@ func (o *GatewayObservability) count(event metrics.GatewayEvent) {
 		o.counters.registerFailures.Add(1)
 	case "heartbeat_failure":
 		o.counters.heartbeatFailures.Add(1)
-	case "catalog_result":
+	case "heartbeat_attempt":
+		o.counters.heartbeatAttempts.Add(1)
+	case "heartbeat_ok":
+		o.counters.heartbeatOK.Add(1)
+	case "catalog_success", "catalog_failure":
 		o.counters.catalogResults.Add(1)
+		if event.Name == "catalog_failure" {
+			o.counters.catalogFailures.Add(1)
+		}
 	case "invite_started":
 		o.counters.inviteStarted.Add(1)
 	case "invite_stopped":
 		o.counters.inviteStopped.Add(1)
 	case "invite_failure":
 		o.counters.inviteFailures.Add(1)
-	case "rtp_packet":
-		o.counters.rtpPackets.Add(1)
+	case "rtp_send":
+		o.counters.rtpSends.Add(1)
 		o.counters.rtpBytes.Add(event.Value)
 	case "playback_success":
 		o.counters.playbackSuccesses.Add(1)
@@ -299,6 +323,7 @@ type WatchdogNotifier interface {
 type gatewayWatchdog struct {
 	notifier WatchdogNotifier
 	interval time.Duration
+	mu       sync.Mutex
 }
 
 func newGatewayWatchdog(notifier WatchdogNotifier, interval time.Duration) *gatewayWatchdog {
@@ -312,17 +337,23 @@ func (w *gatewayWatchdog) Run(ctx context.Context) {
 	if w == nil || w.notifier == nil {
 		return
 	}
-	_ = w.notifier.Notify()
+	w.notify()
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			_ = w.notifier.Notify()
+			w.notify()
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+func (w *gatewayWatchdog) notify() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_ = w.notifier.Notify()
 }
 
 type systemdWatchdogNotifier struct {
@@ -413,6 +444,7 @@ type gatewayLogContext struct {
 
 func logGateway(level slog.Level, message string, fields gatewayLogContext) {
 	errorCode := ""
+	diagnostic := ""
 	if fields.err != nil {
 		errorCode = "operation_failed"
 		if errors.Is(fields.err, context.Canceled) {
@@ -420,6 +452,7 @@ func logGateway(level slog.Level, message string, fields gatewayLogContext) {
 		} else if errors.Is(fields.err, context.DeadlineExceeded) {
 			errorCode = "deadline_exceeded"
 		}
+		diagnostic = gatewayDiagnostic(fields.err)
 	}
 	slog.Log(context.Background(), level, message,
 		"camera_id", fields.cameraID,
@@ -433,7 +466,21 @@ func logGateway(level slog.Level, message string, fields gatewayLogContext) {
 		"transport", fields.transport,
 		"ssrc", fields.ssrc,
 		"error_code", errorCode,
+		"diagnostic", diagnostic,
 	)
+}
+
+func gatewayDiagnostic(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := gatewayURLRE.ReplaceAllString(err.Error(), "[URL_REDACTED]")
+	text = gatewaySecretRE.ReplaceAllString(text, "[REDACTED]")
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 256 {
+		text = text[:256]
+	}
+	return text
 }
 
 func (g *Gateway) refreshSnapshot() GatewaySnapshot {
@@ -449,9 +496,14 @@ func (g *Gateway) refreshSnapshot() GatewaySnapshot {
 		if view.Online {
 			status = "ON"
 		}
+		var lastHealth *time.Time
+		if !view.LastHealth.IsZero() {
+			health := view.LastHealth
+			lastHealth = &health
+		}
 		channelViews = append(channelViews, GatewayChannelSnapshot{
 			CameraID: view.ID, GBChannelID: byCamera[view.ID], Status: status,
-			LastHealth: view.LastHealth, StreamEpoch: view.StreamEpoch, Codec: codecName(view.Codec),
+			LastHealth: lastHealth, StreamEpoch: view.StreamEpoch, Codec: codecName(view.Codec),
 		})
 	}
 	registration := "DISABLED"

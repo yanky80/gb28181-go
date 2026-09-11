@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ghettovoice/gosip/sip"
+	"github.com/mickeyzzc/gb28181-go/metrics"
 	"github.com/mickeyzzc/gb28181-go/psmux"
 )
 
@@ -54,7 +55,10 @@ type playbackSession struct {
 	ctrl chan pbCtrl // MANSRTSP controls (paused 1-bit channel, buffered)
 	done chan struct{}
 
-	closed atomic.Bool
+	closed         atomic.Bool
+	started        atomic.Bool
+	stopped        atomic.Bool
+	resultReported atomic.Bool
 
 	frames atomic.Int64
 	bytes  atomic.Int64
@@ -72,29 +76,34 @@ type pbCtrl struct {
 // stream at file speed. 404 when the channel is unknown or the window holds
 // no recordings (the platform surfaces that as a fetch error).
 func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP, u *upper, generation uint64) {
+	reject := func(status sip.StatusCode, reason, code string) {
+		s.observeInviteFailure(callID, channelID, code)
+		s.observe(metrics.GatewayEvent{Name: "playback_failure", CallID: callID, GBChannelID: channelID, ErrorCode: code}, nil)
+		_, _ = s.srv.RespondOnRequest(req, status, reason, "", nil)
+	}
 	cameraID, ok := s.cameraOfChannel(channelID)
 	if !ok {
 		slog.Warn("gb28181-cascade: playback INVITE for unknown channel", "channel", channelID)
-		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
+		reject(404, "Unknown Channel", "unknown_channel")
 		return
 	}
 	cam, ok := s.cameraInfo(cameraID)
 	if !ok {
-		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
+		reject(404, "Unknown Channel", "unknown_channel")
 		return
 	}
 	_, expectedCodec, profileErr := cameraProtocolProfile(s.cfg, cam)
 	if profileErr != nil || !s.mediaVersionAllowed(u, cam) {
-		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+		reject(488, StatusVersionMismatch, "version_mismatch")
 		return
 	}
 	if s.db == nil || !s.segmentParserConfigured() {
 		slog.Warn("gb28181-cascade: playback unavailable — recording capability is not configured", "channel", channelID)
-		_, _ = s.srv.RespondOnRequest(req, 503, "Playback Unavailable", "", nil)
+		reject(503, "Playback Unavailable", "playback_unavailable")
 		return
 	}
 	if !sd.hasT {
-		_, _ = s.srv.RespondOnRequest(req, 400, "Playback without time range", "", nil)
+		reject(400, "Playback without time range", "missing_time_range")
 		return
 	}
 	s.mu.Lock()
@@ -103,7 +112,7 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	start := time.Unix(sd.t0, 0)
 	end := time.Unix(sd.t1, 0)
 	if !end.After(start) {
-		_, _ = s.srv.RespondOnRequest(req, 400, "Bad time range", "", nil)
+		reject(400, "Bad time range", "invalid_time_range")
 		return
 	}
 	if end.Sub(start) > pbMaxWindow {
@@ -117,20 +126,20 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	recs, err := s.playbackRecordings(ctx, cameraID, start, end)
 	if err != nil {
 		if ctx.Err() != nil {
-			_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+			reject(503, "Service Unavailable", "service_unavailable")
 		} else {
-			_, _ = s.srv.RespondOnRequest(req, 500, "Recording Store Unavailable", "", nil)
+			reject(500, "Recording Store Unavailable", safeErrorCode(err))
 		}
 		return
 	}
 	if s.stopping.Load() || ctx.Err() != nil {
-		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+		reject(503, "Service Unavailable", "service_unavailable")
 		return
 	}
 	if len(recs) == 0 {
 		slog.Info("gb28181-cascade: playback INVITE for empty window",
 			"channel", channelID, "start", start, "end", end)
-		_, _ = s.srv.RespondOnRequest(req, 404, "No Records", "", nil)
+		reject(404, "No Records", "no_records")
 		return
 	}
 	compatible := false
@@ -141,7 +150,7 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		}
 	}
 	if !compatible {
-		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+		reject(488, StatusVersionMismatch, "version_mismatch")
 		return
 	}
 	for _, rec := range recs {
@@ -150,15 +159,15 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		}
 		seg, err := s.parseSegment(rec.FilePath)
 		if err != nil {
-			_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
+			reject(500, "Playback Unavailable", safeErrorCode(err))
 			return
 		}
 		if err := s.validatePlaybackSegment(cameraID, seg); err != nil {
-			_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+			reject(488, StatusVersionMismatch, safeErrorCode(err))
 			return
 		}
 		if err := validatePlaybackFile(rec.FilePath, seg); err != nil {
-			_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
+			reject(500, "Playback Unavailable", safeErrorCode(err))
 			return
 		}
 	}
@@ -169,7 +178,7 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	if sd.tcp {
 		conn, err = (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", target)
 		if err != nil {
-			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
+			reject(500, "Internal Error", safeErrorCode(err))
 			return
 		}
 		rtp = psmux.NewRTPPacketizerTCP(conn, sd.ssrc, uint16(time.Now().UnixNano()&0xFFFF))
@@ -177,7 +186,7 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		dst := &net.UDPAddr{IP: net.ParseIP(sd.host), Port: sd.port}
 		conn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 		if err != nil {
-			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
+			reject(500, "Internal Error", safeErrorCode(err))
 			return
 		}
 		rtp = psmux.NewRTPPacketizer(conn, dst, sd.ssrc, uint16(time.Now().UnixNano()&0xFFFF))
@@ -268,6 +277,7 @@ func (ps *playbackSession) pump() {
 	for !ps.closed.Load() {
 		done, nextSeek, err := ps.playOnce(seekNPT)
 		if err != nil {
+			ps.observeResult(false)
 			ps.finish("playback error: "+err.Error(), true)
 			return
 		}
@@ -282,6 +292,7 @@ func (ps *playbackSession) pump() {
 			break
 		}
 	}
+	ps.observeResult(ps.started.Load())
 	ps.finish("end of media", true)
 }
 
@@ -295,7 +306,7 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 	recs, err := ps.svc.playbackRecordings(ctx, ps.camera, ps.start, ps.end)
 	if err != nil {
 		slog.Warn("gb28181-cascade: playback recordings query failed",
-			"camera", ps.camera, "error", err)
+			"camera", ps.camera, "error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		return false, nil, err
 	}
 
@@ -330,7 +341,7 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 		f, err := os.Open(rec.FilePath)
 		if err != nil {
 			slog.Debug("gb28181-cascade: playback cannot open recording",
-				"path", rec.FilePath, "error", err)
+				"path", rec.FilePath, "error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 			continue
 		}
 		ps.mux.SetVideoCodec(seg.Codec)
@@ -436,6 +447,7 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 				_ = f.Close()
 				return false, nil, err
 			}
+			ps.observeRTP(len(psTS))
 			ps.frames.Add(1)
 			ps.bytes.Add(int64(len(psTS)))
 		}
@@ -578,8 +590,9 @@ func (ps *playbackSession) finish(reason string, bye bool) {
 	if bye {
 		ps.svc.sendBye(ps.upper, ps.callID, ps.channel)
 	}
+	ps.observeStopped()
 	slog.Info("gb28181-cascade: playback ended",
-		"channel", ps.channel, "reason", reason,
+		"channel", ps.channel, "reason", safeText(reason),
 		"frames", ps.frames.Load(), "bytes", ps.bytes.Load())
 }
 
@@ -590,6 +603,43 @@ func (ps *playbackSession) stop() {
 	}
 	close(ps.done)
 	_ = ps.conn.Close()
+	ps.observeStopped()
+}
+
+func (ps *playbackSession) observeRTP(bytes int) {
+	if ps.started.CompareAndSwap(false, true) {
+		ps.svc.observe(metrics.GatewayEvent{
+			Name: "invite_started", CallID: ps.callID, GBChannelID: ps.channel,
+			StreamEpoch: ps.generation, SSRC: ps.ssrc,
+		}, func(h metrics.Hooks) { h.InviteSessionStarted() })
+	}
+	ps.svc.observe(metrics.GatewayEvent{
+		Name: "rtp_send", CallID: ps.callID, GBChannelID: ps.channel,
+		StreamEpoch: ps.generation, SSRC: ps.ssrc, Value: int64(bytes),
+	}, func(h metrics.Hooks) { h.PSBytesOut(int64(bytes)) })
+}
+
+func (ps *playbackSession) observeStopped() {
+	if ps.stopped.CompareAndSwap(false, true) {
+		ps.svc.observe(metrics.GatewayEvent{
+			Name: "invite_stopped", CallID: ps.callID, GBChannelID: ps.channel,
+			StreamEpoch: ps.generation, SSRC: ps.ssrc,
+		}, func(h metrics.Hooks) { h.InviteSessionStopped() })
+	}
+}
+
+func (ps *playbackSession) observeResult(success bool) {
+	if !ps.resultReported.CompareAndSwap(false, true) {
+		return
+	}
+	name := "playback_failure"
+	if success {
+		name = "playback_success"
+	}
+	ps.svc.observe(metrics.GatewayEvent{
+		Name: name, CallID: ps.callID, GBChannelID: ps.channel,
+		StreamEpoch: ps.generation,
+	}, nil)
 }
 
 // ---- SIP INFO (MANSRTSP) ----

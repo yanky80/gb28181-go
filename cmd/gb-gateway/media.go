@@ -329,10 +329,17 @@ func (c *mediaConnection) publish(frame edgeipc.MediaFrame) error {
 		c.server.mu.Unlock()
 		return ErrMediaConnectionReplaced
 	}
-	dropped := !c.server.registry.Publish(c.cameraID, c.epoch, int64(frame.PTS90kHz), nals, frame.Flags&edgeipc.FlagIDR != 0)
+	view, _ := c.server.registry.Camera(c.cameraID)
+	beforeDropped := int64(0)
+	if view.Hub != nil {
+		beforeDropped = view.Hub.Dropped()
+	}
+	published := c.server.registry.Publish(c.cameraID, c.epoch, int64(frame.PTS90kHz), nals, frame.Flags&edgeipc.FlagIDR != 0)
 	c.server.mu.Unlock()
-	if dropped {
-		c.server.observe(metrics.GatewayEvent{Name: "frame_drop", CameraID: c.cameraID, StreamEpoch: c.epoch, Codec: codecName(c.codec)})
+	if published && view.Hub != nil {
+		if dropped := view.Hub.Dropped() - beforeDropped; dropped > 0 {
+			c.server.observe(metrics.GatewayEvent{Name: "frame_drop", CameraID: c.cameraID, StreamEpoch: c.epoch, Codec: codecName(c.codec), Value: dropped})
+		}
 	}
 	c.server.observe(metrics.GatewayEvent{
 		Name: "access_unit", CameraID: c.cameraID, StreamEpoch: c.epoch,
