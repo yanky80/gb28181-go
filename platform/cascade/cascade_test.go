@@ -385,7 +385,9 @@ func TestNilStoreChannelBindingsSurviveHideAndReorder(t *testing.T) {
 func TestUpperForDeviceStatusRejectsUnknownSource(t *testing.T) {
 	svc := New(testCfg(), fakeSource{}, newCascadeTestDB(t))
 	require.Nil(t, svc.upperForDeviceStatus(newFromRequest(t, "unknown-upper")))
-	require.Equal(t, svc.uppers[0], svc.upperForDeviceStatus(newFromRequest(t, testCfg().ServerDomain)))
+	valid := newFromRequest(t, testCfg().ServerDomain)
+	valid.SetSource("127.0.0.1:49152")
+	require.Equal(t, svc.uppers[0], svc.upperForDeviceStatus(valid))
 }
 
 // TestCatalogHiddenCamerasExcluded verifies catalog convergence: cameras with

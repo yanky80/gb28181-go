@@ -18,7 +18,8 @@ var catalogAllocationMu sync.Mutex
 // with GB channel IDs allocated on first sight and persisted
 // (cascade_channels) so the upper platform's bindings survive restarts.
 // Format: <LocalDeviceID[:10]> + "132" + 7-digit serial.
-func (s *Service) catalogItems() ([]manscdp.Item, error) {
+func (s *Service) catalogItems(ctxs ...context.Context) ([]manscdp.Item, error) {
+	ctx := s.storeContext(ctxs...)
 	cams := s.src.Cameras()
 
 	alloc := map[string]string{} // cameraID → gbChannelID
@@ -30,7 +31,7 @@ func (s *Service) catalogItems() ([]manscdp.Item, error) {
 			catalogAllocationMu.Lock()
 			defer catalogAllocationMu.Unlock()
 		}
-		rows, err := s.db.ListCascadeChannels(context.Background())
+		rows, err := s.db.ListCascadeChannels(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -65,7 +66,7 @@ func (s *Service) catalogItems() ([]manscdp.Item, error) {
 			chID, ok = alloc[cam.ID]
 			if !ok {
 				if allocator != nil {
-					channel, err := allocator.AllocateCascadeChannel(context.Background(), cam.ID, prefix, cam.Name)
+					channel, err := allocator.AllocateCascadeChannel(ctx, cam.ID, prefix, cam.Name)
 					if err != nil {
 						return nil, err
 					}
@@ -73,7 +74,7 @@ func (s *Service) catalogItems() ([]manscdp.Item, error) {
 				} else {
 					maxSerial++
 					chID = fmt.Sprintf("%s%07d", prefix, maxSerial)
-					if err := s.db.UpsertCascadeChannel(context.Background(), CascadeChannel{
+					if err := s.db.UpsertCascadeChannel(ctx, CascadeChannel{
 						CameraID: cam.ID, GBChannelID: chID, Name: cam.Name, UpdatedAt: time.Now(),
 					}); err != nil {
 						return nil, fmt.Errorf("persist GB channel allocation for local camera %q: %w", cam.ID, err)
@@ -100,8 +101,12 @@ func (s *Service) catalogItems() ([]manscdp.Item, error) {
 
 // cameraOfChannel resolves the local camera behind an aggregated channel ID.
 func (s *Service) cameraOfChannel(channelID string) (string, bool) {
+	return s.cameraOfChannelContext(s.storeContext(), channelID)
+}
+
+func (s *Service) cameraOfChannelContext(ctx context.Context, channelID string) (string, bool) {
 	if s.db != nil {
-		rows, err := s.db.ListCascadeChannels(context.Background())
+		rows, err := s.db.ListCascadeChannels(ctx)
 		if err != nil {
 			return "", false
 		}

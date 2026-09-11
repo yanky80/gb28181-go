@@ -27,8 +27,8 @@ const gbTimeLayout = "2006-01-02T15:04:05"
 // local camera's recorded segments in the requested window. The response
 // echoes the queried channel ID (platforms correlate on DeviceID+SN — some
 // echo the device ID, but the channel form is what our own platform keys on).
-func (s *Service) answerRecordInfo(u *upper, q manscdp.RecordInfoQuery) {
-	cameraID, ok := s.cameraOfChannel(q.DeviceID)
+func (s *Service) answerRecordInfo(ctx context.Context, u *upper, q manscdp.RecordInfoQuery) {
+	cameraID, ok := s.cameraOfChannelContext(ctx, q.DeviceID)
 	if !ok {
 		slog.Warn("gb28181-cascade: RecordInfo for unknown channel", "channel", q.DeviceID)
 		return
@@ -44,7 +44,7 @@ func (s *Service) answerRecordInfo(u *upper, q manscdp.RecordInfoQuery) {
 		end = start.Add(31 * 24 * time.Hour) // bound the DB scan
 	}
 
-	recs, err := s.db.ListRecordings(context.Background(), RecordingFilter{
+	recs, err := s.db.ListRecordings(ctx, RecordingFilter{
 		CameraID:  cameraID,
 		StartTime: start,
 		EndTime:   end,

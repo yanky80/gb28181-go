@@ -52,8 +52,12 @@ type upperSocket struct {
 }
 
 func newUpperSocket(t *testing.T, sipAddr string) *upperSocket {
+	return newUpperSocketOn(t, sipAddr, lbLocalHost)
+}
+
+func newUpperSocketOn(t *testing.T, sipAddr, bindHost string) *upperSocket {
 	t.Helper()
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(bindHost)})
 	require.NoError(t, err)
 	addr, err := net.ResolveUDPAddr("udp", sipAddr)
 	require.NoError(t, err)
@@ -223,6 +227,9 @@ func startLoopbackServiceWithConfig(t *testing.T, cfg Config, src CameraSource, 
 	svc := New(cfg, src, db)
 	svc.SetSegmentParser(fakeSegmentParser)
 	require.NoError(t, svc.Start(context.Background()))
+	for _, u := range svc.uppers {
+		svc.setOnline(u, true)
+	}
 	t.Cleanup(func() { _ = svc.Stop() })
 	return svc, up
 }

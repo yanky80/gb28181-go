@@ -5,11 +5,13 @@ package cascade
 // depend on their polling fallback.
 
 import (
+	"context"
 	"encoding/xml"
 	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ghettovoice/gosip/sip"
@@ -23,6 +25,9 @@ type catalogSub struct {
 	fromUser string
 	toUser   string
 	expires  time.Time
+	sendMu   sync.Mutex
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 // notifyScanInterval is how often the camera set is diffed for changes.
@@ -34,6 +39,15 @@ var notifyScanInterval = 10 * time.Second
 func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 	u := s.requireUpper(req)
 	if u == nil {
+		return
+	}
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if !s.requireDialogOwner(req, u) {
+		return
+	}
+	if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
 		return
 	}
 	event := ""
@@ -74,22 +88,34 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 		callID = h.String()
 	}
 	fromUser, toUser := reqIDs(req)
+	s.mu.Lock()
+	old := s.subs[callID]
+	s.mu.Unlock()
+	if old != nil {
+		if old.cancel != nil {
+			old.cancel()
+		}
+		old.sendMu.Lock()
+		old.sendMu.Unlock()
+	}
 	expHdr := sip.Expires(uint32(expires))
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", []sip.Header{&expHdr})
 
-	s.mu.Lock()
-	s.subs[callID] = &catalogSub{
+	sub := &catalogSub{
 		upper:    u,
 		callID:   callID,
 		fromUser: fromUser,
 		toUser:   toUser,
 		expires:  time.Now().Add(time.Duration(expires) * time.Second),
 	}
+	sub.ctx, sub.cancel = context.WithCancel(s.storeContext())
+	s.mu.Lock()
+	s.subs[callID] = sub
 	s.mu.Unlock()
 	slog.Info("gb28181-cascade: catalog subscription active",
 		"upper", u.cfg.ServerAddr, "expires", expires)
 	// A fresh subscription immediately gets the current catalog state.
-	go s.sendCatalogNotify(s.subs[callID])
+	go s.sendCatalogNotify(sub)
 }
 
 // catalogNotifyLoop diffs the camera set and pushes NOTIFYs on change until
@@ -109,15 +135,24 @@ func (s *Service) catalogNotifyLoop() {
 		last = cur
 		s.mu.Lock()
 		subs := make([]*catalogSub, 0, len(s.subs))
+		expired := make([]*catalogSub, 0)
 		now := time.Now()
 		for k, sub := range s.subs {
 			if now.After(sub.expires) {
 				delete(s.subs, k)
+				expired = append(expired, sub)
 				continue
 			}
 			subs = append(subs, sub)
 		}
 		s.mu.Unlock()
+		for _, sub := range expired {
+			if sub.cancel != nil {
+				sub.cancel()
+			}
+			sub.sendMu.Lock()
+			sub.sendMu.Unlock()
+		}
 		for _, sub := range subs {
 			go s.sendCatalogNotify(sub)
 		}
@@ -173,7 +208,19 @@ func (s *Service) sendCatalogNotify(sub *catalogSub) {
 	if s.srv == nil || sub == nil {
 		return
 	}
-	items, err := s.catalogItems()
+	sub.sendMu.Lock()
+	defer sub.sendMu.Unlock()
+	s.mu.Lock()
+	active := s.subs[sub.callID] == sub
+	s.mu.Unlock()
+	if !active {
+		return
+	}
+	ctx := sub.ctx
+	if ctx == nil {
+		ctx = s.storeContext()
+	}
+	items, err := s.catalogItems(ctx)
 	if err != nil {
 		slog.Warn("gb28181-cascade: catalog build for NOTIFY failed", "error", err)
 		return
