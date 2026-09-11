@@ -155,6 +155,14 @@ type Store interface {
 	ListRecordings(ctx context.Context, filter RecordingFilter) ([]Recording, error)
 }
 
+// CascadeChannelAllocator is an optional atomic allocation seam. Store
+// remains unchanged for source compatibility; hosts that implement this
+// interface let catalog refreshes allocate GB channels without a read-then-
+// write serial race.
+type CascadeChannelAllocator interface {
+	AllocateCascadeChannel(ctx context.Context, cameraID, prefix, name string) (CascadeChannel, error)
+}
+
 // SegmentInfo describes one recorded segment file at the granularity the
 // cascade playback pump consumes. Hosts with an fMP4 recording pipeline
 // (MiBeeNvr internal/merge) adapt their parser to this shape — the field
