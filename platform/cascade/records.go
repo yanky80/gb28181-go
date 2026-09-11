@@ -28,9 +28,18 @@ const gbTimeLayout = "2006-01-02T15:04:05"
 // echoes the queried channel ID (platforms correlate on DeviceID+SN — some
 // echo the device ID, but the channel form is what our own platform keys on).
 func (s *Service) answerRecordInfo(ctx context.Context, u *upper, q manscdp.RecordInfoQuery) {
+	if ctx == nil {
+		ctx = s.storeContext()
+	}
+	if s.db == nil {
+		slog.Warn("gb28181-cascade: RecordInfo unavailable — no recording store", "channel", q.DeviceID)
+		s.sendEmptyRecordInfo(u, q)
+		return
+	}
 	cameraID, ok := s.cameraOfChannelContext(ctx, q.DeviceID)
 	if !ok {
 		slog.Warn("gb28181-cascade: RecordInfo for unknown channel", "channel", q.DeviceID)
+		s.sendEmptyRecordInfo(u, q)
 		return
 	}
 	start, err1 := time.ParseInLocation(gbTimeLayout, q.StartTime, s.gbTZ())
@@ -38,6 +47,7 @@ func (s *Service) answerRecordInfo(ctx context.Context, u *upper, q manscdp.Reco
 	if err1 != nil || err2 != nil || !end.After(start) {
 		slog.Warn("gb28181-cascade: RecordInfo query with bad time range",
 			"channel", q.DeviceID, "start", q.StartTime, "end", q.EndTime)
+		s.sendEmptyRecordInfo(u, q)
 		return
 	}
 	if end.Sub(start) > 31*24*time.Hour {
@@ -56,6 +66,9 @@ func (s *Service) answerRecordInfo(ctx context.Context, u *upper, q manscdp.Reco
 		slog.Warn("gb28181-cascade: recordings query failed", "camera", cameraID, "error", err)
 		return
 	}
+	if len(recs) > 2000 {
+		recs = recs[:2000]
+	}
 
 	name := q.DeviceID
 	if cam, ok := s.cameraInfo(cameraID); ok && cam.Name != "" {
@@ -63,6 +76,9 @@ func (s *Service) answerRecordInfo(ctx context.Context, u *upper, q manscdp.Reco
 	}
 	items := make([]manscdp.RecordItem, 0, len(recs))
 	for _, rec := range recs {
+		if !recordingOverlaps(rec, start, end) {
+			continue
+		}
 		items = append(items, manscdp.RecordItem{
 			DeviceID:  q.DeviceID,
 			Name:      name,
@@ -96,6 +112,21 @@ func (s *Service) answerRecordInfo(ctx context.Context, u *upper, q manscdp.Reco
 	}
 	slog.Info("gb28181-cascade: record info answered",
 		"channel", q.DeviceID, "camera", cameraID, "records", len(items))
+}
+
+func (s *Service) sendEmptyRecordInfo(u *upper, q manscdp.RecordInfoQuery) {
+	if u == nil || s.srv == nil {
+		return
+	}
+	body, err := manscdp.Encode(manscdp.RecordInfo{
+		CmdType: manscdp.CmdRecordInfo, SN: q.SN, DeviceID: q.DeviceID,
+		Name: q.DeviceID, SumNum: 0,
+	})
+	if err == nil {
+		if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
+			slog.Warn("gb28181-cascade: empty RecordInfo response failed", "channel", q.DeviceID, "error", err)
+		}
+	}
 }
 
 // PTZForwarder translates a decoded GB/T 28181 PTZ direction into the local

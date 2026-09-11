@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -87,6 +88,11 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
 		return
 	}
+	if s.db == nil || !s.segmentParserConfigured() {
+		slog.Warn("gb28181-cascade: playback unavailable — recording capability is not configured", "channel", channelID)
+		_, _ = s.srv.RespondOnRequest(req, 503, "Playback Unavailable", "", nil)
+		return
+	}
 	if !sd.hasT {
 		_, _ = s.srv.RespondOnRequest(req, 400, "Playback without time range", "", nil)
 		return
@@ -139,6 +145,9 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		return
 	}
 	for _, rec := range recs {
+		if !recordingOverlaps(rec, start, end) {
+			continue
+		}
 		seg, err := s.parseSegment(rec.FilePath)
 		if err != nil {
 			_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
@@ -146,6 +155,10 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		}
 		if err := s.validatePlaybackSegment(cameraID, seg); err != nil {
 			_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+			return
+		}
+		if err := validatePlaybackFile(rec.FilePath, seg); err != nil {
+			_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
 			return
 		}
 	}
@@ -233,8 +246,11 @@ func (s *Service) playbackRecordings(ctx context.Context, cameraID string, start
 	}
 	out := recs[:0]
 	for _, r := range recs {
-		if r.Format == FormatH264 || r.Format == FormatH265 {
+		if (r.Format == FormatH264 || r.Format == FormatH265) && recordingOverlaps(r, start, end) {
 			out = append(out, r)
+			if len(out) == 2000 {
+				break
+			}
 		}
 	}
 	return out, nil
@@ -272,6 +288,9 @@ func (ps *playbackSession) pump() {
 // playOnce streams the window once (skipping to seekNPT seconds past the
 // window start). Returns (windowDone, seekRequest, fatalErr).
 func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
+	if math.IsNaN(seekNPT) || math.IsInf(seekNPT, 0) || seekNPT < 0 {
+		return false, nil, fmt.Errorf("invalid seek position %v", seekNPT)
+	}
 	ctx := ps.svc.storeContext()
 	recs, err := ps.svc.playbackRecordings(ctx, ps.camera, ps.start, ps.end)
 	if err != nil {
@@ -295,7 +314,7 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 		if ps.closed.Load() {
 			return false, nil, nil
 		}
-		if !rec.EndedAt.After(ps.start) || rec.StartedAt.After(ps.end) {
+		if !recordingOverlaps(rec, ps.start, ps.end) {
 			continue
 		}
 		seg, err := ps.svc.parseSegment(rec.FilePath)
@@ -303,6 +322,9 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 			return false, nil, fmt.Errorf("parse recording %q: %w", rec.FilePath, err)
 		}
 		if err := ps.svc.validatePlaybackSegment(ps.camera, seg); err != nil {
+			return false, nil, err
+		}
+		if err := validatePlaybackFile(rec.FilePath, seg); err != nil {
 			return false, nil, err
 		}
 		f, err := os.Open(rec.FilePath)
@@ -315,8 +337,17 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 
 		var durAcc uint64 // sample-time units since recording start
 		for _, smp := range seg.Samples {
-			wall := rec.StartedAt.Add(time.Duration(durAcc * uint64(time.Second) / uint64(seg.Timescale)))
+			wallOffset, ok := playbackDuration(durAcc, seg.Timescale)
+			if !ok {
+				_ = f.Close()
+				return false, nil, fmt.Errorf("recording %q has an invalid sample timeline", rec.FilePath)
+			}
+			wall := rec.StartedAt.Add(wallOffset)
 			durAcc += uint64(smp.Duration)
+			if !wall.Before(ps.end) {
+				_ = f.Close()
+				return true, nil, nil
+			}
 
 			num90 += int64(smp.Duration) * 90000
 			cum90 += num90 / int64(seg.Timescale)
@@ -335,9 +366,6 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 				started = true
 				firstCum90 = cum90
 				base = time.Now()
-			} else if wall.After(ps.end) {
-				_ = f.Close()
-				return true, nil, nil
 			}
 
 			rel := cum90 - firstCum90
@@ -428,7 +456,76 @@ func (s *Service) validatePlaybackSegment(cameraID string, seg *SegmentInfo) err
 	if seg == nil || seg.Codec != expectedCodec {
 		return fmt.Errorf("recording codec %q does not match profile codec %q", segCodec(seg), expectedCodec)
 	}
+	if len(seg.Samples) == 0 {
+		// Header-only parser results are retained for the existing configured
+		// success path; there is no sample timeline for Timescale to govern.
+		return nil
+	}
+	if seg.Timescale == 0 {
+		return fmt.Errorf("recording timescale is zero")
+	}
+	previousEnd := int64(-1)
+	for _, sample := range seg.Samples {
+		if sample.Offset < 0 || sample.Size == 0 || sample.Size > maxPlaybackSampleSize || sample.Duration == 0 {
+			return fmt.Errorf("recording has invalid sample offset, size, or duration")
+		}
+		end, ok := addPlaybackInt64(sample.Offset, int64(sample.Size))
+		if !ok || (previousEnd >= 0 && sample.Offset < previousEnd) {
+			return fmt.Errorf("recording has invalid sample offset")
+		}
+		previousEnd = end
+	}
 	return nil
+}
+
+const maxPlaybackSampleSize = 16 << 20
+
+func recordingOverlaps(rec Recording, start, end time.Time) bool {
+	// Windows are half-open: a segment ending at start or starting at end is
+	// outside the request.
+	return rec.EndedAt.After(start) && rec.StartedAt.Before(end)
+}
+
+func validatePlaybackFile(path string, seg *SegmentInfo) error {
+	if len(seg.Samples) == 0 {
+		return nil
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat recording %q: %w", path, err)
+	}
+	for _, sample := range seg.Samples {
+		end, _ := addPlaybackInt64(sample.Offset, int64(sample.Size))
+		if end > st.Size() {
+			return fmt.Errorf("recording sample exceeds file size")
+		}
+	}
+	return nil
+}
+
+func addPlaybackInt64(a, b int64) (int64, bool) {
+	if b > 0 && a > int64(^uint64(0)>>1)-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func playbackDuration(ticks uint64, timescale uint32) (time.Duration, bool) {
+	if timescale == 0 {
+		return 0, false
+	}
+	whole := ticks / uint64(timescale)
+	rem := ticks % uint64(timescale)
+	const maxInt64 = uint64(1<<63 - 1)
+	if whole > maxInt64/uint64(time.Second) {
+		return 0, false
+	}
+	nanos := whole * uint64(time.Second)
+	nanos += rem * uint64(time.Second) / uint64(timescale)
+	if nanos > maxInt64 {
+		return 0, false
+	}
+	return time.Duration(nanos), true
 }
 
 func segCodec(seg *SegmentInfo) string {

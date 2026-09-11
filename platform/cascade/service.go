@@ -99,9 +99,10 @@ type Service struct {
 	src CameraSource
 	db  Store
 	// segParser reads recorded segment files for playback forwarding; injected
-	// via SetSegmentParser, nil disables playback media (RecordInfo answers
-	// still work off the Store).
+	// via SetSegmentParser, nil makes Playback/Download INVITEs fail closed
+	// (RecordInfo answers still work off the Store).
 	segParser SegmentParser
+	capMu     sync.RWMutex
 	// subAcq serves sub-stream forwardings (#512); nil = main-only.
 	subAcq SubStreamAcquirer
 	// mainAcq serves live main-stream leases; nil preserves the legacy Hub path.
@@ -297,15 +298,28 @@ func parseRetryDuration(v string, def time.Duration) time.Duration {
 }
 
 // SetSegmentParser injects the host's recorded-segment reader (fMP4 or
-// otherwise). Without it, playback INVITEs are answered but carry no media.
-func (s *Service) SetSegmentParser(p SegmentParser) { s.segParser = p }
+// otherwise). Without it, playback INVITEs are rejected as unavailable.
+func (s *Service) SetSegmentParser(p SegmentParser) {
+	s.capMu.Lock()
+	s.segParser = p
+	s.capMu.Unlock()
+}
 
 // parseSegment reads one segment file through the injected parser.
 func (s *Service) parseSegment(path string) (*SegmentInfo, error) {
-	if s.segParser == nil {
+	s.capMu.RLock()
+	parser := s.segParser
+	s.capMu.RUnlock()
+	if parser == nil {
 		return nil, errors.New("cascade: no segment parser configured")
 	}
-	return s.segParser(path)
+	return parser(path)
+}
+
+func (s *Service) segmentParserConfigured() bool {
+	s.capMu.RLock()
+	defer s.capMu.RUnlock()
+	return s.segParser != nil
 }
 
 // SetGBTimezone pins the zone used for GB/T 28181 naive timestamps (RecordInfo
@@ -379,6 +393,9 @@ func (s *Service) Start(ctx context.Context) error {
 	if err := s.validateProtocolProfiles(); err != nil {
 		return fmt.Errorf("gb28181-cascade: %w", err)
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.storeMu.Lock()
 	s.storeCtx, s.storeCancel = context.WithCancel(s.ctx)
@@ -441,6 +458,7 @@ func (s *Service) Stop() error {
 func (s *Service) stop() error {
 	defer close(s.stopDone)
 	s.stopping.Store(true)
+	s.cancelStoreContext()
 	if s.cancel != nil {
 		s.cancel()
 	}

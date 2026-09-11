@@ -3,6 +3,8 @@ package cascade
 import (
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -472,9 +474,10 @@ func (s *blockingRecordInfoStore) ListRecordings(ctx context.Context, _ Recordin
 
 type releasePlaybackStore struct {
 	*fakeCascadeStore
-	entered chan struct{}
-	release chan struct{}
-	once    sync.Once
+	entered  chan struct{}
+	release  chan struct{}
+	filePath string
+	once     sync.Once
 }
 
 func (s *releasePlaybackStore) ListRecordings(context.Context, RecordingFilter) ([]Recording, error) {
@@ -483,7 +486,7 @@ func (s *releasePlaybackStore) ListRecordings(context.Context, RecordingFilter) 
 	start := time.Now().Add(-10 * time.Minute)
 	return []Recording{{
 		CameraID:  "cam-1",
-		FilePath:  "blocked-segment",
+		FilePath:  s.filePath,
 		Format:    FormatH264,
 		StartedAt: start,
 		EndedAt:   start.Add(5 * time.Minute),
@@ -684,10 +687,13 @@ func TestPlaybackStoreCancellationLetsStopReleaseAdmission(t *testing.T) {
 }
 
 func TestByeAdmissionPreventsBlockedPlaybackReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked-segment")
+	require.NoError(t, os.WriteFile(path, []byte{0}, 0o600))
 	store := &releasePlaybackStore{
 		fakeCascadeStore: newFakeCascadeStore(),
 		entered:          make(chan struct{}),
 		release:          make(chan struct{}),
+		filePath:         path,
 	}
 	hub := platform.NewFrameHub()
 	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, hub}, store)
