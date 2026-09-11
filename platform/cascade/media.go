@@ -13,6 +13,7 @@ import (
 
 	"github.com/ghettovoice/gosip"
 	"github.com/ghettovoice/gosip/sip"
+	"github.com/mickeyzzc/gb28181-go/metrics"
 	"github.com/mickeyzzc/gb28181-go/platform"
 	"github.com/mickeyzzc/gb28181-go/psmux"
 )
@@ -70,6 +71,8 @@ type mediaSession struct {
 	audioPending []audioPendingFrame
 
 	closed        atomic.Bool
+	started       atomic.Bool
+	stopped       atomic.Bool
 	codecVerified atomic.Bool
 	// psStarted latches on the first verified AU: that burst must carry the
 	// PSM so receivers latch the configured demuxer codec before subsequent
@@ -229,29 +232,36 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	if s.srv == nil {
 		return
 	}
-	u := s.requireUpper(req)
-	if u == nil {
-		return
-	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
 	}
 	_, channelID := reqIDs(req)
+	u := s.requireUpper(req)
+	if u == nil {
+		s.observeInviteFailure(callID, channelID, "unauthorized")
+		return
+	}
+	reject := func(status sip.StatusCode, reason, code string) {
+		s.observeInviteFailure(callID, channelID, code)
+		_, _ = s.srv.RespondOnRequest(req, status, reason, "", nil)
+	}
 
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
 	if !s.requireDialogOwner(req, u) {
+		s.observeInviteFailure(callID, channelID, "dialog_owner_mismatch")
 		return
 	}
 	sd, err := sdpFromInvite([]byte(req.Body()))
 	if err != nil {
-		slog.Warn("gb28181-cascade: INVITE SDP parse failed", "error", err)
-		_, _ = s.srv.RespondOnRequest(req, 400, "Bad SDP", "", nil)
+		slog.Warn("gb28181-cascade: INVITE SDP parse failed",
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
+		reject(400, "Bad SDP", safeErrorCode(err))
 		return
 	}
 	if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
-		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+		reject(503, "Service Unavailable", "service_unavailable")
 		return
 	}
 	s.mu.Lock()
@@ -261,11 +271,11 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	if !admitted {
 		if cameraID, ok := s.cameraOfChannel(channelID); ok {
 			if cam, exists := s.cameraInfo(cameraID); exists && !s.mediaVersionAllowed(u, cam) {
-				_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+				reject(488, StatusVersionMismatch, "version_mismatch")
 				return
 			}
 		}
-		_, _ = s.srv.RespondOnRequest(req, 503, "Registration Pending", "", nil)
+		reject(503, "Registration Pending", "registration_pending")
 		return
 	}
 
@@ -278,16 +288,16 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	cameraID, ok := s.cameraOfChannel(channelID)
 	if !ok {
 		slog.Warn("gb28181-cascade: INVITE for unknown channel", "channel", channelID)
-		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
+		reject(404, "Unknown Channel", "unknown_channel")
 		return
 	}
 	cam, ok := s.cameraInfo(cameraID)
 	if !ok {
-		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
+		reject(404, "Unknown Channel", "unknown_channel")
 		return
 	}
 	if !s.mediaVersionAllowed(u, cam) {
-		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+		reject(488, StatusVersionMismatch, "version_mismatch")
 		return
 	}
 
@@ -335,17 +345,18 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		// persist) but the camera is now hidden — the upper may still hold the
 		// stale binding and INVITE it. Refuse like an unknown channel.
 		slog.Info("gb28181-cascade: INVITE for hidden camera refused", "channel", channelID, "camera", cameraID)
-		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
+		reject(404, "Unknown Channel", "unknown_channel")
 		return
 	}
 	if !s.cameraAvailable(cameraID) {
-		_, _ = s.srv.RespondOnRequest(req, 503, "Stream Unavailable", "", nil)
+		reject(503, "Stream Unavailable", "stream_unavailable")
 		return
 	}
 	hub, releaseMain, err := s.acquireMainHub(cameraID)
 	if err != nil {
-		slog.Warn("gb28181-cascade: main-stream acquire failed", "camera", cameraID, "error", err)
-		_, _ = s.srv.RespondOnRequest(req, 503, "Stream Unavailable", "", nil)
+		slog.Warn("gb28181-cascade: main-stream acquire failed", "camera", cameraID,
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
+		reject(503, "Stream Unavailable", safeErrorCode(err))
 		return
 	}
 
@@ -360,8 +371,9 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		conn, err = (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", net.JoinHostPort(sd.host, strconv.Itoa(sd.port)))
 		if err != nil {
 			releaseMain()
-			slog.Warn("gb28181-cascade: TCP media dial failed", "channel", channelID, "upper", sd.host, "error", err)
-			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
+			slog.Warn("gb28181-cascade: TCP media dial failed", "channel", channelID, "upper", sd.host,
+				"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
+			reject(500, "Internal Error", safeErrorCode(err))
 			return
 		}
 		slog.Info("gb28181-cascade: TCP media connected", "channel", channelID, "upper", conn.RemoteAddr())
@@ -370,7 +382,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		conn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 		if err != nil {
 			releaseMain()
-			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
+			reject(500, "Internal Error", safeErrorCode(err))
 			return
 		}
 	}
@@ -391,7 +403,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	_, codec, profileErr := cameraProtocolProfile(s.cfg, cam)
 	if profileErr != nil {
 		releaseMain()
-		_, _ = s.srv.RespondOnRequest(req, 488, "Unsupported Protocol Profile", "", nil)
+		reject(488, "Unsupported Protocol Profile", safeErrorCode(profileErr))
 		return
 	}
 	ms.codecHint = codec
@@ -562,10 +574,13 @@ func (ms *mediaSession) run(hub *platform.FrameHub) {
 		}
 		if err := ms.rtp.Send(ps, pts); err != nil {
 			ms.teardown("send error")
+		} else {
+			ms.observeRTP(len(ps))
 		}
 	})
 	if err != nil {
-		slog.Warn("gb28181-cascade: hub subscribe failed", "camera", ms.camera, "error", err)
+		slog.Warn("gb28181-cascade: hub subscribe failed", "camera", ms.camera,
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		ms.teardown("subscribe failed")
 		return
 	}
@@ -629,10 +644,13 @@ func (ms *mediaSession) run(hub *platform.FrameHub) {
 			}
 			if err := ms.rtp.Send(out, pts); err != nil {
 				ms.teardown("audio send error")
+			} else {
+				ms.observeRTP(len(out))
 			}
 		}
 	}); err != nil {
-		slog.Warn("gb28181-cascade: hub audio subscribe failed", "camera", ms.camera, "error", err)
+		slog.Warn("gb28181-cascade: hub audio subscribe failed", "camera", ms.camera,
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		return
 	}
 	ms.mu.Lock()
@@ -682,7 +700,8 @@ func (ms *mediaSession) teardown(reason string) {
 	if !ms.closed.CompareAndSwap(false, true) {
 		return
 	}
-	slog.Warn("gb28181-cascade: forward error, stopping", "channel", ms.channel, "reason", reason)
+	slog.Warn("gb28181-cascade: forward error, stopping", "channel", ms.channel,
+		"reason", safeText(reason))
 	ms.svc.mu.Lock()
 	delete(ms.svc.sessions, ms.callID)
 	ms.svc.mu.Unlock()
@@ -690,8 +709,33 @@ func (ms *mediaSession) teardown(reason string) {
 	ms.svc.sendBye(ms.upper, ms.callID, ms.channel)
 }
 
+func (ms *mediaSession) observeRTP(bytes int) {
+	if ms.started.CompareAndSwap(false, true) {
+		ms.svc.observe(metrics.GatewayEvent{
+			Name: "invite_started", CallID: ms.callID, GBChannelID: ms.channel,
+			StreamEpoch: ms.generation, SSRC: ms.ssrc,
+			Transport: map[bool]string{true: "udp", false: "tcp"}[ms.dst != nil],
+		}, func(h metrics.Hooks) { h.InviteSessionStarted() })
+	}
+	ms.svc.observe(metrics.GatewayEvent{
+		Name: "rtp_send", CallID: ms.callID, GBChannelID: ms.channel,
+		StreamEpoch: ms.generation, SSRC: ms.ssrc, Value: int64(bytes),
+		Transport: map[bool]string{true: "udp", false: "tcp"}[ms.dst != nil],
+	}, func(h metrics.Hooks) { h.PSBytesOut(int64(bytes)) })
+}
+
+func (ms *mediaSession) observeStopped() {
+	if ms.stopped.CompareAndSwap(false, true) {
+		ms.svc.observe(metrics.GatewayEvent{
+			Name: "invite_stopped", CallID: ms.callID, GBChannelID: ms.channel,
+			StreamEpoch: ms.generation, SSRC: ms.ssrc,
+		}, func(h metrics.Hooks) { h.InviteSessionStopped() })
+	}
+}
+
 func (ms *mediaSession) close() {
 	ms.closed.Store(true)
+	ms.observeStopped()
 	ms.mu.Lock()
 	hub := ms.hub
 	releaseMain := ms.releaseMain
@@ -761,11 +805,13 @@ func (s *Service) sendBye(u *upper, callID, channelID string) {
 	})
 	req, err := rb.Build()
 	if err != nil {
-		slog.Warn("gb28181-cascade: BYE build failed", "channel", channelID, "error", err)
+		slog.Warn("gb28181-cascade: BYE build failed", "channel", channelID,
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		return
 	}
 	if _, err := s.srv.Request(req); err != nil {
-		slog.Warn("gb28181-cascade: BYE send failed", "channel", channelID, "error", err)
+		slog.Warn("gb28181-cascade: BYE send failed", "channel", channelID,
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 	}
 }
 

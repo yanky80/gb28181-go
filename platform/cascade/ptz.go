@@ -244,7 +244,7 @@ func (s *Service) auditPTZ(cameraID, channelID, command, reason string, err erro
 	s.mu.Unlock()
 	slogArgs := []any{"event", "ptz_rejected", "camera", cameraID, "channel", channelID, "command", event.Command, "reason", reason}
 	if err != nil {
-		slogArgs = append(slogArgs, "error", err)
+		slogArgs = append(slogArgs, "error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 	}
 	slog.Warn("gb28181-cascade: PTZ control rejected", slogArgs...)
 	if sink != nil {

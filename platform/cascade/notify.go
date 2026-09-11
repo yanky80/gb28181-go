@@ -16,6 +16,7 @@ import (
 
 	"github.com/ghettovoice/gosip/sip"
 	"github.com/mickeyzzc/gb28181-go/manscdp"
+	"github.com/mickeyzzc/gb28181-go/metrics"
 )
 
 // catalogSub is one active catalog subscription (an upper's SUBSCRIBE dialog).
@@ -253,7 +254,9 @@ func (s *Service) sendCatalogNotify(sub *catalogSub) {
 	}
 	items, err := s.catalogItems(ctx)
 	if err != nil {
-		slog.Warn("gb28181-cascade: catalog build for NOTIFY failed", "error", err)
+		s.observe(metrics.GatewayEvent{Name: "catalog_failure", ErrorCode: safeErrorCode(err)}, nil)
+		slog.Warn("gb28181-cascade: catalog build for NOTIFY failed",
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		return
 	}
 	body, err := xml.Marshal(catalogNotifyBody{
@@ -264,6 +267,7 @@ func (s *Service) sendCatalogNotify(sub *catalogSub) {
 		Items:    items,
 	})
 	if err != nil {
+		s.observe(metrics.GatewayEvent{Name: "catalog_failure", ErrorCode: safeErrorCode(err)}, nil)
 		return
 	}
 	full := append([]byte(xml.Header), body...)
@@ -296,15 +300,20 @@ func (s *Service) sendCatalogNotify(sub *catalogSub) {
 	rb.SetBody(string(full))
 	req, err := rb.Build()
 	if err != nil {
-		slog.Warn("gb28181-cascade: NOTIFY build failed", "error", err)
+		s.observe(metrics.GatewayEvent{Name: "catalog_failure", ErrorCode: safeErrorCode(err)}, nil)
+		slog.Warn("gb28181-cascade: NOTIFY build failed",
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		return
 	}
 	req.AppendHeader(&sip.GenericHeader{HeaderName: "Event", Contents: "Catalog"})
 	req.AppendHeader(&sip.GenericHeader{HeaderName: "Subscription-State", Contents: "active;expires=3600"})
 	if _, err := s.srv.Request(req); err != nil {
-		slog.Warn("gb28181-cascade: catalog NOTIFY failed", "upper", sub.upper.cfg.ServerAddr, "error", err)
+		s.observe(metrics.GatewayEvent{Name: "catalog_failure", ErrorCode: safeErrorCode(err)}, nil)
+		slog.Warn("gb28181-cascade: catalog NOTIFY failed", "upper", sub.upper.cfg.ServerAddr,
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		return
 	}
+	s.observe(metrics.GatewayEvent{Name: "catalog_success", Value: int64(len(items))}, nil)
 	slog.Info("gb28181-cascade: catalog NOTIFY sent",
 		"upper", sub.upper.cfg.ServerAddr, "channels", len(items))
 }

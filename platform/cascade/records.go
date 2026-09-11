@@ -63,7 +63,8 @@ func (s *Service) answerRecordInfo(ctx context.Context, u *upper, q manscdp.Reco
 		SortOrder: "asc",
 	})
 	if err != nil {
-		slog.Warn("gb28181-cascade: recordings query failed", "camera", cameraID, "error", err)
+		slog.Warn("gb28181-cascade: recordings query failed", "camera", cameraID,
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		return
 	}
 	if len(recs) > 2000 {
@@ -106,7 +107,8 @@ func (s *Service) answerRecordInfo(ctx context.Context, u *upper, q manscdp.Reco
 		}
 		if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
 			slog.Warn("gb28181-cascade: record info page failed",
-				"channel", q.DeviceID, "page", off/recordPageSize, "error", err)
+				"channel", q.DeviceID, "page", off/recordPageSize,
+				"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 			return
 		}
 	}
@@ -124,7 +126,8 @@ func (s *Service) sendEmptyRecordInfo(u *upper, q manscdp.RecordInfoQuery) {
 	})
 	if err == nil {
 		if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
-			slog.Warn("gb28181-cascade: empty RecordInfo response failed", "channel", q.DeviceID, "error", err)
+			slog.Warn("gb28181-cascade: empty RecordInfo response failed", "channel", q.DeviceID,
+				"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		}
 	}
 }
@@ -195,7 +198,8 @@ func (s *Service) forwardDeviceControl(dc manscdp.DeviceControl) {
 	if err != nil {
 		s.auditPTZ(cameraID, dc.DeviceID, "", "invalid_command", err)
 		slog.Warn("gb28181-cascade: unparseable PTZ command",
-			"channel", dc.DeviceID, "ptz", dc.PTZCmd, "error", err)
+			"channel", dc.DeviceID, "ptz", dc.PTZCmd,
+			"error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
 		return
 	}
 	s.forwardPTZ(cameraID, dc.DeviceID, direction, speed)

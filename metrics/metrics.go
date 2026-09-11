@@ -7,6 +7,31 @@
 // packet); never block inside them.
 package metrics
 
+// GatewayEvent is a low-cardinality observation from the standalone gateway.
+// Fields contain identifiers and protocol metadata only; callers must not put
+// credentials, Authorization headers, URLs, or raw IPC payloads in it.
+type GatewayEvent struct {
+	Name            string
+	CameraID        string
+	GBChannelID     string
+	CallID          string
+	StreamEpoch     uint64
+	RequestID       uint64
+	Codec           string
+	ProtocolVersion string
+	PeerGBVersion   string
+	Transport       string
+	SSRC            uint32
+	ErrorCode       string
+	Value           int64
+}
+
+// GatewayHooks receives gateway-specific observations. It is optional so the
+// original Hooks seam remains source-compatible for existing hosts.
+type GatewayHooks interface {
+	ObserveGateway(GatewayEvent)
+}
+
 // Hooks are observation points fired by the device (UAC) and platform
 // (UAS) roles. The zero-value [NoopHooks] does nothing.
 type Hooks interface {
