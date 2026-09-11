@@ -37,6 +37,10 @@ type CameraStatusSource interface {
     CameraStatus(cameraID string) string // "ON" or "OFF"
 }
 
+type MainStreamAcquirer interface {
+    AcquireMainHub(ctx context.Context, cameraID string) (hub *platform.FrameHub, release func(), err error)
+}
+
 type Store interface {
     UpsertCascadeChannel(ctx, CascadeChannel) error
     ListCascadeChannels(ctx) ([]CascadeChannel, error)
@@ -54,6 +58,8 @@ Wire and start:
 
 ```go
 svc := cascade.New(cfg, cameraSource, store)
+// Optional: acquire/release the encoder's main live output per dialog
+svc.SetMainStreamAcquirer(mainAcquirer)
 // Optional: on-demand sub-stream tier
 svc.SetSubStreamAcquirer(subAcquirer)
 // Playback from recorded segments:

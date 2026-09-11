@@ -46,6 +46,8 @@ type mediaSession struct {
 	// unsubscribes through it. Guarded by mu: run()'s async sub acquisition
 	// can swap it while a concurrent BYE runs close().
 	hub *platform.FrameHub
+	// releaseMain drops the main-stream reference acquired for this dialog.
+	releaseMain func()
 	// releaseSub drops the sub-stream reference acquired for the sub tier.
 	releaseSub func()
 	// wantSub: the camera opted into the low-res cascade tier; run()
@@ -167,6 +169,13 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		return
 	}
 
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.stopping.Load() {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+		return
+	}
+
 	// Playback/download dialogs take the recordings-backed path (download =
 	// same pump without 1x pacing, #378).
 	if strings.EqualFold(sd.name, "Playback") || strings.EqualFold(sd.name, "Download") {
@@ -204,6 +213,23 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
 		return
 	}
+
+	// Supersede synchronously so the replacement never overlaps the old
+	// session's Hub subscription or main-stream lease. Admission is serialized
+	// above, so concurrent new dialogs cannot replace each other out of order.
+	var replaced []*mediaSession
+	s.mu.Lock()
+	for otherID, other := range s.sessions {
+		if otherID != callID && other.channel == channelID {
+			delete(s.sessions, otherID)
+			replaced = append(replaced, other)
+		}
+	}
+	s.mu.Unlock()
+	for _, other := range replaced {
+		other.teardown("superseded by new-dialog re-INVITE")
+	}
+
 	if cam, ok := s.cameraInfo(cameraID); ok && cam.CascadeHidden {
 		// Catalog convergence: the channel was allocated once (allocation rows
 		// persist) but the camera is now hidden — the upper may still hold the
@@ -212,27 +238,16 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
 		return
 	}
-	hub := s.src.Hub(cameraID)
-	if hub == nil {
-		_, _ = s.srv.RespondOnRequest(req, 500, "Stream Unavailable", "", nil)
+	if !s.cameraAvailable(cameraID) {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Stream Unavailable", "", nil)
 		return
 	}
-
-	// Supersede: a new-dialog INVITE for a channel that is already forwarding
-	// means the upper recycled the session (its BYE may be lost or still in
-	// flight). Keeping both forwards alive overlaps two SSRCs onto the upper's
-	// recycled receive port — the upper's first-packet SSRC latch grabs
-	// whichever sender arrives first and every packet of the other is dropped
-	// as foreign (observed as endless "recycling stale session / no keyframe"
-	// churn on the fnOS upper, 2026-08-19). One channel, one live forward.
-	s.mu.Lock()
-	for otherID, other := range s.sessions {
-		if otherID != callID && other.channel == channelID {
-			delete(s.sessions, otherID)
-			go other.teardown("superseded by new-dialog re-INVITE")
-		}
+	hub, releaseMain, err := s.acquireMainHub(cameraID)
+	if err != nil {
+		slog.Warn("gb28181-cascade: main-stream acquire failed", "camera", cameraID, "error", err)
+		_, _ = s.srv.RespondOnRequest(req, 503, "Stream Unavailable", "", nil)
+		return
 	}
-	s.mu.Unlock()
 
 	// Media transport: the upper's tcp-passive offer (TCP/RTP/AVP +
 	// a=setup:passive) means WE connect — TCP retransmission survives lossy
@@ -244,6 +259,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	if sd.tcp {
 		conn, err = (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", net.JoinHostPort(sd.host, strconv.Itoa(sd.port)))
 		if err != nil {
+			releaseMain()
 			slog.Warn("gb28181-cascade: TCP media dial failed", "channel", channelID, "upper", sd.host, "error", err)
 			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
 			return
@@ -253,6 +269,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		dst = &net.UDPAddr{IP: net.ParseIP(sd.host), Port: sd.port}
 		conn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 		if err != nil {
+			releaseMain()
 			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
 			return
 		}
@@ -262,8 +279,9 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
 		upper: s.upperOf(req),
 		conn:  conn, dst: dst, ssrc: sd.ssrc,
-		mux:       psmux.New(),
-		withAudio: strings.Contains(string(req.Body()), "m=audio"),
+		releaseMain: releaseMain,
+		mux:         psmux.New(),
+		withAudio:   strings.Contains(string(req.Body()), "m=audio"),
 	}
 	// Sub-stream forwarding (#512): acquisition happens in run() AFTER the
 	// INVITE is answered — the ready wait (first keyframe) must never block
@@ -544,6 +562,8 @@ func (ms *mediaSession) close() {
 	ms.closed.Store(true)
 	ms.mu.Lock()
 	hub := ms.hub
+	releaseMain := ms.releaseMain
+	ms.releaseMain = nil
 	releaseSub := ms.releaseSub
 	ms.releaseSub = nil
 	audioSubID := ms.audioSubID
@@ -561,6 +581,9 @@ func (ms *mediaSession) close() {
 	}
 	if releaseSub != nil {
 		releaseSub()
+	}
+	if releaseMain != nil {
+		releaseMain()
 	}
 	if ms.conn != nil {
 		_ = ms.conn.Close()

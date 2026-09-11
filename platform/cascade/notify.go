@@ -99,6 +99,7 @@ func (s *Service) catalogNotifyLoop() {
 			return
 		}
 		cur := s.cameraFingerprint()
+		s.stopUnavailableSessions()
 		if cur == last {
 			continue
 		}
@@ -136,6 +137,20 @@ func (s *Service) cameraFingerprint() string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "\x00")
+}
+
+func (s *Service) stopUnavailableSessions() {
+	s.mu.Lock()
+	sessions := make([]*mediaSession, 0, len(s.sessions))
+	for _, ms := range s.sessions {
+		if !s.cameraAvailable(ms.camera) {
+			sessions = append(sessions, ms)
+		}
+	}
+	s.mu.Unlock()
+	for _, ms := range sessions {
+		ms.teardown("camera source unavailable")
+	}
 }
 
 // catalogNotifyBody mirrors manscdp.Catalog under a Notify root — the
