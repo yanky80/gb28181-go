@@ -17,6 +17,47 @@ type fakeSource struct {
 	cams []CameraInfo
 }
 
+type mutableStatusSource struct {
+	fakeSource
+	mu       sync.RWMutex
+	statuses map[string]string
+}
+
+func (s *mutableStatusSource) Cameras() []CameraInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]CameraInfo(nil), s.fakeSource.cams...)
+}
+
+func (s *mutableStatusSource) CameraStatus(cameraID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.statuses[cameraID]
+}
+
+func (s *mutableStatusSource) SetStatus(cameraID, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statuses[cameraID] = status
+}
+
+func (s *mutableStatusSource) SetCamera(camera CameraInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.fakeSource.cams {
+		if s.fakeSource.cams[i].ID == camera.ID {
+			s.fakeSource.cams[i] = camera
+			return
+		}
+	}
+}
+
+func (s *mutableStatusSource) SetCameras(cams []CameraInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fakeSource.cams = append([]CameraInfo(nil), cams...)
+}
+
 // segByPath backs the injected fake segment parser: tests write raw sample
 // files and register their SegmentInfo here (replaces the source repo's
 // fMP4 writer+parser fixture pair with equivalent pump inputs).
@@ -133,6 +174,113 @@ func TestCatalogItemsAllocatesAndPersists(t *testing.T) {
 	items3, err := svc3.catalogItems()
 	require.NoError(t, err)
 	require.Equal(t, "34020000001320000003", items3[2].DeviceID)
+}
+
+func TestCatalogItemsUsesDynamicCameraStatus(t *testing.T) {
+	src := &mutableStatusSource{
+		fakeSource: fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}},
+		statuses:   map[string]string{"front": "OFF"},
+	}
+	svc := New(testCfg(), src, newCascadeTestDB(t))
+
+	items, err := svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "OFF", items[0].Status)
+
+	src.SetStatus("front", "ON")
+	items, err = svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "ON", items[0].Status)
+}
+
+func TestCameraStatusNormalizesCaseAndWhitespace(t *testing.T) {
+	src := &mutableStatusSource{
+		fakeSource: fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}},
+		statuses:   map[string]string{"front": " \t oN\n"},
+	}
+	svc := New(testCfg(), src, newCascadeTestDB(t))
+
+	items, err := svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "ON", items[0].Status)
+
+	src.SetStatus("front", " off ")
+	items, err = svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "OFF", items[0].Status)
+}
+
+func TestCameraOfChannelResolvesPersistedIDBeforeCatalog(t *testing.T) {
+	db := newCascadeTestDB(t)
+	require.NoError(t, db.UpsertCascadeChannel(context.Background(), CascadeChannel{
+		CameraID: "front", GBChannelID: "34020000001320000042",
+	}))
+	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}}, db)
+
+	cameraID, ok := svc.cameraOfChannel("34020000001320000042")
+	require.True(t, ok)
+	require.Equal(t, "front", cameraID)
+}
+
+func TestCatalogItemsRejectsMalformedPersistedChannelID(t *testing.T) {
+	db := newCascadeTestDB(t)
+	require.NoError(t, db.UpsertCascadeChannel(context.Background(), CascadeChannel{
+		CameraID: "front", GBChannelID: "short",
+	}))
+	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}}, db)
+
+	require.NotPanics(t, func() {
+		_, err := svc.catalogItems()
+		require.Error(t, err)
+	})
+}
+
+func TestCatalogItemsWithoutStoreResolvesPublishedChannel(t *testing.T) {
+	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}}, nil)
+	items, err := svc.catalogItems()
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+
+	cameraID, ok := svc.cameraOfChannel(items[0].DeviceID)
+	require.True(t, ok)
+	require.Equal(t, "front", cameraID)
+}
+
+func TestNilStoreChannelBindingsSurviveHideAndReorder(t *testing.T) {
+	src := &mutableStatusSource{
+		fakeSource: fakeSource{cams: []CameraInfo{
+			{ID: "a", Name: "A"},
+			{ID: "b", Name: "B"},
+		}},
+		statuses: map[string]string{"a": "ON", "b": "ON"},
+	}
+	svc := New(testCfg(), src, nil)
+	items, err := svc.catalogItems()
+	require.NoError(t, err)
+	require.Equal(t, "34020000001320000001", items[0].DeviceID)
+	require.Equal(t, "34020000001320000002", items[1].DeviceID)
+
+	src.SetCameras([]CameraInfo{
+		{ID: "b", Name: "B"},
+		{ID: "a", Name: "A", CascadeHidden: true},
+	})
+
+	cameraID, ok := svc.cameraOfChannel("34020000001320000001")
+	require.True(t, ok)
+	require.Equal(t, "a", cameraID)
+	cameraID, ok = svc.cameraOfChannel("34020000001320000002")
+	require.True(t, ok)
+	require.Equal(t, "b", cameraID)
+
+	cam, ok := svc.cameraInfo("a")
+	require.True(t, ok)
+	require.True(t, cam.CascadeHidden)
+}
+
+func TestUpperForDeviceStatusRejectsUnknownSource(t *testing.T) {
+	svc := New(testCfg(), fakeSource{}, newCascadeTestDB(t))
+	require.Nil(t, svc.upperForDeviceStatus(newFromRequest(t, "unknown-upper")))
+	require.Equal(t, svc.uppers[0], svc.upperForDeviceStatus(newFromRequest(t, testCfg().ServerDomain)))
 }
 
 // TestCatalogHiddenCamerasExcluded verifies catalog convergence: cameras with

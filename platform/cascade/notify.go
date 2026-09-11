@@ -26,7 +26,7 @@ type catalogSub struct {
 }
 
 // notifyScanInterval is how often the camera set is diffed for changes.
-const notifyScanInterval = 10 * time.Second
+var notifyScanInterval = 10 * time.Second
 
 // onSubscribe answers an upper platform's catalog SUBSCRIBE and records the
 // dialog for change-driven NOTIFYs. Non-catalog events get Expires 0 (upper
@@ -125,7 +125,14 @@ func (s *Service) cameraFingerprint() string {
 	cams := s.src.Cameras()
 	parts := make([]string, 0, len(cams))
 	for _, c := range cams {
-		parts = append(parts, c.ID+"/"+c.Name)
+		parts = append(parts, strings.Join([]string{
+			c.ID,
+			c.Name,
+			c.Brand,
+			c.Model,
+			s.cameraStatus(c.ID),
+			strconv.FormatBool(c.CascadeHidden),
+		}, "\x00"))
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "\x00")

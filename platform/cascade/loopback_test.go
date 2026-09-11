@@ -189,6 +189,11 @@ func playSDP(t *testing.T, name string, withT bool) string {
 func startLoopbackService(t *testing.T, src CameraSource, db Store) (*Service, *upperSocket) {
 	t.Helper()
 	cfg := testCfg()
+	return startLoopbackServiceWithConfig(t, cfg, src, db)
+}
+
+func startLoopbackServiceWithConfig(t *testing.T, cfg Config, src CameraSource, db Store) (*Service, *upperSocket) {
+	t.Helper()
 	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
 
 	up := newUpperSocket(t, cfg.SIPListen)
@@ -323,7 +328,14 @@ func TestLoopbackInviteNoHub(t *testing.T) {
 
 func TestLoopbackSubscribeCatalogNotify(t *testing.T) {
 	db := newCascadeTestDB(t)
-	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, platform.NewFrameHub()}, db)
+	src := &mutableStatusSource{
+		fakeSource: fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}},
+		statuses:   map[string]string{"cam-1": "ON"},
+	}
+	oldNotifyScanInterval := notifyScanInterval
+	notifyScanInterval = 10 * time.Millisecond
+	t.Cleanup(func() { notifyScanInterval = oldNotifyScanInterval })
+	svc, up := startLoopbackService(t, src, db)
 
 	sub := up.request(sip.SUBSCRIBE, testCfg().LocalDeviceID, "", "")
 	sub.AppendHeader(&sip.GenericHeader{HeaderName: "Event", Contents: "Catalog"})
@@ -335,6 +347,18 @@ func TestLoopbackSubscribeCatalogNotify(t *testing.T) {
 	// A fresh catalog subscription immediately gets the current catalog.
 	notify := up.awaitServerRequest(sip.NOTIFY, "<CmdType>Catalog</CmdType>")
 	require.Contains(t, string(notify.Body()), lbChannelOne, "NOTIFY must carry the allocated channel")
+
+	src.SetStatus("cam-1", "OFF")
+	offlineNotify := up.awaitServerRequest(sip.NOTIFY, "<Status>OFF</Status>")
+	require.Contains(t, string(offlineNotify.Body()), lbChannelOne, "status changes must reach NOTIFY")
+
+	src.SetCamera(CameraInfo{ID: "cam-1", Name: "Front-renamed"})
+	identityNotify := up.awaitServerRequest(sip.NOTIFY, "<Name>Front-renamed</Name>")
+	require.Contains(t, string(identityNotify.Body()), lbChannelOne, "identity changes must reach NOTIFY")
+
+	src.SetCamera(CameraInfo{ID: "cam-1", Name: "Front-renamed", CascadeHidden: true})
+	hiddenNotify := up.awaitServerRequest(sip.NOTIFY, "<SumNum>0</SumNum>")
+	require.NotContains(t, string(hiddenNotify.Body()), lbChannelOne, "hidden channels must leave NOTIFY")
 
 	require.Equal(t, 1, subCount(svc), "catalog subscription must be registered")
 

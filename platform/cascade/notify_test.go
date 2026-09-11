@@ -80,6 +80,18 @@ func TestCameraFingerprintChange(t *testing.T) {
 
 	renamed := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "a", Name: "A"}, {ID: "b", Name: "B2"}}}, newCascadeTestDB(t))
 	require.NotEqual(t, base, renamed.cameraFingerprint())
+
+	offline := New(testCfg(), &mutableStatusSource{
+		fakeSource: fakeSource{cams: []CameraInfo{{ID: "a", Name: "A"}, {ID: "b", Name: "B"}}},
+		statuses:   map[string]string{"a": "OFF", "b": "ON"},
+	}, newCascadeTestDB(t))
+	require.NotEqual(t, base, offline.cameraFingerprint(), "status changes must trigger NOTIFY")
+
+	hidden := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "a", Name: "A"}, {ID: "b", Name: "B", CascadeHidden: true}}}, newCascadeTestDB(t))
+	require.NotEqual(t, base, hidden.cameraFingerprint(), "hidden changes must trigger NOTIFY")
+
+	identity := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "a", Name: "A"}, {ID: "b", Name: "B", Brand: "Brand-2"}}}, newCascadeTestDB(t))
+	require.NotEqual(t, base, identity.cameraFingerprint(), "catalog identity changes must trigger NOTIFY")
 }
 
 // TestUpperOfResolution: multi-upper request routing keys on the From user
