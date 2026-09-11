@@ -125,7 +125,54 @@ func TestPTZStopIsIdempotentAndLeaseExpires(t *testing.T) {
 		PTZCmd: "A50F0100000000B5",
 	})
 	_, stops, _, _ := adapter.snapshot()
-	require.Equal(t, 1, stops, "an already-stopped command must be harmless")
+	require.Equal(t, 2, stops, "an explicit STOP must reach the idempotent adapter")
+}
+
+func TestPTZStopReachesAdapterWithoutTrackedMotion(t *testing.T) {
+	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", PTZMode: "vendor"}}}, newCascadeTestDB(t))
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	adapter := &recordingPTZAdapter{}
+	svc.SetPTZAdapter("front", adapter)
+
+	stop := manscdp.DeviceControl{
+		CmdType: manscdp.CmdDeviceControl, DeviceID: "34020000001320000001",
+		PTZCmd: "A50F0100000000B5",
+	}
+	svc.forwardDeviceControl(stop)
+	_, stops, _, _ := adapter.snapshot()
+	require.Equal(t, 1, stops, "an explicit STOP must reach a capable adapter without motion state")
+
+	svc.forwardDeviceControl(stop)
+	_, stops, _, _ = adapter.snapshot()
+	require.Equal(t, 2, stops, "repeated STOP must remain safe through the adapter contract")
+}
+
+func TestPTZStopFailureDoesNotEmitStoppedState(t *testing.T) {
+	stopErr := errors.New("stop failed")
+	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", PTZMode: "vendor"}}}, newCascadeTestDB(t))
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	adapter := &recordingPTZAdapter{stopErr: stopErr}
+	var states []PTZStateEvent
+	var audits []PTZAuditEvent
+	svc.SetPTZAdapter("front", adapter)
+	svc.SetPTZStateSink(func(event PTZStateEvent) { states = append(states, event) })
+	svc.SetPTZAuditSink(func(event PTZAuditEvent) { audits = append(audits, event) })
+
+	svc.forwardDeviceControl(manscdp.DeviceControl{
+		CmdType: manscdp.CmdDeviceControl, DeviceID: "34020000001320000001",
+		PTZCmd: "A50F0108002000DD",
+	})
+	svc.forwardDeviceControl(manscdp.DeviceControl{
+		CmdType: manscdp.CmdDeviceControl, DeviceID: "34020000001320000001",
+		PTZCmd: "A50F0100000000B5",
+	})
+
+	require.Len(t, states, 1)
+	require.Equal(t, PTZMoving, states[0].State)
+	require.Equal(t, "stop_error", audits[len(audits)-1].Reason)
+	require.Equal(t, stopErr.Error(), audits[len(audits)-1].Error)
 }
 
 func TestPTZFailureStopsSafelyAndAuditsRejections(t *testing.T) {

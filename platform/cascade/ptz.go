@@ -8,6 +8,7 @@ import (
 
 // PTZAdapter is the smallest local-camera control contract. The adapter is
 // registered for one camera, so it does not need to carry camera identity.
+// Stop must be safe when motion is already stopped and when called repeatedly.
 type PTZAdapter interface {
 	Move(direction string, speed byte) error
 	Stop() error
@@ -73,7 +74,7 @@ func (a forwarderAdapter) Stop() error {
 // SetPTZAdapter wires the adapter for one stable local camera. Replacing or
 // removing an adapter first stops any active motion on the old one.
 func (s *Service) SetPTZAdapter(cameraID string, adapter PTZAdapter) {
-	s.stopPTZ(cameraID, 0)
+	s.stopPTZ(cameraID, 0, nil)
 	s.ptzMu.Lock()
 	// Keep a nil entry so an explicit disconnect cannot fall back to the
 	// legacy process-wide forwarder.
@@ -169,15 +170,27 @@ func (s *Service) movePTZ(cameraID, channelID, direction string, speed byte) {
 	}
 	motion.moving = true
 	lease := s.ptzLease
-	motion.timer = time.AfterFunc(lease, func() { s.stopPTZ(cameraID, generation) })
-	s.ptzMu.Unlock()
+	motion.timer = time.AfterFunc(lease, func() { s.stopPTZ(cameraID, generation, nil) })
 	s.emitPTZState(PTZStateEvent{CameraID: cameraID, Direction: direction, Speed: speed, State: PTZMoving})
+	s.ptzMu.Unlock()
 }
 
-func (s *Service) stopPTZ(cameraID string, generation uint64) {
+func (s *Service) stopPTZ(cameraID string, generation uint64, explicit PTZAdapter) {
 	s.ptzMu.Lock()
 	motion := s.ptzMotion[cameraID]
-	if motion == nil || !motion.moving || (generation != 0 && motion.generation != generation) {
+	if motion == nil || !motion.moving {
+		if explicit == nil {
+			s.ptzMu.Unlock()
+			return
+		}
+		err := explicit.Stop()
+		s.ptzMu.Unlock()
+		if err != nil {
+			s.auditPTZ(cameraID, "", ptzStop, "stop_error", err)
+		}
+		return
+	}
+	if generation != 0 && motion.generation != generation {
 		s.ptzMu.Unlock()
 		return
 	}
@@ -185,15 +198,17 @@ func (s *Service) stopPTZ(cameraID string, generation uint64) {
 		motion.timer.Stop()
 		motion.timer = nil
 	}
-	motion.moving = false
-	motion.generation++
 	adapter := motion.adapter
 	err := adapter.Stop()
-	s.ptzMu.Unlock()
-	s.emitPTZState(PTZStateEvent{CameraID: cameraID, Direction: ptzStop, State: PTZStopped})
 	if err != nil {
+		s.ptzMu.Unlock()
 		s.auditPTZ(cameraID, "", ptzStop, "stop_error", err)
+		return
 	}
+	motion.moving = false
+	motion.generation++
+	s.emitPTZState(PTZStateEvent{CameraID: cameraID, Direction: ptzStop, State: PTZStopped})
+	s.ptzMu.Unlock()
 }
 
 func (s *Service) stopAllPTZ() {
@@ -206,7 +221,7 @@ func (s *Service) stopAllPTZ() {
 	}
 	s.ptzMu.Unlock()
 	for _, cameraID := range cameras {
-		s.stopPTZ(cameraID, 0)
+		s.stopPTZ(cameraID, 0, nil)
 	}
 }
 
@@ -243,7 +258,7 @@ func (s *Service) forwardPTZ(cameraID, channelID, direction string, speed byte) 
 			s.auditPTZ(cameraID, channelID, direction, "adapter_unavailable", nil)
 			return
 		}
-		s.stopPTZ(cameraID, 0)
+		s.stopPTZ(cameraID, 0, s.ptzAdapter(cameraID))
 		return
 	}
 	s.movePTZ(cameraID, channelID, direction, speed)
