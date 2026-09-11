@@ -62,10 +62,13 @@ func (s *Service) mediaVersionAllowed(u *upper, cam CameraInfo) bool {
 	if err != nil {
 		return false
 	}
+	if u == nil || version != "2022" || codec != "h265" {
+		return true
+	}
 	s.mu.Lock()
-	mismatch := u != nil && u.versionMismatch
+	seen, upstreamVersion := u.protocolVersionSeen, u.protocolVersion
 	s.mu.Unlock()
-	return !mismatch || version != "2022" || codec != "h265"
+	return !seen || upstreamVersion == profileVersionMarker(version)
 }
 
 func (s *Service) requiresVersionGate() bool {

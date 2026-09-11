@@ -9,6 +9,7 @@ forwards INVITEs as streams, and serves playback from your recordings.
 ```go
 cfg := cascade.Config{
     Enabled:       true,
+    ProtocolVersion: "",                 // empty = GB/T 28181-2022
     ServerDomain:  "34020000002000000001", // upper platform's GB ID
     ServerAddr:    "192.0.2.20:5060",      // upper platform's SIP address
     LocalDeviceID: "34020000002000000002", // THIS platform's ID upward
@@ -18,6 +19,12 @@ cfg := cascade.Config{
     UserAgent:     "",                     // "" = "gb28181-go/cascade"
 }
 ```
+
+The supported profiles are `2022+h265` (the default), `2022+h264`, and
+`2016+h264`. An empty `CameraInfo.Encoding` keeps source compatibility and
+selects H.265; set it explicitly to `h264` for an H.264 camera. REGISTER
+advertises the selected version with `X-GB-Ver` and the cascade refuses
+2022/H.265 media when the upper platform reports `2.0` or omits the marker.
 
 Catalog identity defaults are neutral (`Unknown` manufacturer/model)
 and overridable via `CatalogDefaultManufacturer` /

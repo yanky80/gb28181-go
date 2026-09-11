@@ -100,6 +100,143 @@ func TestRegisterProtocolVersionHeaderAndResponse(t *testing.T) {
 	}
 }
 
+func TestRegisterWireCarriesProfileOnInitialAndDigestRetry(t *testing.T) {
+	cfg := testCfg()
+	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	up := newUpperSocket(t, cfg.SIPListen)
+	cfg.ServerAddr = up.conn.LocalAddr().String()
+
+	wire := make(chan string, 2)
+	stop := make(chan struct{})
+	go serveProfileRegistration(t, up, "3.0", nil, stop, wire)
+	svc := New(cfg, fakeSource{}, nil)
+	t.Cleanup(func() {
+		close(stop)
+		_ = svc.Stop()
+	})
+	require.NoError(t, svc.Start(context.Background()))
+	require.Eventually(t, func() bool { return svc.Online() }, 5*time.Second, 20*time.Millisecond)
+
+	first, second := <-wire, <-wire
+	require.Contains(t, first, "\r\nCSeq: 1 REGISTER\r\n")
+	require.NotContains(t, first, "Authorization: Digest ")
+	require.Contains(t, second, "\r\nCSeq: 1 REGISTER\r\n")
+	for _, raw := range []string{first, second} {
+		require.Contains(t, raw, "REGISTER sip:"+cfg.ServerDomain+"@"+cfg.ServerAddr+" SIP/2.0\r\n")
+		require.Contains(t, raw, "X-GB-Ver: 3.0\r\n")
+		require.Contains(t, raw, "Expires: 3600\r\n")
+		require.Contains(t, raw, "Content-Length: 0\r\n")
+	}
+	require.Contains(t, second, "Authorization: Digest ")
+}
+
+func TestDynamicH265CameraUsesSavedPerUpperVersion(t *testing.T) {
+	for _, responseVersion := range []string{"", "2.0"} {
+		t.Run("response-"+responseVersion, func(t *testing.T) {
+			cfg := testCfg()
+			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+			up := newUpperSocket(t, cfg.SIPListen)
+			cfg.ServerAddr = up.conn.LocalAddr().String()
+			src := &mutableStatusSource{fakeSource: fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h264"}}}}
+			stop := make(chan struct{})
+			go serveProfileRegistration(t, up, responseVersion, nil, stop)
+			svc := New(cfg, src, nil)
+			t.Cleanup(func() {
+				close(stop)
+				_ = svc.Stop()
+			})
+			require.NoError(t, svc.Start(context.Background()))
+			require.Eventually(t, func() bool { return svc.Online() }, 5*time.Second, 20*time.Millisecond)
+
+			src.SetCamera(CameraInfo{ID: "cam-1", Encoding: "h265"})
+			require.Equal(t, StatusVersionMismatch, svc.Status())
+			_, err := svc.catalogItems()
+			require.NoError(t, err)
+			res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+			require.Equal(t, 488, int(res.StatusCode()))
+			require.Contains(t, res.Reason(), StatusVersionMismatch)
+		})
+	}
+}
+
+func TestLiveReinviteRechecksCurrentVersionGate(t *testing.T) {
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, hub}, nil)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	invite := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	res := up.roundTrip(invite)
+	require.Equal(t, 200, int(res.StatusCode()))
+	callID, ok := invite.CallID()
+	require.True(t, ok)
+	svc.saveUpperProtocolVersion(svc.uppers[0], "2.0")
+
+	res = up.roundTrip(up.requestDialog(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp", callID))
+	require.Equal(t, 488, int(res.StatusCode()))
+	require.Contains(t, res.Reason(), StatusVersionMismatch)
+}
+
+func TestVersionAdmissionIsIsolatedPerUpper(t *testing.T) {
+	cfg := testCfg()
+	cfg.Upstreams = []Upstream{{ServerDomain: "34020000002000000003", ServerAddr: "127.0.0.1:5061"}}
+	svc := New(cfg, fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, nil)
+	require.Len(t, svc.uppers, 2)
+	svc.saveUpperProtocolVersion(svc.uppers[0], "2.0")
+	svc.saveUpperProtocolVersion(svc.uppers[1], "3.0")
+
+	cam := CameraInfo{ID: "cam-1", Encoding: "h265"}
+	require.False(t, svc.mediaVersionAllowed(svc.uppers[0], cam))
+	require.True(t, svc.mediaVersionAllowed(svc.uppers[1], cam))
+}
+
+func TestServiceStartsForEverySupportedProtocolProfile(t *testing.T) {
+	for _, tt := range []struct {
+		name, version, encoding string
+	}{
+		{name: "2022 h265", encoding: "h265"},
+		{name: "2022 h264", encoding: "h264"},
+		{name: "2016 h264", version: "2016", encoding: "h264"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testCfg()
+			cfg.ProtocolVersion = tt.version
+			hub := platform.NewFrameHub()
+			svc, up := startLoopbackServiceWithConfig(t, cfg,
+				hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: tt.encoding}}}, hub}, nil)
+			_, err := svc.catalogItems()
+			require.NoError(t, err)
+			res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+			require.Equal(t, 200, int(res.StatusCode()))
+		})
+	}
+}
+
+func TestLiveAndSubstreamCodecMismatchTearsDown(t *testing.T) {
+	for _, wantSub := range []bool{false, true} {
+		t.Run(map[bool]string{false: "live", true: "substream"}[wantSub], func(t *testing.T) {
+			mainHub, subHub := platform.NewFrameHub(), platform.NewFrameHub()
+			svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265", SubStream: wantSub}}}, mainHub}, nil)
+			acq := &fakeSubAcquirer{hub: subHub, release: make(chan struct{}, 1)}
+			svc.SetSubStreamAcquirer(acq)
+			_, err := svc.catalogItems()
+			require.NoError(t, err)
+			res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+			require.Equal(t, 200, int(res.StatusCode()))
+			target := mainHub
+			if wantSub {
+				target = subHub
+			}
+			require.Eventually(t, func() bool { return target.ConsumerCount() == 1 }, time.Second, 10*time.Millisecond)
+
+			target.Broadcast(90000, [][]byte{{0x67, 0x42}, {0x68, 0xce}, {0x65, 0x88}}, true)
+			require.Eventually(t, func() bool {
+				return target.ConsumerCount() == 0 && svc.ForwardCount() == 0
+			}, time.Second, 10*time.Millisecond)
+		})
+	}
+}
+
 func TestH265VersionMismatchBlocksInvite(t *testing.T) {
 	for _, responseVersion := range []string{"", "2.0"} {
 		t.Run("response-"+responseVersion, func(t *testing.T) {
@@ -211,7 +348,7 @@ func TestH265PlaybackRejectsMismatchedParsedCodec(t *testing.T) {
 	require.Contains(t, res.Reason(), StatusVersionMismatch)
 }
 
-func serveProfileRegistration(t *testing.T, up *upperSocket, version string, received chan<- string, stop <-chan struct{}) {
+func serveProfileRegistration(t *testing.T, up *upperSocket, version string, received chan<- string, stop <-chan struct{}, wire ...chan<- string) {
 	t.Helper()
 	go func() {
 		buf := make([]byte, 65535)
@@ -225,6 +362,9 @@ func serveProfileRegistration(t *testing.T, up *upperSocket, version string, rec
 			n, src, err := up.conn.ReadFromUDP(buf)
 			if err != nil {
 				continue
+			}
+			if len(wire) > 0 {
+				wire[0] <- string(buf[:n])
 			}
 			msg, err := parseSIPBytes(buf[:n])
 			if err != nil {

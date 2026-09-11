@@ -82,11 +82,11 @@ type MainStreamAcquirer interface {
 // legacy config form becomes uppers[0]; gb28181_cascade.upstreams appends
 // more.
 type upper struct {
-	cfg             Upstream // resolved — defaults filled in
-	online          bool
-	regTS           time.Time
-	protocolVersion string
-	versionMismatch bool
+	cfg                 Upstream // resolved — defaults filled in
+	online              bool
+	regTS               time.Time
+	protocolVersion     string
+	protocolVersionSeen bool
 }
 
 // Service is the cascade client (pkg/app.Service "gb28181-cascade").
@@ -482,7 +482,7 @@ func (s *Service) Status() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, u := range s.uppers {
-		if u.versionMismatch {
+		if s.upperVersionMismatchLocked(u) {
 			return StatusVersionMismatch
 		}
 	}
@@ -701,9 +701,13 @@ func responseProtocolVersion(resp sip.Response) string {
 
 func (s *Service) saveUpperProtocolVersion(u *upper, version string) {
 	s.mu.Lock()
-	u.protocolVersion = version
-	u.versionMismatch = s.requiresVersionGate() && version != profileVersionMarker("2022")
+	u.protocolVersion = strings.TrimSpace(version)
+	u.protocolVersionSeen = true
 	s.mu.Unlock()
+}
+
+func (s *Service) upperVersionMismatchLocked(u *upper) bool {
+	return u.protocolVersionSeen && s.requiresVersionGate() && u.protocolVersion != profileVersionMarker("2022")
 }
 
 var challengeRe = regexp.MustCompile(`(\w+)\s*=\s*"([^"]+)"`)

@@ -182,6 +182,21 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		s.onPlaybackInvite(req, callID, channelID, sd)
 		return
 	}
+	cameraID, ok := s.cameraOfChannel(channelID)
+	if !ok {
+		slog.Warn("gb28181-cascade: INVITE for unknown channel", "channel", channelID)
+		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
+		return
+	}
+	cam, ok := s.cameraInfo(cameraID)
+	if !ok {
+		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
+		return
+	}
+	if !s.mediaVersionAllowed(s.upperOf(req), cam) {
+		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+		return
+	}
 
 	// Idempotency: a re-INVITE for an active forward keeps it. A re-INVITE
 	// for a live playback restarts it when the requested window moved.
@@ -205,22 +220,6 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		ps.finish("re-INVITE with new window", true)
 	} else {
 		s.mu.Unlock()
-	}
-
-	cameraID, ok := s.cameraOfChannel(channelID)
-	if !ok {
-		slog.Warn("gb28181-cascade: INVITE for unknown channel", "channel", channelID)
-		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
-		return
-	}
-	cam, ok := s.cameraInfo(cameraID)
-	if !ok {
-		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
-		return
-	}
-	if !s.mediaVersionAllowed(s.upperOf(req), cam) {
-		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
-		return
 	}
 
 	// Supersede synchronously so the replacement never overlaps the old
@@ -422,6 +421,10 @@ func (ms *mediaSession) run(hub *platform.FrameHub) {
 	subID := "cascade-" + ms.callID
 	err := hub.Subscribe(subID, func(pts int64, au [][]byte, isIDR bool) {
 		if ms.closed.Load() || len(au) == 0 {
+			return
+		}
+		if ms.codecHint != "" && !accessUnitCodecMatches(au, ms.codecHint) {
+			ms.teardown("access-unit codec mismatch")
 			return
 		}
 		// Annex-B framing for psmux.
@@ -687,6 +690,33 @@ func sniffCodec(firstNALU []byte) string {
 		return "h265"
 	}
 	return "h264"
+}
+
+// accessUnitCodecMatches rejects only clear codec evidence that contradicts
+// the configured profile; VCL-only NALUs are shared byte space and remain
+// usable until parameter-set evidence identifies their syntax.
+func accessUnitCodecMatches(au [][]byte, expected string) bool {
+	evidence := ""
+	for _, nalu := range au {
+		if len(nalu) == 0 {
+			continue
+		}
+		codec := ""
+		switch nalu[0] {
+		case 0x40, 0x42:
+			codec = "h265"
+		case 0x67, 0x68, 0x65, 0x41:
+			codec = "h264"
+		}
+		if codec == "" {
+			continue
+		}
+		if evidence != "" && evidence != codec {
+			return false
+		}
+		evidence = codec
+	}
+	return evidence == "" || evidence == expected
 }
 
 var _ = gosip.Server(nil) // keep import until Stop() signature settles
