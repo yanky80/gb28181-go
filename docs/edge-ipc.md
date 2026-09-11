@@ -80,3 +80,20 @@ Example default H.265 exchange:
 
 Errors are returned to the caller. The package does not send an `error`
 message, close a socket, retry, or alter process state.
+
+## Gateway media host
+
+`cmd/gb-gateway` owns the Unix `SOCK_STREAM` media listener configured by
+`ipc.media_socket`. It sets the socket mode to `0660`, binds each connection
+to the first valid `camera_id`, and replaces an older connection for that
+camera. Each connection has a bounded reader and is independent of other
+cameras.
+
+The host snapshots the camera's current `stream_epoch` and configured codec
+when it binds. A sequence gap, non-increasing PTS, `DISCONTINUITY`, invalid
+access unit, new connection, or stream replacement enters `WAIT_IDR`. While
+waiting it drops non-IDR AUs and invokes the injected `REQUEST_IDR` callback
+once. A valid H.265 IDR must contain VPS/SPS/PPS; H.264 compatibility uses
+SPS/PPS. A valid IDR restores broadcast to that camera's `FrameHub`; if the
+configured deadline (default three seconds) expires first, the host invokes
+the failure callback once.

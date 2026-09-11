@@ -84,6 +84,20 @@ func TestConfiguredMediaReaderRejectsPeerCodecBeforePayloadRead(t *testing.T) {
 	}
 }
 
+func TestMediaReaderHonorsHostPayloadLimitBeforeAllocation(t *testing.T) {
+	wire, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-1", Payload: h264AU(0x41)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewMediaReaderWithMaxPayload(bytes.NewReader(wire), len(h264AU(0x41))-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("error = %v, want payload-too-large", err)
+	}
+}
+
 func TestMediaFrameRejectsInvalidHeaderBeforePayloadAllocation(t *testing.T) {
 	base, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-1", Payload: h264AU(0x41)})
 	if err != nil {
