@@ -26,7 +26,7 @@ type catalogSub struct {
 }
 
 // notifyScanInterval is how often the camera set is diffed for changes.
-const notifyScanInterval = 10 * time.Second
+var notifyScanInterval = 10 * time.Second
 
 // onSubscribe answers an upper platform's catalog SUBSCRIBE and records the
 // dialog for change-driven NOTIFYs. Non-catalog events get Expires 0 (upper
@@ -99,6 +99,7 @@ func (s *Service) catalogNotifyLoop() {
 			return
 		}
 		cur := s.cameraFingerprint()
+		s.stopUnavailableSessions()
 		if cur == last {
 			continue
 		}
@@ -125,10 +126,31 @@ func (s *Service) cameraFingerprint() string {
 	cams := s.src.Cameras()
 	parts := make([]string, 0, len(cams))
 	for _, c := range cams {
-		parts = append(parts, c.ID+"/"+c.Name)
+		parts = append(parts, strings.Join([]string{
+			c.ID,
+			c.Name,
+			c.Brand,
+			c.Model,
+			s.cameraStatus(c.ID),
+			strconv.FormatBool(c.CascadeHidden),
+		}, "\x00"))
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "\x00")
+}
+
+func (s *Service) stopUnavailableSessions() {
+	s.mu.Lock()
+	sessions := make([]*mediaSession, 0, len(s.sessions))
+	for _, ms := range s.sessions {
+		if !s.cameraAvailable(ms.camera) {
+			sessions = append(sessions, ms)
+		}
+	}
+	s.mu.Unlock()
+	for _, ms := range sessions {
+		ms.teardown("camera source unavailable")
+	}
 }
 
 // catalogNotifyBody mirrors manscdp.Catalog under a Notify root — the

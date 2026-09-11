@@ -10,6 +10,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -133,6 +134,63 @@ func TestLoopbackDeviceInfoQueryAnswer(t *testing.T) {
 
 	answer := up.awaitServerRequest(sip.MESSAGE, "<CmdType>DeviceInfo</CmdType>")
 	require.Contains(t, string(answer.Body()), "GB28181 Platform", "device-info answer carries the (configurable, neutral-default) device name")
+}
+
+func TestLoopbackDeviceStatusQueryAnswer(t *testing.T) {
+	src := &mutableStatusSource{
+		fakeSource: fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}},
+		statuses:   map[string]string{"cam-1": "OFF"},
+	}
+	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
+	svc, up := startLoopbackServiceWithConfig(t, cfg, src, nil)
+	gbLoc := time.FixedZone("GB", 8*60*60)
+	svc.SetGBTimezone(gbLoc)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	query := func(sn int, deviceID string) manscdp.DeviceStatus {
+		body := fmt.Sprintf("<Query><CmdType>DeviceStatus</CmdType><SN>%d</SN><DeviceID>%s</DeviceID></Query>", sn, deviceID)
+		res := up.roundTrip(up.request(sip.MESSAGE, deviceID, body, "Application/MANSCDP+xml"))
+		require.Equal(t, 200, int(res.StatusCode()))
+		answer := up.awaitServerRequest(sip.MESSAGE, "<CmdType>DeviceStatus</CmdType>")
+		_, payload, err := manscdp.Decode([]byte(answer.Body()))
+		require.NoError(t, err)
+		status, ok := payload.(manscdp.DeviceStatus)
+		require.True(t, ok)
+		return status
+	}
+
+	local := query(1, testCfg().LocalDeviceID)
+	require.Equal(t, testCfg().LocalDeviceID, local.DeviceID)
+	require.Equal(t, "ON", local.Status)
+	deviceTime, err := time.ParseInLocation(gbTimeLayout, local.Time, gbLoc)
+	require.NoError(t, err)
+	require.WithinDuration(t, time.Now(), deviceTime, 2*time.Second)
+	require.Equal(t, "OFF", query(2, lbChannelOne).Status)
+	require.Equal(t, "OFF", query(3, "34020099991320000099").Status)
+	src.SetCamera(CameraInfo{ID: "cam-1", Name: "Front", CascadeHidden: true})
+	require.Equal(t, "OFF", query(4, lbChannelOne).Status)
+}
+
+func TestSetGBTimezoneConcurrent(t *testing.T) {
+	svc := New(testCfg(), fakeSource{}, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			svc.SetGBTimezone(time.FixedZone("GB", i*3600))
+		}(i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_ = svc.gbTZ()
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // TestLoopbackMediaPump drives real frames through the hub and asserts RTP
