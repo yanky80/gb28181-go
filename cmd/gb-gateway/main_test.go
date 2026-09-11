@@ -22,7 +22,7 @@ func TestNewGatewayRestoresChannelsAndUsesConfiguredCodec(t *testing.T) {
 	cfg.IPC.StatusDir = statusDir
 	cfg.IPC.ControlSocket = filepath.Join(dir, "control.sock")
 	cfg.IPC.MediaSocket = filepath.Join(dir, "media.sock")
-	cfg.Cameras = []CameraConfig{{Index: 1, LocalCameraID: "front", Expose: true, Name: "Front", Codec: "h264", PTZMode: "none"}}
+	cfg.Cameras = []CameraConfig{{Index: 1, LocalCameraID: "front", Expose: true, Name: "Front", Codec: "h264", PTZMode: "onvif"}}
 	first, err := NewGateway(cfg, Credentials{})
 	if err != nil {
 		t.Fatal(err)
@@ -41,8 +41,12 @@ func TestNewGatewayRestoresChannelsAndUsesConfiguredCodec(t *testing.T) {
 	defer gateway.Stop()
 
 	view, ok := gateway.registry.Camera("front")
-	if !ok || view.Codec != edgeipc.CodecH264 || view.Online {
-		t.Fatalf("camera view = %+v, %v; want configured H.264 and OFF", view, ok)
+	if !ok || view.Codec != edgeipc.CodecH264 || view.PTZMode != "onvif" || view.Online {
+		t.Fatalf("camera view = %+v, %v; want configured H.264, PTZ mode, and OFF", view, ok)
+	}
+	cameras := gateway.registry.Cameras()
+	if len(cameras) != 1 || cameras[0].PTZMode != "onvif" {
+		t.Fatalf("cascade camera view = %#v, want configured PTZ mode", cameras)
 	}
 	channels, err := gateway.store.ListCascadeChannels(context.Background())
 	if err != nil {

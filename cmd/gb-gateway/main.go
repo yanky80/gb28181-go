@@ -85,6 +85,7 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 			ID:            camera.LocalCameraID,
 			Name:          camera.Name,
 			Codec:         configuredCodec(camera.Codec),
+			PTZMode:       camera.PTZMode,
 			CascadeHidden: !camera.Expose,
 		})
 	}
