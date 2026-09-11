@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -185,6 +186,45 @@ func TestGatewayConformanceH265TCPActive(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("TCP-active media did not reach the upper platform")
 	}
+}
+
+func TestGatewayConformanceLostUpperConverges(t *testing.T) {
+	s := newGatewayScenario(t, "2022", "h265", "udp", "3.0", false)
+	peer := s.connectPeer("front", 1)
+	frontChannel := s.waitForFrontChannel()
+	require.NoError(t, s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID))
+	hub := awaitUpperHub(t, s.upperSM, frontChannel.ID)
+	got := make(chan struct{}, 1)
+	require.NoError(t, hub.Subscribe("conformance-lost-upper", func(_ int64, _ [][]byte, _ bool) { got <- struct{}{} }))
+	commands := readPeerMessages(t, peer.control, 2)
+	require.Equal(t, edgeipc.MessageStart, commands[0].Type)
+	require.Equal(t, edgeipc.MessageRequestIDR, commands[1].Type)
+	writeMedia(t, peer.media, edgeipc.MediaFrame{
+		Codec: edgeipc.CodecH265, Flags: edgeipc.FlagIDR, CameraID: "front",
+		PTS90kHz: 9000, Sequence: 1, Payload: h265IDR(),
+	})
+	require.Equal(t, edgeipc.MessageRequestIDR, readPeerMessages(t, peer.control, 1)[0].Type)
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("established dialog did not publish media before upper loss")
+	}
+
+	beforeGoroutines := runtime.NumGoroutine()
+	// The upper disappears without sending an in-dialog BYE. The cascade must
+	// learn this from the failed keepalive and release its dialog-owned lease.
+	require.NoError(t, s.upper.Stop())
+	require.Eventually(t, func() bool {
+		gatewayHub := s.gateway.registry.Hub("front")
+		return !s.gateway.cascade.Online() &&
+			s.gateway.cascade.ForwardCount() == 0 &&
+			gatewayHub != nil && gatewayHub.ConsumerCount() == 0 &&
+			s.gateway.registry.CameraStatus("front") == "ON"
+	}, 10*time.Second, 20*time.Millisecond, "lost upper must release dialog, FrameHub lease, and RTP socket")
+	runtime.GC()
+	afterGoroutines := runtime.NumGoroutine()
+	require.LessOrEqual(t, afterGoroutines, beforeGoroutines+8,
+		"lost upper grew goroutines by %d", afterGoroutines-beforeGoroutines)
 }
 
 func TestGatewayConformanceDeterministicOnePercentLoss(t *testing.T) {
