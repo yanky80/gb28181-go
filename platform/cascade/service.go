@@ -57,6 +57,13 @@ type CameraSource interface {
 	Hub(cameraID string) *platform.FrameHub
 }
 
+// CameraStatusSource is an optional dynamic status view for CameraSource.
+// Sources that do not implement it retain the historical catalog behavior:
+// every visible camera is reported as ON. An empty or non-ON status is OFF.
+type CameraStatusSource interface {
+	CameraStatus(cameraID string) string
+}
+
 // SubStreamAcquirer grants the cascade access to the on-demand sub-stream
 // tier (#513): one INVITE holds one reference for its lifetime. Nil (or an
 // error) falls back to main-stream forwarding.
@@ -68,13 +75,6 @@ type SubStreamAcquirer interface {
 // legacy CameraSource.Hub path, where the host owns the stream lifetime.
 type MainStreamAcquirer interface {
 	AcquireMainHub(ctx context.Context, cameraID string) (hub *platform.FrameHub, release func(), err error)
-}
-
-// CameraStatusSource is the optional status seam supplied by hosts that can
-// observe source health. Without it, existing CameraSource implementations
-// retain their historical always-available behavior.
-type CameraStatusSource interface {
-	CameraStatus(cameraID string) string
 }
 
 // upper is one upper-platform registration session (#370): its own REGISTER /
@@ -131,7 +131,12 @@ type Service struct {
 	playbacks  map[string]*playbackSession // SIP Call-ID → active playback dialog
 	subs       map[string]*catalogSub      // catalog subscriptions (SUBSCRIBE → NOTIFY, #370)
 	ptzForward PTZForwarder
+	tzMu       sync.RWMutex
 	gbLoc      *time.Location // GB naive-clock zone (nil → time.Local)
+	channelMu  sync.RWMutex
+	// nil-Store channel bindings live for this Service's lifetime.
+	channelBindings   map[string]string // GB channel ID → camera ID
+	nextChannelSerial int
 }
 
 // buildUppers resolves the configured upper platforms: the legacy single form
@@ -185,12 +190,13 @@ func (s *Service) SetMainStreamAcquirer(a MainStreamAcquirer) { s.mainAcq = a }
 func New(cfg Config, src CameraSource, db Store) *Service {
 	return &Service{
 		cfg: cfg, src: src, db: db,
-		retryBase: parseRetryDuration(cfg.RegisterRetryBase, registerRetryBaseDefault),
-		retryMax:  parseRetryDuration(cfg.RegisterRetryMax, registerRetryMaxDefault),
-		uppers:    buildUppers(cfg),
-		sessions:  make(map[string]*mediaSession),
-		playbacks: make(map[string]*playbackSession),
-		subs:      make(map[string]*catalogSub),
+		retryBase:       parseRetryDuration(cfg.RegisterRetryBase, registerRetryBaseDefault),
+		retryMax:        parseRetryDuration(cfg.RegisterRetryMax, registerRetryMaxDefault),
+		uppers:          buildUppers(cfg),
+		sessions:        make(map[string]*mediaSession),
+		playbacks:       make(map[string]*playbackSession),
+		subs:            make(map[string]*catalogSub),
+		channelBindings: make(map[string]string),
 	}
 }
 
@@ -232,12 +238,16 @@ func (s *Service) parseSegment(path string) (*SegmentInfo, error) {
 // set this to the devices' zone.
 func (s *Service) SetGBTimezone(loc *time.Location) {
 	if loc != nil {
+		s.tzMu.Lock()
 		s.gbLoc = loc
+		s.tzMu.Unlock()
 	}
 }
 
 // gbTZ returns the effective GB naive-clock zone.
 func (s *Service) gbTZ() *time.Location {
+	s.tzMu.RLock()
+	defer s.tzMu.RUnlock()
 	if s.gbLoc != nil {
 		return s.gbLoc
 	}
@@ -287,7 +297,6 @@ func (s *Service) acquireMainHub(cameraID string) (*platform.FrameHub, func(), e
 	}
 	return hub, func() {}, nil
 }
-
 func (s *Service) Name() string { return "gb28181-cascade" }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -514,6 +523,20 @@ func (s *Service) upperOf(req sip.Request) *upper {
 	return s.uppers[0]
 }
 
+func (s *Service) upperForDeviceStatus(req sip.Request) *upper {
+	from, ok := req.From()
+	if !ok || from.Address == nil {
+		return nil
+	}
+	user := from.Address.User().String()
+	for _, u := range s.uppers {
+		if u.cfg.ServerDomain == user {
+			return u
+		}
+	}
+	return nil
+}
+
 // buildCoreRequest assembles a REGISTER/MESSAGE request toward the upper
 // platform on the cascade's own SIP listening port.
 func (s *Service) buildCoreRequest(u *upper, method sip.RequestMethod, localHost string, localPort int, body, contentType string) (sip.Request, error) {
@@ -728,8 +751,17 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 400, "Bad MANSCDP", "", nil)
 		return
 	}
+	var u *upper
+	if cmd == manscdp.CmdDeviceStatus {
+		u = s.upperForDeviceStatus(req)
+		if u == nil {
+			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+			return
+		}
+	} else {
+		u = s.upperOf(req)
+	}
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
-	u := s.upperOf(req)
 	switch cmd {
 	case manscdp.CmdCatalog:
 		// Queries (root <Query>) come from the upper platform; Response-root
@@ -740,6 +772,10 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 	case manscdp.CmdDeviceInfo:
 		if d, ok := payload.(manscdp.DeviceInfo); ok && d.SN > 0 {
 			s.answerDeviceInfo(u, d.SN)
+		}
+	case manscdp.CmdDeviceStatus:
+		if q, ok := payload.(manscdp.DeviceStatusQuery); ok && q.SN > 0 {
+			s.answerDeviceStatus(u, q.SN, q.DeviceID)
 		}
 	case manscdp.CmdRecordInfo:
 		// Root <Query> carries CmdType RecordInfo (decoded as
@@ -790,6 +826,29 @@ func (s *Service) answerDeviceInfo(u *upper, sn int) {
 	if err == nil {
 		if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
 			slog.Warn("gb28181-cascade: deviceinfo response failed", "error", err)
+		}
+	}
+}
+
+func (s *Service) answerDeviceStatus(u *upper, sn int, deviceID string) {
+	status := "OFF"
+	if deviceID == u.cfg.LocalDeviceID {
+		status = "ON"
+	} else if cameraID, ok := s.cameraOfChannel(deviceID); ok {
+		if cam, exists := s.cameraInfo(cameraID); exists && !cam.CascadeHidden {
+			status = s.cameraStatus(cameraID)
+		}
+	}
+	body, err := manscdp.Encode(manscdp.DeviceStatus{
+		CmdType:  manscdp.CmdDeviceStatus,
+		SN:       sn,
+		DeviceID: deviceID,
+		Status:   status,
+		Time:     time.Now().In(s.gbTZ()).Format(gbTimeLayout),
+	})
+	if err == nil {
+		if err := s.sendMessageBodyTo(u, body, "Application/MANSCDP+xml"); err != nil {
+			slog.Warn("gb28181-cascade: device status response failed", "device", deviceID, "error", err)
 		}
 	}
 }

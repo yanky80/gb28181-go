@@ -32,8 +32,9 @@ type CameraSource interface {
     Hub(cameraID string) *platform.FrameHub // live frames per camera
 }
 
+// Optional: expose current local-camera state without changing CameraSource.
 type CameraStatusSource interface {
-    CameraStatus(cameraID string) string // "ON" keeps live sessions; other values stop them
+    CameraStatus(cameraID string) string // "ON" or "OFF"
 }
 
 type MainStreamAcquirer interface {
@@ -46,6 +47,12 @@ type Store interface {
     ListRecordings(ctx, RecordingFilter) ([]Recording, error)
 }
 ```
+
+When implemented, `CameraStatusSource` drives Catalog and DeviceStatus. Empty
+or non-`ON` values report `OFF`; older sources retain the legacy `ON` behavior.
+DeviceStatus accepts the local device ID and allocated GB channel IDs, reports
+unknown or hidden channels as `OFF`, and formats time in the zone set by
+`SetGBTimezone`.
 
 Wire and start:
 

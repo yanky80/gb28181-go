@@ -1,0 +1,37 @@
+# Gateway configuration
+
+`cmd/gb-gateway` reads a small `key=value` file with `LoadConfig`. Parsing
+does not write the file; callers can atomically replace it and load it again
+on restart. Unknown or duplicate keys include their source line.
+
+The default profile is GB/T 28181-2022 with H.265, UDP signaling, a 60-second
+heartbeat, a 3,600-second registration lease, 5-second stop grace, a 3-second
+IDR deadline, and an 8 MiB access-unit limit. The only accepted profiles are
+`2022+h265`, `2022+h264`, and `2016+h264`; all cameras in one gateway use the
+same codec profile.
+
+Supported keys are:
+
+- `gb.enabled`, `gb.protocol_version`, `gb.server_addr`,
+  `gb.server_domain`, `gb.local_device_id`, `gb.realm`, `gb.sip_listen`,
+  `gb.heartbeat_interval`, `gb.register_expires`, `gb.transport`,
+  `gb.media_transport`, `gb.stop_grace_ms`, `gb.idr_timeout_ms`, and
+  `gb.record_playback`;
+- `ipc.control_socket`, `ipc.media_socket`, `ipc.max_au_bytes`, and
+  `ipc.status_dir`;
+- `camN.camera_id`, `camN.gb_expose`, `camN.gb_name`, `camN.gb_codec`, and
+  `camN.ptz_mode`.
+
+Here `camera_id` is the design's external key for a local camera; it is not
+the stable GB channel identity assigned by the gateway.
+
+`gb.password` and other secret-like keys are rejected. Load secrets
+separately with `LoadCredentials`; the file must be regular and mode `0600`
+and uses the same `key=value` syntax, for example:
+
+```text
+sip.password=replace-me
+```
+
+Credential values are not included in parser or permission errors, and the
+ordinary configuration has no secret fields.

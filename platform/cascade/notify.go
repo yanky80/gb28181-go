@@ -129,8 +129,10 @@ func (s *Service) cameraFingerprint() string {
 		parts = append(parts, strings.Join([]string{
 			c.ID,
 			c.Name,
-			strconv.FormatBool(c.CascadeHidden),
+			c.Brand,
+			c.Model,
 			s.cameraStatus(c.ID),
+			strconv.FormatBool(c.CascadeHidden),
 		}, "\x00"))
 	}
 	sort.Strings(parts)

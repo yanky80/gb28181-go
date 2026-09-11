@@ -122,6 +122,8 @@ func decodeOnce(data []byte) (CmdType, any, error) {
 		// device side rejects the query with 400 and the upper platform
 		// sees an empty recording list.
 		return unmarshalAs[RecordInfoQuery](body, CmdRecordInfo)
+	case probe.CmdType == CmdDeviceStatus && probe.XMLName.Local == "Query":
+		return unmarshalAs[DeviceStatusQuery](body, CmdDeviceStatus)
 	}
 	switch probe.CmdType {
 	case CmdCatalog:
