@@ -27,6 +27,7 @@ type CameraSpec struct {
 	Brand         string
 	Model         string
 	Codec         edgeipc.Codec
+	PTZMode       string
 	SubStream     bool
 	CascadeHidden bool
 }
@@ -39,6 +40,7 @@ type CameraSnapshot struct {
 	Brand         string
 	Model         string
 	Codec         edgeipc.Codec
+	PTZMode       string
 	StreamEpoch   uint64
 	Online        bool
 	LastHealth    time.Time
@@ -244,7 +246,7 @@ func (r *CameraRegistry) Cameras() []cascade.CameraInfo {
 	for _, view := range views {
 		cameras = append(cameras, cascade.CameraInfo{
 			ID: view.ID, Name: view.Name, Brand: view.Brand, Model: view.Model,
-			Encoding: codecName(view.Codec), SubStream: view.SubStream,
+			Encoding: codecName(view.Codec), PTZMode: view.PTZMode, SubStream: view.SubStream,
 			CascadeHidden: view.CascadeHidden,
 		})
 	}
@@ -286,7 +288,7 @@ func closeStateLocked(state *cameraState) {
 func snapshotOf(state *cameraState) CameraSnapshot {
 	return CameraSnapshot{
 		ID: state.spec.ID, Name: state.spec.Name, Brand: state.spec.Brand,
-		Model: state.spec.Model, Codec: state.codec, StreamEpoch: state.streamEpoch,
+		Model: state.spec.Model, Codec: state.codec, PTZMode: state.spec.PTZMode, StreamEpoch: state.streamEpoch,
 		Online: state.online, LastHealth: state.lastHealth, Hub: state.hub,
 		SubStream: state.spec.SubStream, CascadeHidden: state.spec.CascadeHidden,
 	}

@@ -38,6 +38,9 @@ type CameraInfo struct {
 	Name  string
 	Brand string
 	Model string
+	// PTZMode names the configured local control path. An empty mode preserves
+	// the legacy injected-forwarder seam; "none" explicitly disables PTZ.
+	PTZMode string
 	// Encoding is the camera's configured codec ("h264"|"h265"). Empty uses
 	// the selected protocol profile's default (H.265 for the default profile).
 	Encoding string
@@ -143,14 +146,20 @@ type Service struct {
 	mu sync.Mutex
 	// ponytail: one global admission lock; split by upper only if INVITE
 	// throughput makes serialized admission measurable.
-	stopDone   chan struct{}
-	sessions   map[string]*mediaSession    // SIP Call-ID → active live forward
-	playbacks  map[string]*playbackSession // SIP Call-ID → active playback dialog
-	subs       map[string]*catalogSub      // catalog subscriptions (SUBSCRIBE → NOTIFY, #370)
-	ptzForward PTZForwarder
-	tzMu       sync.RWMutex
-	gbLoc      *time.Location // GB naive-clock zone (nil → time.Local)
-	channelMu  sync.RWMutex
+	stopDone    chan struct{}
+	sessions    map[string]*mediaSession    // SIP Call-ID → active live forward
+	playbacks   map[string]*playbackSession // SIP Call-ID → active playback dialog
+	subs        map[string]*catalogSub      // catalog subscriptions (SUBSCRIBE → NOTIFY, #370)
+	ptzForward  PTZForwarder
+	ptzMu       sync.Mutex
+	ptzAdapters map[string]PTZAdapter
+	ptzMotion   map[string]*ptzMotion
+	ptzLease    time.Duration
+	ptzAudit    PTZAuditSink
+	ptzState    PTZStateSink
+	tzMu        sync.RWMutex
+	gbLoc       *time.Location // GB naive-clock zone (nil → time.Local)
+	channelMu   sync.RWMutex
 	// nil-Store channel bindings live for this Service's lifetime.
 	channelBindings   map[string]string // GB channel ID → camera ID
 	nextChannelSerial int
@@ -210,6 +219,10 @@ func New(cfg Config, src CameraSource, db Store) *Service {
 	if retryMax < retryBase {
 		retryMax = retryBase
 	}
+	lease := cfg.PTZLeaseTimeout
+	if lease <= 0 {
+		lease = 5 * time.Second
+	}
 	return &Service{
 		cfg: cfg, src: src, db: db,
 		retryBase:       retryBase,
@@ -222,6 +235,9 @@ func New(cfg Config, src CameraSource, db Store) *Service {
 		playbacks:       make(map[string]*playbackSession),
 		subs:            make(map[string]*catalogSub),
 		channelBindings: make(map[string]string),
+		ptzAdapters:     make(map[string]PTZAdapter),
+		ptzMotion:       make(map[string]*ptzMotion),
+		ptzLease:        lease,
 		stopDone:        make(chan struct{}),
 	}
 }
@@ -462,6 +478,7 @@ func (s *Service) stop() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
+	s.stopAllPTZ()
 	// Stop must not race an INVITE that is acquiring a stream or creating a
 	// dialog. New INVITEs reject before entering this critical section.
 	s.admissionMu.Lock()

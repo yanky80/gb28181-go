@@ -82,6 +82,10 @@ func (s *Service) catalogItems(ctxs ...context.Context) ([]manscdp.Item, error) 
 				}
 			}
 		}
+		ptzType := 0
+		if s.ptzCapable(cam.ID) {
+			ptzType = 3
+		}
 		items = append(items, manscdp.Item{
 			DeviceID:     chID,
 			Name:         cam.Name,
@@ -93,7 +97,7 @@ func (s *Service) catalogItems(ctxs ...context.Context) ([]manscdp.Item, error) 
 			// PTZType 3 = pan/tilt/zoom: the upper platform refuses to send
 			// PTZ (404 "PTZ not supported") when this is 0. The cascade
 			// forwards DeviceControl to whatever the local camera supports.
-			PTZType: 3,
+			PTZType: ptzType,
 		})
 	}
 	return items, nil

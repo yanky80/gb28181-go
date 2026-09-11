@@ -81,6 +81,20 @@ func TestLoadConfigRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAcceptsPTZModes(t *testing.T) {
+	for _, mode := range []string{"none", "local-gb28181", "onvif", "vendor"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, err := ParseConfig(strings.NewReader("cam1.ptz_mode=" + mode + "\n"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestLoadConfigRejectsInconsistentCameras(t *testing.T) {
 	input := "gb.protocol_version=2016\ncam1.camera_id=front\ncam1.gb_codec=h264\ncam2.camera_id=front\ncam2.gb_codec=h264\n"
 	_, err := ParseConfig(strings.NewReader(input))
