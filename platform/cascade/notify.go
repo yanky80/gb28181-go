@@ -5,6 +5,7 @@ package cascade
 // depend on their polling fallback.
 
 import (
+	"context"
 	"encoding/xml"
 	"log/slog"
 	"sort"
@@ -25,6 +26,8 @@ type catalogSub struct {
 	toUser   string
 	expires  time.Time
 	sendMu   sync.Mutex
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 // notifyScanInterval is how often the camera set is diffed for changes.
@@ -92,6 +95,7 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 		toUser:   toUser,
 		expires:  time.Now().Add(time.Duration(expires) * time.Second),
 	}
+	sub.ctx, sub.cancel = context.WithCancel(s.storeContext())
 	s.mu.Lock()
 	s.subs[callID] = sub
 	s.mu.Unlock()
@@ -130,6 +134,9 @@ func (s *Service) catalogNotifyLoop() {
 		}
 		s.mu.Unlock()
 		for _, sub := range expired {
+			if sub.cancel != nil {
+				sub.cancel()
+			}
 			sub.sendMu.Lock()
 			sub.sendMu.Unlock()
 		}
@@ -196,7 +203,11 @@ func (s *Service) sendCatalogNotify(sub *catalogSub) {
 	if !active {
 		return
 	}
-	items, err := s.catalogItems()
+	ctx := sub.ctx
+	if ctx == nil {
+		ctx = s.storeContext()
+	}
+	items, err := s.catalogItems(ctx)
 	if err != nil {
 		slog.Warn("gb28181-cascade: catalog build for NOTIFY failed", "error", err)
 		return

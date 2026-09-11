@@ -104,10 +104,7 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		_, _ = s.srv.RespondOnRequest(req, 200, "OK", current.sdpBody, nil)
 		return
 	}
-	ctx := s.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := s.storeContext()
 	recs, queryErr := s.playbackRecordings(ctx, cameraID, start, end)
 	if queryErr != nil {
 		if ctx.Err() != nil {
@@ -254,10 +251,7 @@ func (ps *playbackSession) pump() {
 // playOnce streams the window once (skipping to seekNPT seconds past the
 // window start). Returns (windowDone, seekRequest, fatalErr).
 func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
-	ctx := ps.svc.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := ps.svc.storeContext()
 	recs, err := ps.svc.playbackRecordings(ctx, ps.camera, ps.start, ps.end)
 	if err != nil {
 		slog.Warn("gb28181-cascade: playback recordings query failed",

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ghettovoice/gosip/sip"
+	"github.com/mickeyzzc/gb28181-go/manscdp"
 	"github.com/mickeyzzc/gb28181-go/platform"
 	"github.com/stretchr/testify/require"
 )
@@ -427,6 +428,46 @@ type blockingPlaybackStore struct {
 	once    sync.Once
 }
 
+type blockingCatalogStore struct {
+	*fakeCascadeStore
+	entered    chan struct{}
+	done       chan struct{}
+	release    chan struct{}
+	enteredOne sync.Once
+	doneOne    sync.Once
+	releaseOne sync.Once
+}
+
+func (s *blockingCatalogStore) ListCascadeChannels(ctx context.Context) ([]CascadeChannel, error) {
+	s.enteredOne.Do(func() { close(s.entered) })
+	select {
+	case <-ctx.Done():
+		s.doneOne.Do(func() { close(s.done) })
+		return nil, ctx.Err()
+	case <-s.release:
+		s.doneOne.Do(func() { close(s.done) })
+		return nil, nil
+	}
+}
+
+func (s *blockingCatalogStore) unblock() {
+	s.releaseOne.Do(func() { close(s.release) })
+}
+
+type blockingRecordInfoStore struct {
+	*fakeCascadeStore
+	entered chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingRecordInfoStore) ListRecordings(ctx context.Context, _ RecordingFilter) ([]Recording, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	close(s.done)
+	return nil, ctx.Err()
+}
+
 type releasePlaybackStore struct {
 	*fakeCascadeStore
 	entered chan struct{}
@@ -452,6 +493,157 @@ func (s *blockingPlaybackStore) ListRecordings(ctx context.Context, _ RecordingF
 	<-ctx.Done()
 	close(s.done)
 	return nil, ctx.Err()
+}
+
+func TestCatalogStoreCancellationLetsStopReleaseNotify(t *testing.T) {
+	store := &blockingCatalogStore{
+		fakeCascadeStore: newFakeCascadeStore(),
+		entered:          make(chan struct{}),
+		done:             make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	svc, _ := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, store)
+	sub := &catalogSub{upper: svc.uppers[0], callID: "blocked-catalog-stop"}
+	svc.mu.Lock()
+	svc.subs[sub.callID] = sub
+	svc.mu.Unlock()
+	go svc.sendCatalogNotify(sub)
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("catalog NOTIFY did not reach the blocking Store")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- svc.Stop() }()
+	select {
+	case err := <-stopped:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		store.unblock()
+		<-stopped
+		t.Fatal("Stop remained blocked behind a catalog Store query")
+	}
+	select {
+	case <-store.done:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the catalog Store query")
+	}
+}
+
+func TestCatalogStoreCancellationLetsNetworkChangeReleaseNotify(t *testing.T) {
+	store := &blockingCatalogStore{
+		fakeCascadeStore: newFakeCascadeStore(),
+		entered:          make(chan struct{}),
+		done:             make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	svc, _ := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, store)
+	sub := &catalogSub{upper: svc.uppers[0], callID: "blocked-catalog-network"}
+	sub.ctx, sub.cancel = context.WithCancel(svc.ctx)
+	svc.mu.Lock()
+	svc.subs[sub.callID] = sub
+	svc.mu.Unlock()
+	go svc.sendCatalogNotify(sub)
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("catalog NOTIFY did not reach the blocking Store")
+	}
+
+	changed := make(chan struct{})
+	go func() {
+		svc.NotifyNetworkChange()
+		close(changed)
+	}()
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		store.unblock()
+		<-changed
+		t.Fatal("network change remained blocked behind a catalog Store query")
+	}
+	select {
+	case <-store.done:
+	case <-time.After(time.Second):
+		t.Fatal("network change did not cancel the catalog Store query")
+	}
+	_ = svc.Stop()
+}
+
+func TestCatalogStoreCancellationLetsNetworkChangeReleaseInvite(t *testing.T) {
+	store := &blockingCatalogStore{
+		fakeCascadeStore: newFakeCascadeStore(),
+		entered:          make(chan struct{}),
+		done:             make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	svc, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, store)
+	up.send(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("INVITE admission did not reach the blocking Store")
+	}
+
+	changed := make(chan struct{})
+	go func() {
+		svc.NotifyNetworkChange()
+		close(changed)
+	}()
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		store.unblock()
+		<-changed
+		t.Fatal("network change remained blocked behind INVITE admission")
+	}
+	select {
+	case <-store.done:
+	case <-time.After(time.Second):
+		t.Fatal("network change did not cancel the INVITE Store query")
+	}
+	_ = svc.Stop()
+}
+
+func TestRecordInfoStoreCancellationIsInServiceLifecycle(t *testing.T) {
+	store := &blockingRecordInfoStore{
+		fakeCascadeStore: newFakeCascadeStore(),
+		entered:          make(chan struct{}),
+		done:             make(chan struct{}),
+	}
+	svc, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, store)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	body, err := manscdp.Encode(manscdp.RecordInfoQuery{
+		CmdType:   manscdp.CmdRecordInfo,
+		SN:        9,
+		DeviceID:  lbChannelOne,
+		StartTime: time.Now().Add(-time.Hour).Format(gbTimeLayout),
+		EndTime:   time.Now().Format(gbTimeLayout),
+	})
+	require.NoError(t, err)
+	res := up.roundTrip(up.request(sip.MESSAGE, lbChannelOne, string(body), "Application/MANSCDP+xml"))
+	require.Equal(t, 200, int(res.StatusCode()))
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("RecordInfo handler did not reach the blocking Store")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- svc.Stop() }()
+	select {
+	case err := <-stopped:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not wait for the RecordInfo query to cancel")
+	}
+	select {
+	case <-store.done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled RecordInfo Store query left a residual goroutine")
+	}
 }
 
 func TestPlaybackStoreCancellationLetsStopReleaseAdmission(t *testing.T) {

@@ -105,9 +105,12 @@ type Service struct {
 	// mainAcq serves live main-stream leases; nil preserves the legacy Hub path.
 	mainAcq MainStreamAcquirer
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	storeMu     sync.RWMutex
+	storeCtx    context.Context
+	storeCancel context.CancelFunc
 
 	// admissionMu serializes INVITE admission with Stop. ponytail: one global
 	// lock keeps lifecycle ordering simple; per-camera admission if throughput
@@ -217,6 +220,44 @@ func New(cfg Config, src CameraSource, db Store) *Service {
 		subs:            make(map[string]*catalogSub),
 		channelBindings: make(map[string]string),
 		stopDone:        make(chan struct{}),
+	}
+}
+
+func (s *Service) storeContext(ctxs ...context.Context) context.Context {
+	if len(ctxs) > 0 && ctxs[0] != nil {
+		return ctxs[0]
+	}
+	s.storeMu.RLock()
+	ctx := s.storeCtx
+	if ctx == nil {
+		ctx = s.ctx
+	}
+	s.storeMu.RUnlock()
+	if ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
+func (s *Service) cancelStoreContext() {
+	s.storeMu.RLock()
+	cancel := s.storeCancel
+	s.storeMu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *Service) resetStoreContext() {
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
+	if s.storeCancel != nil {
+		s.storeCancel()
+	}
+	if s.ctx != nil {
+		s.storeCtx, s.storeCancel = context.WithCancel(s.ctx)
+	} else {
+		s.storeCtx, s.storeCancel = nil, nil
 	}
 }
 
@@ -334,6 +375,9 @@ func (s *Service) Name() string { return "gb28181-cascade" }
 
 func (s *Service) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	s.storeMu.Lock()
+	s.storeCtx, s.storeCancel = context.WithCancel(s.ctx)
+	s.storeMu.Unlock()
 
 	listen := s.cfg.SIPListen
 	if listen == "" {
@@ -430,6 +474,9 @@ func (s *Service) stop() error {
 		ps.stop()
 	}
 	for _, sub := range subs {
+		if sub.cancel != nil {
+			sub.cancel()
+		}
 		sub.sendMu.Lock()
 		sub.sendMu.Unlock()
 	}
@@ -575,8 +622,10 @@ func (s *Service) RegistrationSince() (time.Duration, bool) {
 // registration loop. A changed local address/NAT mapping makes old SIP and
 // media dialogs unusable even when the registration state was still online.
 func (s *Service) NotifyNetworkChange() {
+	s.cancelStoreContext()
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
+	s.resetStoreContext()
 	for _, u := range s.uppers {
 		s.mu.Lock()
 		u.generation.Add(1)
@@ -632,6 +681,9 @@ func (s *Service) closeUpperDialogsLocked(u *upper) {
 		ps.stop()
 	}
 	for _, sub := range subs {
+		if sub.cancel != nil {
+			sub.cancel()
+		}
 		sub.sendMu.Lock()
 		sub.sendMu.Unlock()
 	}
@@ -993,7 +1045,18 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 		// RecordInfoQuery); the Response-root form is a device answer that
 		// never reaches the cascade.
 		if q, ok := payload.(manscdp.RecordInfoQuery); ok && q.SN > 0 {
-			go s.answerRecordInfo(u, q)
+			s.admissionMu.Lock()
+			if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
+				s.admissionMu.Unlock()
+				return
+			}
+			ctx := s.storeContext()
+			s.wg.Add(1)
+			s.admissionMu.Unlock()
+			go func() {
+				defer s.wg.Done()
+				s.answerRecordInfo(ctx, u, q)
+			}()
 		}
 	case manscdp.CmdDeviceControl:
 		if dc, ok := payload.(manscdp.DeviceControl); ok {
