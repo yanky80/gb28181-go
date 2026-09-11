@@ -35,6 +35,10 @@ type CameraStatusSource interface {
     CameraStatus(cameraID string) string // "ON" 或 "OFF"
 }
 
+type MainStreamAcquirer interface {
+    AcquireMainHub(ctx context.Context, cameraID string) (hub *platform.FrameHub, release func(), err error)
+}
+
 type Store interface {
     UpsertCascadeChannel(ctx, CascadeChannel) error
     ListCascadeChannels(ctx) ([]CascadeChannel, error)
@@ -51,6 +55,8 @@ DeviceStatus 同时接受级联本地设备 ID 和已分配的 GB 通道 ID；�
 
 ```go
 svc := cascade.New(cfg, cameraSource, store)
+// 可选：按每个直播会话 acquire/release 主直播输出
+svc.SetMainStreamAcquirer(mainAcquirer)
 // 可选:按需子码流层
 svc.SetSubStreamAcquirer(subAcquirer)
 // 从录像段回放:

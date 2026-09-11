@@ -37,6 +37,10 @@ type CameraStatusSource interface {
     CameraStatus(cameraID string) string // "ON" or "OFF"
 }
 
+type MainStreamAcquirer interface {
+    AcquireMainHub(ctx context.Context, cameraID string) (hub *platform.FrameHub, release func(), err error)
+}
+
 type Store interface {
     UpsertCascadeChannel(ctx, CascadeChannel) error
     ListCascadeChannels(ctx) ([]CascadeChannel, error)
@@ -54,6 +58,8 @@ Wire and start:
 
 ```go
 svc := cascade.New(cfg, cameraSource, store)
+// Optional: acquire/release the encoder's main live output per dialog
+svc.SetMainStreamAcquirer(mainAcquirer)
 // Optional: on-demand sub-stream tier
 svc.SetSubStreamAcquirer(subAcquirer)
 // Playback from recorded segments:
@@ -65,6 +71,11 @@ svc.Start(ctx)
 yields `SegmentInfo` (codec + parameter sets + timestamped samples)
 per segment file; hosts with an fMP4 pipeline adapt their parser with
 a thin wrapper (field names already match).
+
+For recorded segments in the supported fragmented MP4 format,
+`platform/mp4.ParseSegment` can be passed directly to `SetSegmentParser`.
+Its H.264/H.265 samples use 4-byte big-endian NAL length prefixes;
+other `lengthSizeMinusOne` values are rejected.
 
 ## What the upper platform sees
 

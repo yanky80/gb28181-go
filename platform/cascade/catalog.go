@@ -3,12 +3,16 @@ package cascade
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/mickeyzzc/gb28181-go/manscdp"
 )
+
+// ponytail: global fallback lock keeps legacy Store implementations atomic;
+// use per-store allocation locks if multiple gateways share one process.
+var catalogAllocationMu sync.Mutex
 
 // catalogItems builds the aggregated catalog: one channel per local camera,
 // with GB channel IDs allocated on first sight and persisted
@@ -19,18 +23,26 @@ func (s *Service) catalogItems() ([]manscdp.Item, error) {
 
 	alloc := map[string]string{} // cameraID → gbChannelID
 	maxSerial := 0
+	var allocator CascadeChannelAllocator
 	if s.db != nil {
+		allocator, _ = s.db.(CascadeChannelAllocator)
+		if allocator == nil {
+			catalogAllocationMu.Lock()
+			defer catalogAllocationMu.Unlock()
+		}
 		rows, err := s.db.ListCascadeChannels(context.Background())
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range rows {
 			if err := validateCascadeChannelID(r.GBChannelID); err != nil {
-				return nil, fmt.Errorf("cascade: invalid persisted channel %q: %w", r.GBChannelID, err)
+				return nil, fmt.Errorf("invalid GB channel ID %q for local camera %q: %w", r.GBChannelID, r.CameraID, err)
 			}
 			alloc[r.CameraID] = r.GBChannelID
-			if ser, err := strconv.Atoi(r.GBChannelID[len(r.GBChannelID)-7:]); err == nil && ser > maxSerial {
-				maxSerial = ser
+			if allocator == nil {
+				if ser, err := strconv.Atoi(r.GBChannelID[len(r.GBChannelID)-7:]); err == nil && ser > maxSerial {
+					maxSerial = ser
+				}
 			}
 		}
 	}
@@ -48,18 +60,24 @@ func (s *Service) catalogItems() ([]manscdp.Item, error) {
 		var chID string
 		if s.db == nil {
 			chID = s.nilStoreChannelID(cam.ID, prefix)
-		}
-		if s.db != nil {
+		} else {
 			var ok bool
 			chID, ok = alloc[cam.ID]
 			if !ok {
-				maxSerial++
-				chID = fmt.Sprintf("%s%07d", prefix, maxSerial)
-				if err := s.db.UpsertCascadeChannel(context.Background(), CascadeChannel{
-					CameraID: cam.ID, GBChannelID: chID, Name: cam.Name, UpdatedAt: time.Now(),
-				}); err != nil {
-					slog.Warn("gb28181-cascade: channel allocation persist failed",
-						"camera", cam.ID, "channel", chID, "error", err)
+				if allocator != nil {
+					channel, err := allocator.AllocateCascadeChannel(context.Background(), cam.ID, prefix, cam.Name)
+					if err != nil {
+						return nil, err
+					}
+					chID = channel.GBChannelID
+				} else {
+					maxSerial++
+					chID = fmt.Sprintf("%s%07d", prefix, maxSerial)
+					if err := s.db.UpsertCascadeChannel(context.Background(), CascadeChannel{
+						CameraID: cam.ID, GBChannelID: chID, Name: cam.Name, UpdatedAt: time.Now(),
+					}); err != nil {
+						return nil, fmt.Errorf("persist GB channel allocation for local camera %q: %w", cam.ID, err)
+					}
 				}
 			}
 		}

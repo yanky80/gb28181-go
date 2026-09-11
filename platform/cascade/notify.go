@@ -34,6 +34,10 @@ var notifyScanInterval = 10 * time.Second
 // dialog for change-driven NOTIFYs. Non-catalog events get Expires 0 (upper
 // falls back to polling).
 func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
+	u := s.requireUpper(req)
+	if u == nil {
+		return
+	}
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
 	if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
@@ -73,11 +77,6 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 		return
 	}
 
-	u := s.requireUpper(req)
-	if u == nil {
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-		return
-	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
@@ -112,6 +111,7 @@ func (s *Service) catalogNotifyLoop() {
 			return
 		}
 		cur := s.cameraFingerprint()
+		s.stopUnavailableSessions()
 		if cur == last {
 			continue
 		}
@@ -155,6 +155,20 @@ func (s *Service) cameraFingerprint() string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, "\x00")
+}
+
+func (s *Service) stopUnavailableSessions() {
+	s.mu.Lock()
+	sessions := make([]*mediaSession, 0, len(s.sessions))
+	for _, ms := range s.sessions {
+		if !s.cameraAvailable(ms.camera) {
+			sessions = append(sessions, ms)
+		}
+	}
+	s.mu.Unlock()
+	for _, ms := range sessions {
+		ms.teardown("camera source unavailable")
+	}
 }
 
 // catalogNotifyBody mirrors manscdp.Catalog under a Notify root — the

@@ -12,6 +12,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -102,6 +103,25 @@ func (u *upperSocket) roundTrip(req sip.Request) sip.Response {
 	return nil
 }
 
+func (u *upperSocket) awaitResponse(callID string, seq uint) sip.Response {
+	u.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		msg := u.readMessage()
+		res, ok := msg.(sip.Response)
+		if !ok {
+			continue
+		}
+		gotID, idOK := res.CallID()
+		gotSeq, seqOK := res.CSeq()
+		if idOK && seqOK && gotID.String() == callID && uint(gotSeq.SeqNo) == seq && res.StatusCode() >= 200 {
+			return res
+		}
+	}
+	u.t.Fatalf("awaitResponse: no response for Call-ID %s CSeq %d within 5s", callID, seq)
+	return nil
+}
+
 // awaitServerRequest polls until a server-initiated request of the given
 // method arrives whose body contains bodyPart.
 func (u *upperSocket) awaitServerRequest(method sip.RequestMethod, bodyPart string) sip.Request {
@@ -181,7 +201,7 @@ func playSDP(t *testing.T, name string, withT bool) string {
 	}
 	return "v=0\r\no=" + lbUpperDevice + " 0 0 IN IP4 " + lbLocalHost + "\r\ns=" + name + "\r\n" +
 		"c=IN IP4 " + lbLocalHost + "\r\n" + tline +
-		"m=video " + strconv.Itoa(freeUDPPort(t)) + " RTP/AVP 96\r\ny=12345678\r\n"
+		"m=video " + strconv.Itoa(freeUDPPort(t)) + " RTP/AVP 96\r\na=recvonly\r\na=rtpmap:96 PS/90000\r\ny=12345678\r\n"
 }
 
 // startLoopbackService boots the cascade against a fake upper socket and
@@ -189,6 +209,7 @@ func playSDP(t *testing.T, name string, withT bool) string {
 func startLoopbackService(t *testing.T, src CameraSource, db Store) (*Service, *upperSocket) {
 	t.Helper()
 	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
 	return startLoopbackServiceWithConfig(t, cfg, src, db)
 }
 
@@ -259,8 +280,18 @@ func TestLoopbackInviteLiveForwardAndBye(t *testing.T) {
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
 
+	// A valid SDP from an unknown upper ID is rejected before channel lookup.
+	forged := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	from, ok := forged.From()
+	require.True(t, ok)
+	uri, ok := from.Address.(*sip.SipUri)
+	require.True(t, ok)
+	uri.SetUser(sip.String{Str: "99999999999999999999"})
+	res := up.roundTrip(forged)
+	require.Equal(t, 403, int(res.StatusCode()), "unknown upper ID must be forbidden")
+
 	// Unknown channel → 404.
-	res := up.roundTrip(up.request(sip.INVITE, "34020099991320000099", playSDP(t, "Play", false), "application/sdp"))
+	res = up.roundTrip(up.request(sip.INVITE, "34020099991320000099", playSDP(t, "Play", false), "application/sdp"))
 	require.Equal(t, 404, int(res.StatusCode()), "INVITE for unknown channel must 404")
 
 	// Bad SDP → 400.
@@ -326,7 +357,192 @@ func TestLoopbackInviteNoHub(t *testing.T) {
 	require.NoError(t, err)
 
 	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
-	require.Equal(t, 500, int(res.StatusCode()), "INVITE for a camera with no hub must 500")
+	require.Equal(t, 503, int(res.StatusCode()), "INVITE for a camera with no hub must be unavailable")
+}
+
+func TestLoopbackMainStreamLeaseLifecycle(t *testing.T) {
+	hub := platform.NewFrameHub()
+	acq := &fakeMainAcquirer{hub: hub}
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc.SetMainStreamAcquirer(acq)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	invite := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	res := up.roundTrip(invite)
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Equal(t, int32(1), acq.calls.Load())
+
+	callID, ok := invite.CallID()
+	require.True(t, ok)
+	res = up.roundTrip(up.requestDialog(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp", callID))
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Equal(t, int32(1), acq.calls.Load(), "same Call-ID re-INVITE must not acquire again")
+
+	invite2 := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	res = up.roundTrip(invite2)
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Eventually(t, func() bool { return acq.releases.Load() == 1 }, 5*time.Second, 20*time.Millisecond,
+		"replaced dialog must release its main-stream lease once")
+
+	callID2, ok := invite2.CallID()
+	require.True(t, ok)
+	res = up.roundTrip(up.requestDialog(sip.BYE, lbChannelOne, "", "", callID2))
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Eventually(t, func() bool {
+		return acq.releases.Load() == 2 && hub.ConsumerCount() == 0 && len(sessionIDs(svc)) == 0
+	}, 5*time.Second, 20*time.Millisecond, "BYE must release the current lease and subscription")
+}
+
+func TestLoopbackMainStreamLeaseFailureRefusesInvite(t *testing.T) {
+	acq := &fakeMainAcquirer{err: errNoSubForTest}
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, platform.NewFrameHub()}, db)
+	svc.SetMainStreamAcquirer(acq)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+	require.Equal(t, 503, int(res.StatusCode()), "main-stream acquisition failure must refuse the INVITE")
+	require.Equal(t, int32(1), acq.calls.Load())
+	require.Empty(t, sessionIDs(svc))
+}
+
+func TestLoopbackSourceOfflineStopsLiveLease(t *testing.T) {
+	oldScanInterval := notifyScanInterval
+	notifyScanInterval = 10 * time.Millisecond
+	t.Cleanup(func() { notifyScanInterval = oldScanInterval })
+
+	hub := platform.NewFrameHub()
+	acq := &fakeMainAcquirer{hub: hub}
+	src := &mutableAvailabilitySource{
+		cam:    CameraInfo{ID: "cam-1", Name: "Front"},
+		hub:    hub,
+		status: "OFF",
+	}
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, src, db)
+	svc.SetMainStreamAcquirer(acq)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+	require.Equal(t, 503, int(res.StatusCode()), "known OFF source must refuse the INVITE")
+
+	src.SetStatus("ON")
+	invite := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	res = up.roundTrip(invite)
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Eventually(t, func() bool { return hub.ConsumerCount() == 1 }, 5*time.Second, 20*time.Millisecond)
+
+	src.SetStatus("OFF")
+	up.awaitServerRequest(sip.BYE, "")
+	require.Eventually(t, func() bool {
+		return acq.releases.Load() == 1 && hub.ConsumerCount() == 0 && len(sessionIDs(svc)) == 0
+	}, 5*time.Second, 20*time.Millisecond, "OFF source must tear down the live session")
+}
+
+func TestLoopbackConcurrentSameCallIDAdmitsOnce(t *testing.T) {
+	hub := platform.NewFrameHub()
+	acq := &fakeMainAcquirer{hub: hub, entered: make(chan struct{}), allow: make(chan struct{})}
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc.SetMainStreamAcquirer(acq)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	invite := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	callID, ok := invite.CallID()
+	require.True(t, ok)
+	reinvite := up.requestDialog(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp", callID)
+	go up.send(invite)
+	select {
+	case <-acq.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first INVITE did not reach the acquirer")
+	}
+	go up.send(reinvite)
+
+	close(acq.allow)
+	up.awaitResponse(callID.String(), 2)
+	require.Eventually(t, func() bool {
+		return acq.calls.Load() == 1 && len(sessionIDs(svc)) == 1 && hub.ConsumerCount() == 1
+	}, 5*time.Second, 20*time.Millisecond, "same Call-ID must leave one admitted session")
+
+	up.send(up.requestDialog(sip.BYE, lbChannelOne, "", "", callID))
+	require.Eventually(t, func() bool {
+		return acq.releases.Load() == 1 && len(sessionIDs(svc)) == 0 && hub.ConsumerCount() == 0
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestLoopbackConcurrentReplacementReclaimsOldSession(t *testing.T) {
+	hub := platform.NewFrameHub()
+	acq := &fakeMainAcquirer{hub: hub}
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc.SetMainStreamAcquirer(acq)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	invite1 := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	invite2 := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	var sends sync.WaitGroup
+	sends.Add(2)
+	go func() { defer sends.Done(); up.send(invite1) }()
+	go func() { defer sends.Done(); up.send(invite2) }()
+	sends.Wait()
+
+	require.Eventually(t, func() bool {
+		return acq.calls.Load() == 2 && acq.releases.Load() == 1 && len(sessionIDs(svc)) == 1 && hub.ConsumerCount() == 1
+	}, 5*time.Second, 20*time.Millisecond, "concurrent replacement must reclaim exactly the old session")
+
+	if id, ok := invite1.CallID(); ok {
+		up.send(up.requestDialog(sip.BYE, lbChannelOne, "", "", id))
+	}
+	if id, ok := invite2.CallID(); ok {
+		up.send(up.requestDialog(sip.BYE, lbChannelOne, "", "", id))
+	}
+	require.Eventually(t, func() bool {
+		return acq.releases.Load() == 2 && len(sessionIDs(svc)) == 0 && hub.ConsumerCount() == 0
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+func TestLoopbackStopWaitsForInFlightInvite(t *testing.T) {
+	hub := platform.NewFrameHub()
+	acq := &fakeMainAcquirer{hub: hub, entered: make(chan struct{}), allow: make(chan struct{}), ignoreCancel: true}
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc.SetMainStreamAcquirer(acq)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	up.send(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+	select {
+	case <-acq.entered:
+	case <-time.After(time.Second):
+		t.Fatal("INVITE did not reach the acquirer")
+	}
+	stopDone := make(chan struct{})
+	go func() {
+		_ = svc.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+		t.Fatal("Stop returned before the in-flight INVITE completed")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(acq.allow)
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not complete after the in-flight INVITE was released")
+	}
+	require.Equal(t, int32(1), acq.releases.Load())
+	require.Empty(t, sessionIDs(svc))
+	require.Equal(t, 0, hub.ConsumerCount())
 }
 
 func TestLoopbackSubscribeCatalogNotify(t *testing.T) {

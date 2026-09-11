@@ -72,6 +72,12 @@ type SubStreamAcquirer interface {
 	AcquireSubHub(ctx context.Context, cameraID string) (hub *platform.FrameHub, release func(), err error)
 }
 
+// MainStreamAcquirer grants one live dialog a main-stream lease. Nil keeps the
+// legacy CameraSource.Hub path, where the host owns the stream lifetime.
+type MainStreamAcquirer interface {
+	AcquireMainHub(ctx context.Context, cameraID string) (hub *platform.FrameHub, release func(), err error)
+}
+
 // upper is one upper-platform registration session (#370): its own REGISTER /
 // keepalive loop and online state over the shared SIP listener. The single
 // legacy config form becomes uppers[0]; gb28181_cascade.upstreams appends
@@ -96,10 +102,22 @@ type Service struct {
 	segParser SegmentParser
 	// subAcq serves sub-stream forwardings (#512); nil = main-only.
 	subAcq SubStreamAcquirer
+	// mainAcq serves live main-stream leases; nil preserves the legacy Hub path.
+	mainAcq MainStreamAcquirer
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// admissionMu serializes INVITE admission with Stop. ponytail: one global
+	// lock keeps lifecycle ordering simple; per-camera admission if throughput
+	// ever makes serialized INVITEs measurable. stopping is set before Stop
+	// waits on the mutex, so new INVITEs reject while an in-flight acquire can
+	// still observe the cancelled service context.
+	admissionMu sync.Mutex
+	stopping    atomic.Bool
+	stopOnce    sync.Once
+	stopErr     error
 
 	srv gosip.Server
 
@@ -179,6 +197,10 @@ func buildUppers(cfg Config) []*upper {
 // SetSubStreamAcquirer wires the on-demand sub-stream provider (#512). Call
 // once at wiring time, before Start.
 func (s *Service) SetSubStreamAcquirer(a SubStreamAcquirer) { s.subAcq = a }
+
+// SetMainStreamAcquirer wires the host's main-stream lease provider. Call once
+// at wiring time, before Start.
+func (s *Service) SetMainStreamAcquirer(a MainStreamAcquirer) { s.mainAcq = a }
 
 func New(cfg Config, src CameraSource, db Store) *Service {
 	retryBase := parseRetryDuration(cfg.RegisterRetryBase, registerRetryBaseDefault)
@@ -280,6 +302,38 @@ func (s *Service) cameraStatus(cameraID string) string {
 	return "OFF"
 }
 
+func (s *Service) cameraAvailable(cameraID string) bool {
+	cam, ok := s.cameraInfo(cameraID)
+	if !ok || cam.CascadeHidden || s.cameraStatus(cameraID) != "ON" {
+		return false
+	}
+	return s.mainAcq != nil || s.src.Hub(cameraID) != nil
+}
+
+func (s *Service) acquireMainHub(cameraID string) (*platform.FrameHub, func(), error) {
+	if s.mainAcq != nil {
+		ctx := context.Background()
+		if s.ctx != nil {
+			ctx = s.ctx
+		}
+		hub, release, err := s.mainAcq.AcquireMainHub(ctx, cameraID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if hub == nil {
+			return nil, nil, errors.New("main stream unavailable")
+		}
+		if release == nil {
+			release = func() {}
+		}
+		return hub, release, nil
+	}
+	hub := s.src.Hub(cameraID)
+	if hub == nil {
+		return nil, nil, errors.New("main stream unavailable")
+	}
+	return hub, func() {}, nil
+}
 func (s *Service) Name() string { return "gb28181-cascade" }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -306,10 +360,7 @@ func (s *Service) Start(ctx context.Context) error {
 	// push channel additions/removals without waiting for the upper's
 	// polling fallback (#370).
 	_ = srv.OnRequest(sip.SUBSCRIBE, s.onSubscribe)
-	_ = srv.OnRequest(sip.OPTIONS, func(req sip.Request, tx sip.ServerTransaction) {
-		allow := sip.AllowHeader{sip.REGISTER, sip.MESSAGE, sip.INVITE, sip.ACK, sip.BYE, sip.CANCEL, sip.OPTIONS}
-		_, _ = srv.RespondOnRequest(req, 200, "OK", "", []sip.Header{&allow})
-	})
+	_ = srv.OnRequest(sip.OPTIONS, s.onOptions)
 	// MANSRTSP playback controls (pause/resume/seek/scale) ride in-dialog INFO
 	// messages; onInfo routes them to the channel's playback session.
 	_ = srv.OnRequest(sip.INFO, s.onInfo)
@@ -635,30 +686,66 @@ func upperAddr(u *upper) (*net.UDPAddr, error) {
 	return net.ResolveUDPAddr("udp", u.cfg.ServerAddr)
 }
 
-// requireUpper authorizes an incoming request by the upper platform ID in its
-// From user. A sole upper retains the legacy sender-tolerant behavior.
-func (s *Service) requireUpper(req sip.Request) *upper {
-	if len(s.uppers) == 0 {
+// upperOf resolves a trusted incoming request to its configured upper. Both
+// the From user and the packet source IP must match; source ports are ignored
+// because UDP NAT may rewrite them.
+func (s *Service) upperOf(req sip.Request) *upper {
+	if req == nil {
 		return nil
 	}
-	if len(s.uppers) == 1 {
-		return s.uppers[0]
+	from, ok := req.From()
+	if !ok || from.Address == nil {
+		return nil
 	}
-	if from, ok := req.From(); ok {
-		user := from.Address.User().String()
-		for _, u := range s.uppers {
-			if u.cfg.ServerDomain == user {
-				return u
-			}
+	user := from.Address.User().String()
+	for _, u := range s.uppers {
+		if u.cfg.ServerDomain == user && sourceMatchesUpper(req.Source(), u) {
+			return u
 		}
 	}
 	return nil
 }
 
-// upperOf is retained as the package-local resolution seam used by existing
-// cascade tests and callers.
-func (s *Service) upperOf(req sip.Request) *upper {
-	return s.requireUpper(req)
+func sourceMatchesUpper(source string, u *upper) bool {
+	if u == nil || source == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(source)
+	if err != nil {
+		host = strings.Trim(source, "[]")
+	}
+	sourceIP := net.ParseIP(host)
+	target, err := upperAddr(u)
+	return sourceIP != nil && err == nil && sourceIP.Equal(target.IP)
+}
+
+// requireUpper rejects untrusted requests without logging headers or bodies.
+// In particular, Authorization may contain a digest secret and must never be
+// included in diagnostics.
+func (s *Service) requireUpper(req sip.Request) *upper {
+	if u := s.upperOf(req); u != nil {
+		return u
+	}
+	if req != nil {
+		fromUser := ""
+		if from, ok := req.From(); ok && from.Address != nil {
+			fromUser = from.Address.User().String()
+		}
+		slog.Warn("gb28181-cascade: unauthorized upper request",
+			"method", req.Method(), "from", fromUser, "source", req.Source())
+		if s.srv != nil {
+			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		}
+	}
+	return nil
+}
+
+func (s *Service) onOptions(req sip.Request, _ sip.ServerTransaction) {
+	if s.requireUpper(req) == nil {
+		return
+	}
+	allow := sip.AllowHeader{sip.REGISTER, sip.MESSAGE, sip.INVITE, sip.ACK, sip.BYE, sip.CANCEL, sip.OPTIONS}
+	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", []sip.Header{&allow})
 }
 
 func (s *Service) upperForDeviceStatus(req sip.Request) *upper {
@@ -895,8 +982,8 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 		return
 	}
 	if cmd == manscdp.CmdDeviceStatus {
-		u = s.upperForDeviceStatus(req)
-		if u == nil {
+		statusUpper := s.upperForDeviceStatus(req)
+		if statusUpper == nil {
 			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 			return
 		}

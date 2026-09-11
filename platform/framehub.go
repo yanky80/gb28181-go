@@ -30,6 +30,7 @@ const frameHubQueueSize = 150
 type FrameHub struct {
 	cameraID       string
 	mu             sync.Mutex
+	closed         bool
 	consumers      map[string]*frameHubConsumer
 	audioConsumers map[string]*frameHubAudioConsumer
 	dropped        atomic.Int64
@@ -64,6 +65,9 @@ func (h *FrameHub) CameraID() string { return h.cameraID }
 func (h *FrameHub) Subscribe(id string, cb FrameCallback) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed {
+		return fmt.Errorf("frame hub is closed")
+	}
 	if _, ok := h.consumers[id]; ok {
 		return fmt.Errorf("consumer %q already subscribed", id)
 	}
@@ -95,12 +99,11 @@ func (h *FrameHub) Unsubscribe(id string) {
 // that do not fit a consumer's queue are dropped and counted in Dropped().
 func (h *FrameHub) Broadcast(pts int64, au [][]byte, isIDR bool) {
 	h.mu.Lock()
-	consumers := make([]*frameHubConsumer, 0, len(h.consumers))
-	for _, c := range h.consumers {
-		consumers = append(consumers, c)
+	defer h.mu.Unlock()
+	if h.closed {
+		return
 	}
-	h.mu.Unlock()
-	for _, c := range consumers {
+	for _, c := range h.consumers {
 		select {
 		case c.ch <- frameHubFrame{pts: pts, au: au, isIDR: isIDR}:
 		default:
@@ -150,6 +153,9 @@ type frameHubAudioFrame struct {
 func (h *FrameHub) SubscribeAudio(id string, cb AudioCallback) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed {
+		return fmt.Errorf("frame hub is closed")
+	}
 	if h.audioConsumers == nil {
 		h.audioConsumers = make(map[string]*frameHubAudioConsumer)
 	}
@@ -188,15 +194,35 @@ func (h *FrameHub) UnsubscribeAudio(id string) {
 	}
 }
 
+// Close stops accepting subscribers and releases all current consumers.
+// It is idempotent so owners can close a replaced hub and its old connection
+// independently.
+func (h *FrameHub) Close() {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	h.closed = true
+	for _, c := range h.consumers {
+		close(c.done)
+	}
+	for _, c := range h.audioConsumers {
+		close(c.done)
+	}
+	h.consumers = make(map[string]*frameHubConsumer)
+	h.audioConsumers = make(map[string]*frameHubAudioConsumer)
+	h.mu.Unlock()
+}
+
 // BroadcastAudio fans one audio frame out to all audio consumers, non-blocking.
 func (h *FrameHub) BroadcastAudio(pts int64, codec string, data []byte) {
 	h.mu.Lock()
-	consumers := make([]*frameHubAudioConsumer, 0, len(h.audioConsumers))
-	for _, c := range h.audioConsumers {
-		consumers = append(consumers, c)
+	defer h.mu.Unlock()
+	if h.closed {
+		return
 	}
-	h.mu.Unlock()
-	for _, c := range consumers {
+	for _, c := range h.audioConsumers {
 		select {
 		case c.ch <- frameHubAudioFrame{pts: pts, codec: codec, data: data}:
 		default:

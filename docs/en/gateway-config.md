@@ -35,3 +35,22 @@ sip.password=replace-me
 
 Credential values are not included in parser or permission errors, and the
 ordinary configuration has no secret fields.
+
+## Recording index
+
+The gateway recording store keeps its own in-memory index and append-only
+`recordings.jsonl` journal. Create it and call `Scan(ctx)` from the gateway's
+periodic recorder check:
+
+```go
+store, err := NewRecordingStore(
+	"/var/lib/edge-gateway/recordings.jsonl",
+	"/home/admin/edge/nvr",
+)
+```
+
+Only `root/{camera_id}/{YYYYMMDD}/*.mp4` for the current day is scanned. A
+file must keep the same size for two scans before `ffprobe` metadata is
+recorded. `ListRecordings` returns overlap-filtered, `started_at`-ordered
+results; `Remove` appends a tombstone and `Compact` atomically rewrites the
+journal. The gateway owns the journal while the recorder owns media files.

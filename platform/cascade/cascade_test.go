@@ -3,7 +3,9 @@ package cascade
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,6 +74,109 @@ func fakeSegmentParser(p string) (*SegmentInfo, error) {
 
 func (f fakeSource) Cameras() []CameraInfo         { return f.cams }
 func (f fakeSource) Hub(string) *platform.FrameHub { return nil }
+
+type fakeMainAcquirer struct {
+	hub          *platform.FrameHub
+	err          error
+	calls        atomic.Int32
+	releases     atomic.Int32
+	entered      chan struct{}
+	allow        chan struct{}
+	ignoreCancel bool
+	once         sync.Once
+}
+
+func (f *fakeMainAcquirer) AcquireMainHub(ctx context.Context, _ string) (*platform.FrameHub, func(), error) {
+	f.calls.Add(1)
+	if f.entered != nil {
+		f.once.Do(func() { close(f.entered) })
+		select {
+		case <-f.allow:
+		case <-ctx.Done():
+			if f.ignoreCancel {
+				<-f.allow
+				break
+			}
+			return nil, nil, ctx.Err()
+		}
+	}
+	if f.err != nil {
+		return nil, nil, f.err
+	}
+	return f.hub, func() { f.releases.Add(1) }, nil
+}
+
+type mutableAvailabilitySource struct {
+	mu     sync.RWMutex
+	cam    CameraInfo
+	hub    *platform.FrameHub
+	status string
+}
+
+func (s *mutableAvailabilitySource) Cameras() []CameraInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return []CameraInfo{s.cam}
+}
+
+func (s *mutableAvailabilitySource) Hub(string) *platform.FrameHub { return s.hub }
+
+func (s *mutableAvailabilitySource) CameraStatus(string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.status
+}
+
+func (s *mutableAvailabilitySource) SetStatus(status string) {
+	s.mu.Lock()
+	s.status = status
+	s.mu.Unlock()
+}
+
+func TestMediaSessionMainLeaseReleasedOnceConcurrently(t *testing.T) {
+	var releases atomic.Int32
+	svc := New(testCfg(), fakeSource{}, nil)
+	ms := &mediaSession{
+		svc:         svc,
+		callID:      "lease-race",
+		channel:     "channel",
+		releaseMain: func() { releases.Add(1) },
+	}
+
+	done := make(chan struct{}, 2)
+	go func() { ms.close(); done <- struct{}{} }()
+	go func() { ms.teardown("concurrent failure"); done <- struct{}{} }()
+	<-done
+	<-done
+	require.Equal(t, int32(1), releases.Load())
+}
+
+func TestMediaSessionSendErrorReleasesRealHubLease(t *testing.T) {
+	hub := platform.NewFrameHub()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	require.NoError(t, err)
+
+	var releases atomic.Int32
+	svc := New(testCfg(), hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1"}}}, hub}, nil)
+	ms := &mediaSession{
+		svc:         svc,
+		callID:      "send-error",
+		channel:     "channel",
+		camera:      "cam-1",
+		hub:         hub,
+		releaseMain: func() { releases.Add(1) },
+		mux:         psmux.New(),
+		rtp:         psmux.NewRTPPacketizer(conn, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}, 1, 0),
+	}
+	ms.run(hub)
+	require.Eventually(t, func() bool { return hub.ConsumerCount() == 1 }, time.Second, time.Millisecond)
+
+	require.NoError(t, conn.Close())
+	hub.Broadcast(90000, [][]byte{{0x67, 0x42, 0x00, 0x1f}}, true)
+	require.Eventually(t, func() bool {
+		return releases.Load() == 1 && hub.ConsumerCount() == 0 && ms.closed.Load()
+	}, time.Second, time.Millisecond, "send error must release the lease and hub subscription")
+}
 
 func newCascadeTestDB(t *testing.T) *fakeCascadeStore {
 	t.Helper()
@@ -365,7 +470,7 @@ func TestSDPFromInvite(t *testing.T) {
 	// Unix-era t= values pass through unchanged.
 	sd, err = sdpFromInvite([]byte(
 		"v=0\r\no=- 0 0 IN IP4 10.0.0.3\r\ns=Playback\r\nc=IN IP4 10.0.0.3\r\nt=1760000000 1760000060\r\n" +
-			"m=video 30014 RTP/AVP 96\r\na=recvonly\r\ny=9\r\n"))
+			"m=video 30014 RTP/AVP 96\r\na=recvonly\r\na=rtpmap:96 PS/90000\r\ny=9\r\n"))
 	require.NoError(t, err)
 	require.True(t, sd.hasT)
 	require.EqualValues(t, 1760000000, sd.t0)

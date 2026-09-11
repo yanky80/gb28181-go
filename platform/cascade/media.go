@@ -47,6 +47,8 @@ type mediaSession struct {
 	// unsubscribes through it. Guarded by mu: run()'s async sub acquisition
 	// can swap it while a concurrent BYE runs close().
 	hub *platform.FrameHub
+	// releaseMain drops the main-stream reference acquired for this dialog.
+	releaseMain func()
 	// releaseSub drops the sub-stream reference acquired for the sub tier.
 	releaseSub func()
 	// wantSub: the camera opted into the low-res cascade tier; run()
@@ -102,21 +104,70 @@ type inviteSDP struct {
 // seconds are accepted too (both conventions exist in the field).
 func sdpFromInvite(body []byte) (inviteSDP, error) {
 	var sd inviteSDP
+	var hasVideo, hasAudio, hasOtherMedia, hasDirection, hasPS, hasSSRC bool
+	var mediaErr, direction, setup string
 	for _, line := range strings.Split(string(body), "\r\n") {
 		line = strings.TrimSpace(line)
 		switch {
 		case strings.HasPrefix(line, "c=IN IP4 "):
-			sd.host = strings.TrimSpace(strings.TrimPrefix(line, "c=IN IP4"))
-		case strings.HasPrefix(line, "m=video "):
 			fields := strings.Fields(line)
-			if len(fields) >= 3 && fields[2] == "TCP/RTP/AVP" {
-				sd.tcp = true
+			ip := net.ParseIP(strings.TrimSpace(strings.TrimPrefix(line, "c=IN IP4")))
+			if len(fields) != 3 || ip == nil || ip.To4() == nil || ip.IsUnspecified() || ip.IsMulticast() {
+				return sd, fmt.Errorf("invalid c= media address")
 			}
-			if len(fields) >= 2 {
-				sd.port, _ = strconv.Atoi(fields[1])
+			sd.host = fields[2]
+		case strings.HasPrefix(line, "m=video "):
+			if hasVideo {
+				return sd, fmt.Errorf("duplicate m=video media line")
+			}
+			hasVideo = true
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				mediaErr = "invalid m=video line"
+				break
+			}
+			port, err := strconv.Atoi(fields[1])
+			if err != nil || port < 1 || port > 65535 {
+				mediaErr = "invalid video port"
+				break
+			}
+			sd.port = port
+			switch fields[2] {
+			case "RTP/AVP":
+				sd.tcp = false
+			case "TCP/RTP/AVP":
+				sd.tcp = true
+			default:
+				mediaErr = "unsupported media transport"
+			}
+			if fields[3] != "96" {
+				mediaErr = "unsupported PS payload"
+			}
+		case strings.HasPrefix(line, "m=audio "):
+			hasAudio = true
+		case strings.HasPrefix(line, "m="):
+			hasOtherMedia = true
+		case strings.HasPrefix(line, "a=recvonly") || strings.HasPrefix(line, "a=sendonly") || strings.HasPrefix(line, "a=sendrecv") || strings.HasPrefix(line, "a=inactive"):
+			if hasDirection {
+				return sd, fmt.Errorf("multiple media directions")
+			}
+			hasDirection = true
+			direction = strings.TrimPrefix(line, "a=")
+		case strings.HasPrefix(line, "a=setup:"):
+			setup = strings.TrimSpace(strings.TrimPrefix(line, "a=setup:"))
+		case strings.HasPrefix(line, "a=rtpmap:96 "):
+			if strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(line, "a=rtpmap:96 ")), "PS/90000") {
+				hasPS = true
 			}
 		case strings.HasPrefix(line, "y="):
-			v, _ := strconv.ParseUint(strings.TrimPrefix(line, "y="), 10, 32)
+			if hasSSRC {
+				return sd, fmt.Errorf("duplicate SSRC")
+			}
+			hasSSRC = true
+			v, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "y=")), 10, 32)
+			if err != nil || v == 0 {
+				return sd, fmt.Errorf("invalid SSRC")
+			}
 			sd.ssrc = uint32(v)
 		case strings.HasPrefix(line, "s="):
 			sd.name = strings.TrimSpace(strings.TrimPrefix(line, "s="))
@@ -133,8 +184,32 @@ func sdpFromInvite(body []byte) (inviteSDP, error) {
 			}
 		}
 	}
-	if sd.host == "" || sd.port <= 0 {
-		return sd, fmt.Errorf("invite SDP lacks c=/m=video address")
+	if sd.host == "" {
+		return sd, fmt.Errorf("missing c= media address")
+	}
+	if !hasVideo {
+		return sd, fmt.Errorf("missing m=video media line")
+	}
+	if mediaErr != "" {
+		return sd, fmt.Errorf("%s", mediaErr)
+	}
+	if hasAudio || hasOtherMedia {
+		return sd, fmt.Errorf("audio or non-video media is not supported")
+	}
+	if !hasSSRC || sd.ssrc == 0 {
+		return sd, fmt.Errorf("missing SSRC")
+	}
+	if !hasDirection || direction != "recvonly" {
+		return sd, fmt.Errorf("unsupported media direction")
+	}
+	if !hasPS {
+		return sd, fmt.Errorf("unsupported media format; require PS/90000")
+	}
+	if sd.tcp && setup != "passive" {
+		return sd, fmt.Errorf("unsupported TCP setup; require passive")
+	}
+	if !sd.tcp && setup != "" {
+		return sd, fmt.Errorf("setup is only supported for TCP media")
 	}
 	return sd, nil
 }
@@ -155,15 +230,14 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	if s.srv == nil {
 		return
 	}
+	u := s.requireUpper(req)
+	if u == nil {
+		return
+	}
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
 	if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
 		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
-		return
-	}
-	u := s.requireUpper(req)
-	if u == nil {
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 		return
 	}
 	s.mu.Lock()
@@ -184,6 +258,13 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	if err != nil {
 		slog.Warn("gb28181-cascade: INVITE SDP parse failed", "error", err)
 		_, _ = s.srv.RespondOnRequest(req, 400, "Bad SDP", "", nil)
+		return
+	}
+
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.stopping.Load() {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
 		return
 	}
 
@@ -234,6 +315,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
 		return
 	}
+
 	if cam, ok := s.cameraInfo(cameraID); ok && cam.CascadeHidden {
 		// Catalog convergence: the channel was allocated once (allocation rows
 		// persist) but the camera is now hidden — the upper may still hold the
@@ -242,19 +324,19 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
 		return
 	}
-	hub := s.src.Hub(cameraID)
-	if hub == nil {
-		_, _ = s.srv.RespondOnRequest(req, 500, "Stream Unavailable", "", nil)
+	if !s.cameraAvailable(cameraID) {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Stream Unavailable", "", nil)
+		return
+	}
+	hub, releaseMain, err := s.acquireMainHub(cameraID)
+	if err != nil {
+		slog.Warn("gb28181-cascade: main-stream acquire failed", "camera", cameraID, "error", err)
+		_, _ = s.srv.RespondOnRequest(req, 503, "Stream Unavailable", "", nil)
 		return
 	}
 
-	// Supersede: a new-dialog INVITE for a channel that is already forwarding
-	// means the upper recycled the session (its BYE may be lost or still in
-	// flight). Keeping both forwards alive overlaps two SSRCs onto the upper's
-	// recycled receive port — the upper's first-packet SSRC latch grabs
-	// whichever sender arrives first and every packet of the other is dropped
-	// as foreign (observed as endless "recycling stale session / no keyframe"
-	// churn on the fnOS upper, 2026-08-19). One channel, one live forward.
+	// Supersede only the same upper's channel. Different uppers may forward
+	// the same channel concurrently under distinct dialog ownership.
 	s.mu.Lock()
 	for otherID, other := range s.sessions {
 		if otherID != callID && other.upper == u && other.channel == channelID {
@@ -274,6 +356,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	if sd.tcp {
 		conn, err = (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", net.JoinHostPort(sd.host, strconv.Itoa(sd.port)))
 		if err != nil {
+			releaseMain()
 			slog.Warn("gb28181-cascade: TCP media dial failed", "channel", channelID, "upper", sd.host, "error", err)
 			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
 			return
@@ -283,6 +366,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		dst = &net.UDPAddr{IP: net.ParseIP(sd.host), Port: sd.port}
 		conn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 		if err != nil {
+			releaseMain()
 			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
 			return
 		}
@@ -290,10 +374,12 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 
 	ms := &mediaSession{
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
-		upper: u, generation: generation,
-		conn: conn, dst: dst, ssrc: sd.ssrc,
-		mux:       psmux.New(),
-		withAudio: strings.Contains(string(req.Body()), "m=audio"),
+		upper: u,
+		conn:  conn, dst: dst, ssrc: sd.ssrc,
+		generation:  generation,
+		releaseMain: releaseMain,
+		mux:         psmux.New(),
+		withAudio:   strings.Contains(string(req.Body()), "m=audio"),
 	}
 	// Sub-stream forwarding (#512): acquisition happens in run() AFTER the
 	// INVITE is answered — the ready wait (first keyframe) must never block
@@ -316,14 +402,14 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	ms.sdpBody = fmt.Sprintf(
 		"v=0\r\no=- 0 0 IN IP4 %s\r\ns=Play\r\nc=IN IP4 %s\r\nt=0 0\r\n"+
 			"m=video %d RTP/AVP 96\r\na=sendonly\r\na=rtpmap:96 PS/90000\r\ny=%d\r\n",
-		ms.localHost(), ms.localHost(), ms.localPort(), sd.ssrc)
+		ms.localHost(), ms.localHost(), answerMediaPort(ms.conn, sd.tcp), sd.ssrc)
 	if sd.tcp {
 		// Answer as the TCP-active side: we dialed, per the offer's setup:passive.
 		ms.sdpBody = fmt.Sprintf(
 			"v=0\r\no=- 0 0 IN IP4 %s\r\ns=Play\r\nc=IN IP4 %s\r\nt=0 0\r\n"+
 				"m=video %d TCP/RTP/AVP 96\r\na=sendonly\r\na=setup:active\r\na=connection:new\r\n"+
 				"a=rtpmap:96 PS/90000\r\ny=%d\r\n",
-			ms.localHost(), ms.localHost(), ms.localPort(), sd.ssrc)
+			ms.localHost(), ms.localHost(), answerMediaPort(ms.conn, sd.tcp), sd.ssrc)
 	}
 
 	s.mu.Lock()
@@ -366,9 +452,16 @@ func (ms *mediaSession) localHost() string {
 	return h
 }
 
-func (ms *mediaSession) localPort() int {
-	_, p := ms.svc.localHostPort(ms.upper)
-	return p
+const mediaDiscardPort = 9
+
+func answerMediaPort(conn net.Conn, tcp bool) int {
+	if tcp {
+		return mediaDiscardPort
+	}
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return addr.Port
+	}
+	return 0
 }
 
 // run subscribes to the camera's hub and pumps frames until stopped.
@@ -583,6 +676,8 @@ func (ms *mediaSession) close() {
 	ms.closed.Store(true)
 	ms.mu.Lock()
 	hub := ms.hub
+	releaseMain := ms.releaseMain
+	ms.releaseMain = nil
 	releaseSub := ms.releaseSub
 	ms.releaseSub = nil
 	audioSubID := ms.audioSubID
@@ -600,6 +695,9 @@ func (ms *mediaSession) close() {
 	}
 	if releaseSub != nil {
 		releaseSub()
+	}
+	if releaseMain != nil {
+		releaseMain()
 	}
 	if ms.conn != nil {
 		_ = ms.conn.Close()
