@@ -431,7 +431,7 @@ func validateCamera(camera CameraConfig, version string) error {
 	if version == "2016" && camera.Codec == "h265" {
 		return errors.New("2016+h265 is unsupported")
 	}
-	if camera.PTZMode != "none" && camera.PTZMode != "gb28181" && camera.PTZMode != "onvif" && camera.PTZMode != "vendor" {
+	if camera.PTZMode != "none" && camera.PTZMode != "gb28181" && camera.PTZMode != "local-gb28181" && camera.PTZMode != "onvif" && camera.PTZMode != "vendor" {
 		return fmt.Errorf("cam%d.ptz_mode %q is unsupported", camera.Index, camera.PTZMode)
 	}
 	return nil

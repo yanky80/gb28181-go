@@ -51,6 +51,10 @@ type Config struct {
 	// RegisterRetryMax caps the REGISTER retry wait. Default "5m".
 	RegisterRetryMax string `yaml:"register_retry_max,omitempty"`
 
+	// PTZLeaseTimeout stops a moving adapter when no further control arrives.
+	// Empty/zero uses the safe five-second default.
+	PTZLeaseTimeout time.Duration `yaml:"ptz_lease_timeout,omitempty"`
+
 	// Upstreams appends additional upper platforms beyond the legacy single
 	// form (ServerAddr non-empty becomes uppers[0]).
 	Upstreams []Upstream `yaml:"upstreams,omitempty"`

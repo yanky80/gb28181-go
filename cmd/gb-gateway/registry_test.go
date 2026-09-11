@@ -45,6 +45,18 @@ func TestCameraRegistryHelloHealthAndReadOnlyViews(t *testing.T) {
 	}
 }
 
+func TestCameraRegistryCarriesPTZModeToCascade(t *testing.T) {
+	r := newRegistry(t, CameraSpec{ID: "cam-a", PTZMode: "onvif"})
+	view, ok := r.Camera("cam-a")
+	if !ok || view.PTZMode != "onvif" {
+		t.Fatalf("snapshot PTZ mode = %q, %v; want onvif", view.PTZMode, ok)
+	}
+	cameras := r.Cameras()
+	if len(cameras) != 1 || cameras[0].PTZMode != "onvif" {
+		t.Fatalf("cascade PTZ mode = %+v; want onvif", cameras)
+	}
+}
+
 func TestCameraRegistryTimeoutDisconnectAndIsolation(t *testing.T) {
 	r := newRegistry(t,
 		CameraSpec{ID: "cam-a", Name: "Front"},

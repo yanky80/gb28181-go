@@ -330,7 +330,9 @@ func TestSameChannelInvitesFromDifferentUppersCoexist(t *testing.T) {
 	uri.SetUser(sip.String{Str: "34020000002000000003"})
 	res = secondUp.roundTrip(second)
 	require.Equal(t, 200, int(res.StatusCode()))
-	require.Eventually(t, func() bool { return len(sessionIDs(svc)) == 2 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool {
+		return len(sessionIDs(svc)) == 2 && hub.ConsumerCount() == 2
+	}, time.Second, time.Millisecond)
 	require.Equal(t, 2, hub.ConsumerCount(), "different uppers must retain both same-channel live leases")
 }
 

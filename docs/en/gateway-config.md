@@ -22,6 +22,10 @@ Supported keys are:
 - `camN.camera_id`, `camN.gb_expose`, `camN.gb_name`, `camN.gb_codec`, and
   `camN.ptz_mode`.
 
+`ptz_mode` accepts `none`, `local-gb28181`, `onvif`, or `vendor`. PTZ is only
+advertised after a matching adapter is wired; selecting a mode alone does not
+claim camera capability.
+
 Here `camera_id` is the design's external key for a local camera; it is not
 the stable GB channel identity assigned by the gateway.
 

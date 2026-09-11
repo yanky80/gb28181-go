@@ -136,7 +136,9 @@ type PTZForwarder func(cameraID, direction string, speed byte) error
 
 // SetPTZForwarder wires the local-camera PTZ bridge.
 func (s *Service) SetPTZForwarder(f PTZForwarder) {
+	s.mu.Lock()
 	s.ptzForward = f
+	s.mu.Unlock()
 }
 
 // forwardDeviceControl routes an upper-platform DeviceControl to the local
@@ -148,20 +150,26 @@ func (s *Service) SetPTZForwarder(f PTZForwarder) {
 // outright: an upper platform must not be able to power-cycle this host.
 func (s *Service) forwardDeviceControl(dc manscdp.DeviceControl) {
 	if dc.PTZCmd == "" {
+		cameraID, _ := s.cameraOfChannel(dc.DeviceID)
 		switch {
 		case dc.RecordCmd != "":
+			s.auditPTZ(cameraID, dc.DeviceID, "record", "unsupported", nil)
 			slog.Warn("gb28181-cascade: RecordCmd has no local equivalent — ignored",
 				"channel", dc.DeviceID, "cmd", dc.RecordCmd)
 		case dc.GuardCmd != "":
+			s.auditPTZ(cameraID, dc.DeviceID, "guard", "unsupported", nil)
 			slog.Warn("gb28181-cascade: GuardCmd has no local equivalent — ignored",
 				"channel", dc.DeviceID, "cmd", dc.GuardCmd)
 		case dc.AlarmCmd != "":
+			s.auditPTZ(cameraID, dc.DeviceID, "alarm", "unsupported", nil)
 			slog.Warn("gb28181-cascade: AlarmCmd has no local equivalent — ignored",
 				"channel", dc.DeviceID, "cmd", dc.AlarmCmd)
 		case dc.TeleBoot != "":
+			s.auditPTZ(cameraID, dc.DeviceID, "teleboot", "unsupported", nil)
 			slog.Warn("gb28181-cascade: TeleBoot refused (will not reboot this host)",
 				"channel", dc.DeviceID)
 		case dc.HomePosition != "":
+			s.auditPTZ(cameraID, dc.DeviceID, "home_position", "unsupported", nil)
 			slog.Warn("gb28181-cascade: HomePosition has no local equivalent — ignored",
 				"channel", dc.DeviceID)
 		}
@@ -169,6 +177,7 @@ func (s *Service) forwardDeviceControl(dc manscdp.DeviceControl) {
 	}
 	cameraID, ok := s.cameraOfChannel(dc.DeviceID)
 	if !ok {
+		s.auditPTZ("", dc.DeviceID, "", "channel_not_found", nil)
 		slog.Warn("gb28181-cascade: DeviceControl for unknown channel", "channel", dc.DeviceID)
 		return
 	}
@@ -177,26 +186,19 @@ func (s *Service) forwardDeviceControl(dc manscdp.DeviceControl) {
 		// PTZCmd transport but are not directions — the local PTZ bridge has
 		// no lens/wiper equivalent, so refuse loudly instead of letting
 		// decodePTZCmd misread the bits as a direction (#341).
+		s.auditPTZ(cameraID, dc.DeviceID, kind, "unsupported", nil)
 		slog.Warn("gb28181-cascade: lens/aux control has no local equivalent — ignored",
 			"channel", dc.DeviceID, "kind", kind, "ptz", dc.PTZCmd)
 		return
 	}
 	direction, speed, err := decodePTZCmd(dc.PTZCmd)
 	if err != nil {
+		s.auditPTZ(cameraID, dc.DeviceID, "", "invalid_command", err)
 		slog.Warn("gb28181-cascade: unparseable PTZ command",
 			"channel", dc.DeviceID, "ptz", dc.PTZCmd, "error", err)
 		return
 	}
-	s.mu.Lock()
-	fwd := s.ptzForward
-	s.mu.Unlock()
-	if fwd == nil {
-		return
-	}
-	if err := fwd(cameraID, direction, speed); err != nil {
-		slog.Warn("gb28181-cascade: PTZ forward failed",
-			"channel", dc.DeviceID, "camera", cameraID, "direction", direction, "error", err)
-	}
+	s.forwardPTZ(cameraID, dc.DeviceID, direction, speed)
 }
 
 // lensCmdKind reports the GB/T 28181-2022 § A.3.3/A.3.7 opcode family carried
