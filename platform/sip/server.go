@@ -1294,7 +1294,7 @@ func (s *Server) handleRegister(req sip.Request, tx sip.ServerTransaction) {
 	// 200 OK first — the device must see its REGISTER accepted before any
 	// follow-up request (catalog query, INVITE) arrives.
 	exp := sip.Expires(expires)
-	okHeaders := []sip.Header{&exp}
+	okHeaders := []sip.Header{&exp, &sip.GenericHeader{HeaderName: "X-GB-Ver", Contents: s.cfg.EffectiveProtocolVersion()}}
 	if securityInfo != "" {
 		okHeaders = append(okHeaders, &sip.GenericHeader{HeaderName: "SecurityInfo", Contents: securityInfo})
 	}

@@ -120,6 +120,9 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 	}, registry, store)
 	cascadeService.SetGBTimezone(time.FixedZone("Asia/Shanghai", 8*60*60))
 	cascadeService.SetMainStreamAcquirer(control)
+	control.SetDisconnectHandler(func(cameraID string, _ uint64) {
+		cascadeService.NotifyCameraUnavailable(cameraID)
+	})
 	if recordings != nil {
 		cascadeService.SetSegmentParser(mp4.ParseSegment)
 	}
