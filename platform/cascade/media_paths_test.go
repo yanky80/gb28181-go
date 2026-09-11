@@ -171,7 +171,7 @@ func TestLoopbackPlaybackTCPAnswerUsesDiscardPort(t *testing.T) {
 	})
 
 	db := newCascadeTestDB(t)
-	svc, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, db)
+	svc, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, db)
 	_, err = svc.catalogItems()
 	require.NoError(t, err)
 	now := time.Now().UTC()

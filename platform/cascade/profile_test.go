@@ -3,9 +3,13 @@ package cascade
 import (
 	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,6 +62,7 @@ func TestStartRejectsUnsupportedProtocolProfiles(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := testCfg()
+			cfg.ServerDomain = lbUpperDevice
 			cfg.ProtocolVersion = tt.version
 			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
 			cams := []CameraInfo{{ID: "cam-1", Encoding: tt.codec}}
@@ -101,39 +106,41 @@ func TestRegisterProtocolVersionHeaderAndResponse(t *testing.T) {
 }
 
 func TestRegisterWireCarriesProfileOnInitialAndDigestRetry(t *testing.T) {
-	cfg := testCfg()
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
-	up := newUpperSocket(t, cfg.SIPListen)
-	cfg.ServerAddr = up.conn.LocalAddr().String()
+	for _, tt := range []struct{ name, configVersion, marker string }{
+		{name: "2022", marker: "3.0"},
+		{name: "2016", configVersion: "2016", marker: "2.0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testCfg()
+			cfg.ProtocolVersion = tt.configVersion
+			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+			up := newUpperSocket(t, cfg.SIPListen)
+			cfg.ServerAddr = up.conn.LocalAddr().String()
 
-	wire := make(chan string, 2)
-	stop := make(chan struct{})
-	go serveProfileRegistration(t, up, "3.0", nil, stop, wire)
-	svc := New(cfg, fakeSource{}, nil)
-	t.Cleanup(func() {
-		close(stop)
-		_ = svc.Stop()
-	})
-	require.NoError(t, svc.Start(context.Background()))
-	require.Eventually(t, func() bool { return svc.Online() }, 5*time.Second, 20*time.Millisecond)
+			wire := make(chan string, 2)
+			stop := make(chan struct{})
+			go serveProfileRegistration(t, up, tt.marker, nil, stop, wire)
+			svc := New(cfg, fakeSource{}, nil)
+			t.Cleanup(func() {
+				close(stop)
+				_ = svc.Stop()
+			})
+			require.NoError(t, svc.Start(context.Background()))
+			require.Eventually(t, func() bool { return svc.Online() }, 5*time.Second, 20*time.Millisecond)
 
-	first, second := <-wire, <-wire
-	require.Contains(t, first, "\r\nCSeq: 1 REGISTER\r\n")
-	require.NotContains(t, first, "Authorization: Digest ")
-	require.Contains(t, second, "\r\nCSeq: 1 REGISTER\r\n")
-	for _, raw := range []string{first, second} {
-		require.Contains(t, raw, "REGISTER sip:"+cfg.ServerDomain+"@"+cfg.ServerAddr+" SIP/2.0\r\n")
-		require.Contains(t, raw, "X-GB-Ver: 3.0\r\n")
-		require.Contains(t, raw, "Expires: 3600\r\n")
-		require.Contains(t, raw, "Content-Length: 0\r\n")
+			first, second := <-wire, <-wire
+			requestLine := "REGISTER sip:" + cfg.ServerDomain + "@" + cfg.ServerAddr + " SIP/2.0"
+			require.Equal(t, registerWireGoldenExpected(requestLine, tt.marker, false), registerWireGolden(first, requestLine, tt.marker, false))
+			require.Equal(t, registerWireGoldenExpected(requestLine, tt.marker, true), registerWireGolden(second, requestLine, tt.marker, true))
+		})
 	}
-	require.Contains(t, second, "Authorization: Digest ")
 }
 
 func TestDynamicH265CameraUsesSavedPerUpperVersion(t *testing.T) {
 	for _, responseVersion := range []string{"", "2.0"} {
 		t.Run("response-"+responseVersion, func(t *testing.T) {
 			cfg := testCfg()
+			cfg.ServerDomain = lbUpperDevice
 			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
 			up := newUpperSocket(t, cfg.SIPListen)
 			cfg.ServerAddr = up.conn.LocalAddr().String()
@@ -200,6 +207,7 @@ func TestServiceStartsForEverySupportedProtocolProfile(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := testCfg()
+			cfg.ServerDomain = lbUpperDevice
 			cfg.ProtocolVersion = tt.version
 			hub := platform.NewFrameHub()
 			svc, up := startLoopbackServiceWithConfig(t, cfg,
@@ -237,10 +245,250 @@ func TestLiveAndSubstreamCodecMismatchTearsDown(t *testing.T) {
 	}
 }
 
+func TestCodecAdmissionFailsClosedForUnknownOrMalformedAU(t *testing.T) {
+	for _, au := range []struct {
+		name string
+		au   [][]byte
+	}{
+		{name: "missing AU"},
+		{name: "empty NAL", au: [][]byte{{}}},
+		{name: "truncated H265 NAL", au: [][]byte{{0x40}}},
+		{name: "H264 non-IDR slice", au: [][]byte{{0x41, 0x01, 0x02}}},
+		{name: "parameter sets without keyframe", au: [][]byte{{0x40, 0x01, 0x0c}, {0x42, 0x01, 0x01}, {0x44, 0x01, 0xc0}}},
+		{name: "unknown first VCL", au: [][]byte{{0x02, 0x01, 0x02}}},
+	} {
+		t.Run(au.name, func(t *testing.T) {
+			hub := platform.NewFrameHub()
+			svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, hub}, nil)
+			_, err := svc.catalogItems()
+			require.NoError(t, err)
+			res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+			require.Equal(t, 200, int(res.StatusCode()))
+			require.Eventually(t, func() bool { return hub.ConsumerCount() == 1 }, time.Second, 10*time.Millisecond)
+
+			hub.Broadcast(90000, au.au, false)
+			require.Eventually(t, func() bool {
+				return hub.ConsumerCount() == 0 && svc.ForwardCount() == 0
+			}, time.Second, 10*time.Millisecond)
+		})
+	}
+}
+
+func TestH264ProfileRejectsH265ParameterSets(t *testing.T) {
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h264"}}}, hub}, nil)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Eventually(t, func() bool { return hub.ConsumerCount() == 1 }, time.Second, 10*time.Millisecond)
+
+	hub.Broadcast(90000, [][]byte{{0x40, 0x01, 0x0c}, {0x42, 0x01, 0x01}, {0x44, 0x01, 0xc0}, {0x26, 0x01, 0x02}}, true)
+	require.Eventually(t, func() bool {
+		return hub.ConsumerCount() == 0 && svc.ForwardCount() == 0
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestVerifiedH265AllowsSubsequentNonIDR(t *testing.T) {
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, hub}, nil)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	media, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = media.Close() })
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDPAtPort(t, "Play", false, media.LocalAddr().(*net.UDPAddr).Port), "application/sdp"))
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Eventually(t, func() bool { return hub.ConsumerCount() == 1 }, time.Second, 10*time.Millisecond)
+
+	key := [][]byte{{0x40, 0x01, 0x0c}, {0x42, 0x01, 0x01}, {0x44, 0x01, 0xc0}, {0x26, 0x01, 0x02}}
+	hub.Broadcast(90000, key, true)
+	buf := make([]byte, 2048)
+	require.Eventually(t, func() bool {
+		_ = media.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		n, _, readErr := media.ReadFromUDP(buf)
+		return readErr == nil && n > 12
+	}, time.Second, 10*time.Millisecond)
+
+	hub.Broadcast(93600, [][]byte{{0x02, 0x01, 0x02}}, false)
+	require.Eventually(t, func() bool {
+		_ = media.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		n, _, readErr := media.ReadFromUDP(buf)
+		return readErr == nil && n > 12
+	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, 1, svc.ForwardCount())
+}
+
+func TestPlaybackAdmissionFailsClosedOnRecordingQueryError(t *testing.T) {
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, hub}, recordingQueryErrorStore{err: errors.New("recording index unavailable")})
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp"))
+	require.Equal(t, 500, int(res.StatusCode()))
+	require.Zero(t, svc.ForwardCount())
+}
+
+func TestPlaybackAdmissionFailsClosedOnSegmentParseError(t *testing.T) {
+	hub := platform.NewFrameHub()
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, hub}, db)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	path := "parse-error"
+	delete(segByPath, path)
+	now := time.Now().UTC()
+	require.NoError(t, db.InsertRecording(context.Background(), &Recording{
+		ID: path, CameraID: "cam-1", FilePath: path, Format: FormatH265,
+		StartedAt: now.Add(-10 * time.Minute), EndedAt: now.Add(-9 * time.Minute),
+	}))
+
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp"))
+	require.Equal(t, 500, int(res.StatusCode()))
+	require.Zero(t, svc.ForwardCount())
+}
+
+func TestH265PlaybackWithMatchingParsedCodecIsAccepted(t *testing.T) {
+	hub := platform.NewFrameHub()
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, hub}, db)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	path := "matching-h265"
+	segByPath[path] = &SegmentInfo{Codec: "h265"}
+	t.Cleanup(func() { delete(segByPath, path) })
+	now := time.Now().UTC()
+	require.NoError(t, db.InsertRecording(context.Background(), &Recording{
+		ID: path, CameraID: "cam-1", FilePath: path, Format: FormatH265,
+		StartedAt: now.Add(-10 * time.Minute), EndedAt: now.Add(-9 * time.Minute),
+	}))
+
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp"))
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Eventually(t, func() bool { return svc.ForwardCount() == 0 }, time.Second, 10*time.Millisecond)
+}
+
+func TestPlaybackPumpPropagatesParseError(t *testing.T) {
+	var logs synchronizedBuffer
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(oldLogger) })
+
+	hub := platform.NewFrameHub()
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, hub}, db)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	parseCalls := 0
+	svc.SetSegmentParser(func(string) (*SegmentInfo, error) {
+		parseCalls++
+		if parseCalls == 1 {
+			return &SegmentInfo{Codec: "h265"}, nil
+		}
+		return nil, errors.New("segment became unreadable")
+	})
+	now := time.Now().UTC()
+	require.NoError(t, db.InsertRecording(context.Background(), &Recording{
+		ID: "flaky", CameraID: "cam-1", FilePath: "flaky", Format: FormatH265,
+		StartedAt: now.Add(-10 * time.Minute), EndedAt: now.Add(-9 * time.Minute),
+	}))
+
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp"))
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Eventually(t, func() bool {
+		return strings.Contains(logs.String(), "reason=\"playback error:")
+	}, time.Second, 10*time.Millisecond)
+}
+
+type recordingQueryErrorStore struct{ err error }
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(p)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
+func (recordingQueryErrorStore) UpsertCascadeChannel(context.Context, CascadeChannel) error {
+	return nil
+}
+func (recordingQueryErrorStore) ListCascadeChannels(context.Context) ([]CascadeChannel, error) {
+	return []CascadeChannel{{CameraID: "cam-1", GBChannelID: lbChannelOne}}, nil
+}
+func (s recordingQueryErrorStore) ListRecordings(context.Context, RecordingFilter) ([]Recording, error) {
+	return nil, s.err
+}
+
+func registerWireGolden(raw, requestLine, marker string, auth bool) string {
+	lines := strings.Split(strings.TrimRight(raw, "\r\n"), "\r\n")
+	for i, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "REGISTER "):
+			lines[i] = requestLine
+		case strings.HasPrefix(line, "Via: "):
+			lines[i] = "Via: <volatile>"
+		case strings.HasPrefix(line, "From: "):
+			lines[i] = "From: <volatile>"
+		case strings.HasPrefix(line, "To: "):
+			lines[i] = "To: <volatile>"
+		case strings.HasPrefix(line, "Call-ID: "):
+			lines[i] = "Call-ID: <volatile>"
+		case strings.HasPrefix(line, "Contact: "):
+			lines[i] = "Contact: <volatile>"
+		case strings.HasPrefix(line, "Authorization: "):
+			if marker := strings.Index(line, `response="`); marker >= 0 {
+				valueStart := marker + len(`response="`)
+				if valueEnd := strings.Index(line[valueStart:], `"`); valueEnd >= 0 {
+					lines[i] = line[:valueStart] + "<volatile>" + line[valueStart+valueEnd:]
+				}
+			}
+		case strings.HasPrefix(line, "Allow: "):
+			methods := strings.Split(strings.TrimPrefix(line, "Allow: "), ", ")
+			sort.Strings(methods)
+			lines[i] = "Allow: " + strings.Join(methods, ", ")
+		}
+	}
+	return strings.Join(lines, "\r\n") + "\r\n\r\n"
+}
+
+func registerWireGoldenExpected(requestLine, marker string, auth bool) string {
+	lines := []string{
+		requestLine,
+		"Via: <volatile>",
+		"CSeq: 1 REGISTER",
+		"From: <volatile>",
+		"To: <volatile>",
+		"Call-ID: <volatile>",
+		"Contact: <volatile>",
+		"Max-Forwards: 70",
+		"User-Agent: GoSIP",
+		"Content-Length: 0",
+		"Expires: 3600",
+		"X-GB-Ver: " + marker,
+	}
+	if auth {
+		lines = append(lines, "Authorization: Digest realm=\"34020000002000000001\",algorithm=MD5,nonce=\"profile-nonce\",username=\"34020000001320000099\",uri=\"sip:34020000002000000001@127.0.0.1\",response=\"<volatile>\"")
+	}
+	lines = append(lines, "Allow: ACK, BYE, CANCEL, INFO, INVITE, MESSAGE, OPTIONS, SUBSCRIBE")
+	return strings.Join(lines, "\r\n") + "\r\n\r\n"
+}
+
 func TestH265VersionMismatchBlocksInvite(t *testing.T) {
 	for _, responseVersion := range []string{"", "2.0"} {
 		t.Run("response-"+responseVersion, func(t *testing.T) {
 			cfg := testCfg()
+			cfg.ServerDomain = lbUpperDevice
 			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
 			up := newUpperSocket(t, cfg.SIPListen)
 			cfg.ServerAddr = up.conn.LocalAddr().String()
@@ -271,6 +519,7 @@ func TestH265VersionMismatchBlocksInvite(t *testing.T) {
 
 func TestH265InviteSDPPSMAndParameterSets(t *testing.T) {
 	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
 	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
 	up := newUpperSocket(t, cfg.SIPListen)
 	cfg.ServerAddr = up.conn.LocalAddr().String()
@@ -322,6 +571,7 @@ func TestH265InviteSDPPSMAndParameterSets(t *testing.T) {
 
 func TestH265PlaybackRejectsMismatchedParsedCodec(t *testing.T) {
 	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
 	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
 	up := newUpperSocket(t, cfg.SIPListen)
 	cfg.ServerAddr = up.conn.LocalAddr().String()

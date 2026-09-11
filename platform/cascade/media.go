@@ -68,12 +68,11 @@ type mediaSession struct {
 	// Muxer.AppendAudioPES for why audio must ride inside video bursts).
 	audioPending []audioPendingFrame
 
-	closed atomic.Bool
-	// psStarted latches on the first forwarded AU: that burst must carry the
-	// PSM even when the hub started delivering mid-GOP (P-frames only) —
-	// receivers latch demuxer codec and IDR tracking from the PSM, and an
-	// IDR-less start would hide it for up to a full GOP (observed as H.265
-	// channels mis-detected on the upper platform — MiBeeNvr issue #625).
+	closed        atomic.Bool
+	codecVerified atomic.Bool
+	// psStarted latches on the first verified AU: that burst must carry the
+	// PSM so receivers latch the configured demuxer codec before subsequent
+	// VCL-only access units arrive.
 	psStarted atomic.Bool
 }
 
@@ -270,7 +269,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
 		return
 	}
-	if !s.mediaVersionAllowed(s.upperOf(req), cam) {
+	if !s.mediaVersionAllowed(u, cam) {
 		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
 		return
 	}
@@ -514,12 +513,17 @@ func (ms *mediaSession) run(hub *platform.FrameHub) {
 	// the hub's consumer registry.
 	subID := "cascade-" + ms.callID
 	err := hub.Subscribe(subID, func(pts int64, au [][]byte, isIDR bool) {
-		if ms.closed.Load() || len(au) == 0 {
+		if ms.closed.Load() {
 			return
 		}
-		if ms.codecHint != "" && !accessUnitCodecMatches(au, ms.codecHint) {
-			ms.teardown("access-unit codec mismatch")
-			return
+		if ms.codecHint != "" {
+			evidence, valid := accessUnitCodecEvidence(au, ms.codecHint)
+			if !valid || (!ms.codecVerified.Load() &&
+				(evidence != ms.codecHint || !auHasKeyframe(au, ms.codecHint))) {
+				ms.teardown("access-unit codec mismatch")
+				return
+			}
+			ms.codecVerified.Store(true)
 		}
 		// Annex-B framing for psmux.
 		var annexB []byte
@@ -775,11 +779,27 @@ func auIsIDR(au [][]byte, codec string) bool {
 	return false
 }
 
-// sniffCodec guesses h264 vs h265 from the AU's leading NAL byte. Only the
-// canonical H.265 VPS/SPS leads (0x40/0x42) are treated as h265 — other
-// bytes are ambiguous between the two syntaxes and h264 (by far the more
-// common source) wins. The camera's configured encoding takes precedence
-// over this fallback whenever known.
+func auHasKeyframe(au [][]byte, codec string) bool {
+	for _, nalu := range au {
+		if len(nalu) == 0 || nalu[0]&0x80 != 0 {
+			continue
+		}
+		if codec == "h264" && nalu[0]&0x1F == 5 {
+			return true
+		}
+		if codec == "h265" {
+			t := (nalu[0] >> 1) & 0x3F
+			if t == 19 || t == 20 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sniffCodec is retained for compatibility with existing diagnostics/tests;
+// media admission uses the configured codec evidence below and never uses
+// this ambiguous fallback.
 func errString(err error) string {
 	if err == nil {
 		return "no source"
@@ -794,18 +814,29 @@ func sniffCodec(firstNALU []byte) string {
 	return "h264"
 }
 
-// accessUnitCodecMatches rejects only clear codec evidence that contradicts
-// the configured profile; VCL-only NALUs are shared byte space and remain
-// usable until parameter-set evidence identifies their syntax.
-func accessUnitCodecMatches(au [][]byte, expected string) bool {
+// accessUnitCodecEvidence validates the configured NAL syntax and returns
+// clear parameter-set evidence. The first AU must identify the configured
+// codec and be a keyframe; later VCL-only AUs are safe once that evidence is
+// established.
+func accessUnitCodecEvidence(au [][]byte, expected string) (string, bool) {
+	if len(au) == 0 || (expected != "h264" && expected != "h265") {
+		return "", false
+	}
 	evidence := ""
 	for _, nalu := range au {
-		if len(nalu) == 0 {
-			continue
+		if len(nalu) == 0 || nalu[0]&0x80 != 0 {
+			return "", false
+		}
+		if expected == "h264" {
+			if nalu[0]&0x1f == 0 {
+				return "", false
+			}
+		} else if len(nalu) < 2 || nalu[1]&0x07 == 0 {
+			return "", false
 		}
 		codec := ""
 		switch nalu[0] {
-		case 0x40, 0x42:
+		case 0x40, 0x42, 0x44:
 			codec = "h265"
 		case 0x67, 0x68, 0x65, 0x41:
 			codec = "h264"
@@ -814,11 +845,14 @@ func accessUnitCodecMatches(au [][]byte, expected string) bool {
 			continue
 		}
 		if evidence != "" && evidence != codec {
-			return false
+			return "", false
 		}
 		evidence = codec
 	}
-	return evidence == "" || evidence == expected
+	if evidence != "" && evidence != expected {
+		return "", false
+	}
+	return evidence, true
 }
 
 var _ = gosip.Server(nil) // keep import until Stop() signature settles

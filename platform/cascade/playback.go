@@ -82,7 +82,7 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		return
 	}
 	_, expectedCodec, profileErr := cameraProtocolProfile(s.cfg, cam)
-	if profileErr != nil || !s.mediaVersionAllowed(s.upperOf(req), cam) {
+	if profileErr != nil || !s.mediaVersionAllowed(u, cam) {
 		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
 		return
 	}
@@ -99,38 +99,42 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	if end.Sub(start) > pbMaxWindow {
 		end = start.Add(pbMaxWindow)
 	}
-	if recs, err := s.playbackRecordings(cameraID, start, end); err == nil {
-		if len(recs) == 0 {
-			slog.Info("gb28181-cascade: playback INVITE for empty window",
-				"channel", channelID, "start", start, "end", end)
-			_, _ = s.srv.RespondOnRequest(req, 404, "No Records", "", nil)
+	recs, err := s.playbackRecordings(cameraID, start, end)
+	if err != nil {
+		_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
+		return
+	}
+	if len(recs) == 0 {
+		slog.Info("gb28181-cascade: playback INVITE for empty window",
+			"channel", channelID, "start", start, "end", end)
+		_, _ = s.srv.RespondOnRequest(req, 404, "No Records", "", nil)
+		return
+	}
+	compatible := false
+	for _, rec := range recs {
+		if string(rec.Format) == expectedCodec {
+			compatible = true
+			break
+		}
+	}
+	if !compatible {
+		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+		return
+	}
+	for _, rec := range recs {
+		seg, err := s.parseSegment(rec.FilePath)
+		if err != nil {
+			_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
 			return
 		}
-		compatible := false
-		for _, rec := range recs {
-			if string(rec.Format) == expectedCodec {
-				compatible = true
-				break
-			}
-		}
-		if !compatible {
+		if err := s.validatePlaybackSegment(cameraID, seg); err != nil {
 			_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
 			return
-		}
-		for _, rec := range recs {
-			seg, err := s.parseSegment(rec.FilePath)
-			if err == nil {
-				if err := s.validatePlaybackSegment(cameraID, seg); err != nil {
-					_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
-					return
-				}
-			}
 		}
 	}
 
 	var conn net.Conn
 	var rtp *psmux.RTPPacketizer
-	var err error
 	target := net.JoinHostPort(sd.host, strconv.Itoa(sd.port))
 	if sd.tcp {
 		conn, err = (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", target)
@@ -191,6 +195,9 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 // a recording straddling the window start would otherwise be missed; the
 // sample-level wall-time trim in playOnce aligns playback to the exact edge.
 func (s *Service) playbackRecordings(cameraID string, start, end time.Time) ([]Recording, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("cascade: no recording store")
+	}
 	recs, err := s.db.ListRecordings(context.Background(), RecordingFilter{
 		CameraID:  cameraID,
 		StartTime: start.Add(-2 * time.Hour),
@@ -223,7 +230,7 @@ func (ps *playbackSession) pump() {
 	for !ps.closed.Load() {
 		done, nextSeek, err := ps.playOnce(seekNPT)
 		if err != nil {
-			ps.finish("send error: "+err.Error(), true)
+			ps.finish("playback error: "+err.Error(), true)
 			return
 		}
 		if ps.closed.Load() {
@@ -247,7 +254,7 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 	if err != nil {
 		slog.Warn("gb28181-cascade: playback recordings query failed",
 			"camera", ps.camera, "error", err)
-		return true, nil, nil
+		return false, nil, err
 	}
 
 	var (
@@ -270,11 +277,7 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 		}
 		seg, err := ps.svc.parseSegment(rec.FilePath)
 		if err != nil {
-			// In-progress segments have no moov yet; unparseable ones can't be
-			// streamed — skip rather than fail the whole dialog.
-			slog.Debug("gb28181-cascade: playback skips unparseable recording",
-				"path", rec.FilePath, "error", err)
-			continue
+			return false, nil, fmt.Errorf("parse recording %q: %w", rec.FilePath, err)
 		}
 		if err := ps.svc.validatePlaybackSegment(ps.camera, seg); err != nil {
 			return false, nil, err
