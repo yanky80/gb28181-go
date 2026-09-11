@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -10,13 +11,16 @@ import (
 )
 
 func TestCameraRegistryHelloHealthAndReadOnlyViews(t *testing.T) {
-	r := NewCameraRegistry(CameraSpec{ID: "cam-a", Name: "Front", Codec: edgeipc.CodecH265})
+	r := newRegistry(t, CameraSpec{ID: "cam-a", Name: "Front"})
 	var _ cascade.CameraSource = r
 	var _ cascade.CameraStatusSource = r
 
 	view, ok := r.Camera("cam-a")
-	if !ok || view.Online {
+	if !ok || view.Online || view.Codec != edgeipc.DefaultCodec {
 		t.Fatalf("initial view = %+v, %v; want known OFF camera", view, ok)
+	}
+	if got := r.Cameras(); len(got) != 1 || got[0].Encoding != "h265" {
+		t.Fatalf("initial cascade view = %+v, want default h265", got)
 	}
 
 	if err := r.HandleHello(hello("cam-a", 1, edgeipc.CodecH265)); err != nil {
@@ -42,7 +46,7 @@ func TestCameraRegistryHelloHealthAndReadOnlyViews(t *testing.T) {
 }
 
 func TestCameraRegistryTimeoutDisconnectAndIsolation(t *testing.T) {
-	r := NewCameraRegistry(
+	r := newRegistry(t,
 		CameraSpec{ID: "cam-a", Name: "Front"},
 		CameraSpec{ID: "cam-b", Name: "Back"},
 	)
@@ -52,26 +56,54 @@ func TestCameraRegistryTimeoutDisconnectAndIsolation(t *testing.T) {
 	if err := r.HandleHealth("cam-a", 1, health()); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.HandleHello(hello("cam-b", 1, edgeipc.CodecH265)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.HandleHealth("cam-b", 1, health()); err != nil {
+		t.Fatal(err)
+	}
 	last := r.mustCamera("cam-a").LastHealth
+	hub := r.Hub("cam-a")
+	if err := hub.Subscribe("probe", func(int64, [][]byte, bool) {}); err != nil {
+		t.Fatal(err)
+	}
 	r.Expire(last.Add(HealthTimeout))
-	if r.CameraStatus("cam-a") != "OFF" || r.CameraStatus("cam-b") != "OFF" {
+	if r.CameraStatus("cam-a") != "OFF" || r.CameraStatus("cam-b") != "ON" {
 		t.Fatalf("statuses after timeout = %q, %q", r.CameraStatus("cam-a"), r.CameraStatus("cam-b"))
+	}
+	if hub.ConsumerCount() != 0 {
+		t.Fatalf("expired hub consumers = %d, want 0", hub.ConsumerCount())
+	}
+	if err := hub.Subscribe("after-expire", func(int64, [][]byte, bool) {}); err == nil {
+		t.Fatal("expired hub must reject new subscribers")
 	}
 
 	if err := r.HandleHealth("cam-a", 1, health()); err != nil {
 		t.Fatal(err)
 	}
-	r.HandleDisconnect("cam-a", 1)
 	if r.CameraStatus("cam-a") != "OFF" {
-		t.Fatal("disconnect must mark the matching epoch OFF")
+		t.Fatal("health must not revive an expired epoch")
 	}
-	if r.CameraStatus("cam-b") != "OFF" {
+	if r.Publish("cam-a", 1, 1, [][]byte{{1}}, false) {
+		t.Fatal("expired epoch media must be rejected")
+	}
+	if err := r.HandleHello(hello("cam-a", 2, edgeipc.CodecH265)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.HandleHealth("cam-a", 2, health()); err != nil {
+		t.Fatal(err)
+	}
+	if r.CameraStatus("cam-a") != "ON" {
+		t.Fatal("new hello must be required before recovery")
+	}
+	r.HandleDisconnect("cam-a", 2)
+	if r.CameraStatus("cam-a") != "OFF" || r.CameraStatus("cam-b") != "ON" {
 		t.Fatal("one camera's disconnect must not affect another")
 	}
 }
 
 func TestCameraRegistryNewEpochRejectsStaleEventsAndMedia(t *testing.T) {
-	r := NewCameraRegistry(CameraSpec{ID: "cam-a", Name: "Front"})
+	r := newRegistry(t, CameraSpec{ID: "cam-a", Name: "Front"})
 	if err := r.HandleHello(hello("cam-a", 1, edgeipc.CodecH265)); err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +177,7 @@ func TestCameraRegistryNewEpochRejectsStaleEventsAndMedia(t *testing.T) {
 }
 
 func TestCameraRegistryDuplicateEventsAreIdempotent(t *testing.T) {
-	r := NewCameraRegistry(CameraSpec{ID: "cam-a"})
+	r := newRegistry(t, CameraSpec{ID: "cam-a"})
 	msg := hello("cam-a", 7, edgeipc.CodecH265)
 	if err := r.HandleHello(msg); err != nil {
 		t.Fatal(err)
@@ -171,7 +203,7 @@ func TestCameraRegistryDuplicateEventsAreIdempotent(t *testing.T) {
 }
 
 func TestCameraRegistryRejectsUnknownAndPreservesDefaultCodec(t *testing.T) {
-	r := NewCameraRegistry(CameraSpec{ID: "cam-a"})
+	r := newRegistry(t, CameraSpec{ID: "cam-a"})
 	if r.CameraStatus("missing") != "OFF" {
 		t.Fatal("unknown camera must be OFF")
 	}
@@ -183,8 +215,28 @@ func TestCameraRegistryRejectsUnknownAndPreservesDefaultCodec(t *testing.T) {
 	}
 }
 
+func TestCameraRegistryPreservesExplicitCodecAndRejectsInvalidCodec(t *testing.T) {
+	r := newRegistry(t, CameraSpec{ID: "cam-h264", Codec: edgeipc.CodecH264})
+	view, ok := r.Camera("cam-h264")
+	if !ok || view.Codec != edgeipc.CodecH264 {
+		t.Fatalf("explicit codec snapshot = %+v, %v", view, ok)
+	}
+	if got := r.Cameras(); len(got) != 1 || got[0].Encoding != "h264" {
+		t.Fatalf("explicit codec cascade view = %+v", got)
+	}
+	if err := r.HandleHello(hello("cam-h264", 1, edgeipc.CodecH264)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.HandleHello(hello("cam-h264", 1, edgeipc.Codec(99))); err != edgeipc.ErrUnsupportedCodec {
+		t.Fatalf("invalid hello codec error = %v, want %v", err, edgeipc.ErrUnsupportedCodec)
+	}
+	if _, err := NewCameraRegistry(CameraSpec{ID: "invalid", Codec: edgeipc.Codec(99)}); !errors.Is(err, ErrInvalidCodec) {
+		t.Fatalf("invalid configured codec error = %v, want %v", err, ErrInvalidCodec)
+	}
+}
+
 func TestCameraRegistryAcceptsNonMonotonicNewEpochAndRetiresOld(t *testing.T) {
-	r := NewCameraRegistry(CameraSpec{ID: "cam-a", Codec: edgeipc.CodecH264})
+	r := newRegistry(t, CameraSpec{ID: "cam-a", Codec: edgeipc.CodecH264})
 	if err := r.HandleHello(hello("cam-a", 9, edgeipc.CodecH264)); err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +255,7 @@ func TestCameraRegistryAcceptsNonMonotonicNewEpochAndRetiresOld(t *testing.T) {
 }
 
 func TestCameraRegistryConcurrentEvents(t *testing.T) {
-	r := NewCameraRegistry(CameraSpec{ID: "cam-a"}, CameraSpec{ID: "cam-b"})
+	r := newRegistry(t, CameraSpec{ID: "cam-a"}, CameraSpec{ID: "cam-b"})
 	var wg sync.WaitGroup
 	for _, cameraID := range []string{"cam-a", "cam-b"} {
 		cameraID := cameraID
@@ -245,4 +297,13 @@ func (r *CameraRegistry) mustCamera(id string) CameraSnapshot {
 		panic("camera not found: " + id)
 	}
 	return view
+}
+
+func newRegistry(t *testing.T, specs ...CameraSpec) *CameraRegistry {
+	t.Helper()
+	r, err := NewCameraRegistry(specs...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
 }

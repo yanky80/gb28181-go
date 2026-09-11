@@ -14,8 +14,10 @@ import (
 const HealthTimeout = 15 * time.Second
 
 var (
-	ErrUnknownCamera = errors.New("gateway: unknown camera")
-	ErrInvalidEpoch  = errors.New("gateway: stream epoch must be non-zero")
+	ErrUnknownCamera   = errors.New("gateway: unknown camera")
+	ErrInvalidEpoch    = errors.New("gateway: stream epoch must be non-zero")
+	ErrInvalidCodec    = errors.New("gateway: invalid codec")
+	ErrInvalidCameraID = errors.New("gateway: camera id is empty")
 )
 
 // CameraSpec describes the configured, stable part of one local camera.
@@ -64,11 +66,18 @@ type CameraRegistry struct {
 }
 
 // NewCameraRegistry creates a registry with known cameras initially OFF.
-func NewCameraRegistry(specs ...CameraSpec) *CameraRegistry {
+// A non-zero codec must be H.264 or H.265; zero selects the H.265 default.
+func NewCameraRegistry(specs ...CameraSpec) (*CameraRegistry, error) {
 	r := &CameraRegistry{cameras: make(map[string]*cameraState, len(specs))}
 	for _, spec := range specs {
 		if spec.ID == "" {
-			continue
+			return nil, ErrInvalidCameraID
+		}
+		if spec.Codec != 0 && spec.Codec != edgeipc.CodecH264 && spec.Codec != edgeipc.CodecH265 {
+			return nil, ErrInvalidCodec
+		}
+		if spec.Codec == 0 {
+			spec.Codec = edgeipc.DefaultCodec
 		}
 		if spec.Name == "" {
 			spec.Name = spec.ID
@@ -79,7 +88,7 @@ func NewCameraRegistry(specs ...CameraSpec) *CameraRegistry {
 			spec: spec, codec: spec.Codec, hub: hub, retired: make(map[uint64]struct{}),
 		}
 	}
-	return r
+	return r, nil
 }
 
 // HandleHello accepts a validated encoder hello and starts or replaces its
@@ -165,9 +174,7 @@ func (r *CameraRegistry) HandleDisconnect(cameraID string, streamEpoch uint64) {
 	if state == nil || state.streamEpoch != streamEpoch {
 		return
 	}
-	state.online = false
-	state.closed = true
-	state.hub.Close()
+	closeStateLocked(state)
 }
 
 // Publish sends a frame only when it belongs to the current healthy epoch.
@@ -179,9 +186,10 @@ func (r *CameraRegistry) Publish(cameraID string, streamEpoch uint64, pts int64,
 	}
 	r.mu.Lock()
 	state := r.cameras[cameraID]
-	if state == nil || state.streamEpoch != streamEpoch || !state.online || state.closed || stale(state.lastHealth, time.Now()) {
-		if state != nil && stale(state.lastHealth, time.Now()) {
-			state.online = false
+	now := time.Now()
+	if state == nil || state.streamEpoch != streamEpoch || !state.online || state.closed || stale(state.lastHealth, now) {
+		if state != nil && state.streamEpoch == streamEpoch && stale(state.lastHealth, now) {
+			closeStateLocked(state)
 		}
 		r.mu.Unlock()
 		return false
@@ -264,9 +272,15 @@ func (r *CameraRegistry) CameraStatus(cameraID string) string {
 func (r *CameraRegistry) expireLocked(now time.Time) {
 	for _, state := range r.cameras {
 		if state.online && stale(state.lastHealth, now) {
-			state.online = false
+			closeStateLocked(state)
 		}
 	}
+}
+
+func closeStateLocked(state *cameraState) {
+	state.online = false
+	state.closed = true
+	state.hub.Close()
 }
 
 func snapshotOf(state *cameraState) CameraSnapshot {

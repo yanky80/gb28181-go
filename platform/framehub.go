@@ -99,16 +99,11 @@ func (h *FrameHub) Unsubscribe(id string) {
 // that do not fit a consumer's queue are dropped and counted in Dropped().
 func (h *FrameHub) Broadcast(pts int64, au [][]byte, isIDR bool) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.closed {
-		h.mu.Unlock()
 		return
 	}
-	consumers := make([]*frameHubConsumer, 0, len(h.consumers))
 	for _, c := range h.consumers {
-		consumers = append(consumers, c)
-	}
-	h.mu.Unlock()
-	for _, c := range consumers {
 		select {
 		case c.ch <- frameHubFrame{pts: pts, au: au, isIDR: isIDR}:
 		default:
@@ -223,16 +218,11 @@ func (h *FrameHub) Close() {
 // BroadcastAudio fans one audio frame out to all audio consumers, non-blocking.
 func (h *FrameHub) BroadcastAudio(pts int64, codec string, data []byte) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.closed {
-		h.mu.Unlock()
 		return
 	}
-	consumers := make([]*frameHubAudioConsumer, 0, len(h.audioConsumers))
 	for _, c := range h.audioConsumers {
-		consumers = append(consumers, c)
-	}
-	h.mu.Unlock()
-	for _, c := range consumers {
 		select {
 		case c.ch <- frameHubAudioFrame{pts: pts, codec: codec, data: data}:
 		default:
