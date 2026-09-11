@@ -171,6 +171,87 @@ func TestParseSegmentValidatesLaterSupportedCodecConfig(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalid)
 }
 
+func TestParseSegmentAcceptsExtendedSizeStsdAndCodecChildren(t *testing.T) {
+	config := avcC([]byte{0x67, 1}, []byte{0x68, 2})
+	tests := []struct {
+		name    string
+		entries [][]byte
+	}{
+		{
+			name: "unknown entry and child",
+			entries: [][]byte{
+				extendedBox("free", []byte{1, 2, 3}),
+				avc1BoxWithTail(config, extendedBox("free", []byte{4, 5, 6})),
+			},
+		},
+		{
+			name: "supported entry and config",
+			entries: [][]byte{
+				extendedCodecBox("avc1", config),
+			},
+		},
+		{
+			name: "zero-sized terminal entry and child",
+			entries: [][]byte{
+				avc1BoxWithTail(config, zeroBox("free", []byte{7, 8})),
+				zeroBox("free", []byte{9, 10}),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := fragmentedFileWithMoov(moovVersions(tt.entries, 0, 0, nil))
+			got, err := ParseSegment(writeSegment(t, data))
+			require.NoError(t, err)
+			require.Equal(t, "h264", got.Codec)
+		})
+	}
+}
+
+func TestParseSegmentRejectsMalformedExtendedSizeStsdAndCodecBoxes(t *testing.T) {
+	config := avcC([]byte{0x67, 1}, []byte{0x68, 2})
+	tests := []struct {
+		name    string
+		entries [][]byte
+	}{
+		{
+			name: "truncated entry largesize",
+			entries: [][]byte{
+				avc1Box(config),
+				truncatedExtendedHeader("free"),
+			},
+		},
+		{
+			name: "entry largesize smaller than header",
+			entries: [][]byte{
+				avc1Box(config),
+				extendedHeader("free", 8),
+			},
+		},
+		{
+			name: "entry largesize beyond parent",
+			entries: [][]byte{
+				avc1Box(config),
+				extendedHeader("free", 1<<20),
+			},
+		},
+		{
+			name: "damaged subsequent codec child",
+			entries: [][]byte{
+				avc1BoxWithTail(config, truncatedExtendedHeader("free")),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := fragmentedFileWithMoov(moovVersions(tt.entries, 0, 0, nil))
+			_, err := ParseSegment(writeSegment(t, data))
+			require.Error(t, err)
+			require.True(t, errors.Is(err, ErrTruncated) || errors.Is(err, ErrInvalid), "%v", err)
+		})
+	}
+}
+
 func TestParseSegmentRejectsDamagedCodecConfigTail(t *testing.T) {
 	tests := []struct {
 		name string
@@ -594,6 +675,41 @@ func fullBox(typ string, version, flags uint32, payload []byte) []byte {
 func makeBox(typ string, payload []byte) []byte {
 	out := make([]byte, 8+len(payload))
 	binary.BigEndian.PutUint32(out, uint32(len(out)))
+	copy(out[4:8], typ)
+	copy(out[8:], payload)
+	return out
+}
+
+func extendedBox(typ string, payload []byte) []byte {
+	out := make([]byte, 16+len(payload))
+	binary.BigEndian.PutUint32(out, 1)
+	copy(out[4:8], typ)
+	binary.BigEndian.PutUint64(out[8:16], uint64(len(out)))
+	copy(out[16:], payload)
+	return out
+}
+
+func extendedCodecBox(typ string, config []byte) []byte {
+	return extendedBox(typ, append(make([]byte, 78), config...))
+}
+
+func extendedHeader(typ string, size uint64) []byte {
+	out := make([]byte, 16)
+	binary.BigEndian.PutUint32(out, 1)
+	copy(out[4:8], typ)
+	binary.BigEndian.PutUint64(out[8:16], size)
+	return out
+}
+
+func truncatedExtendedHeader(typ string) []byte {
+	out := make([]byte, 8)
+	binary.BigEndian.PutUint32(out, 1)
+	copy(out[4:8], typ)
+	return out
+}
+
+func zeroBox(typ string, payload []byte) []byte {
+	out := make([]byte, 8+len(payload))
 	copy(out[4:8], typ)
 	copy(out[8:], payload)
 	return out

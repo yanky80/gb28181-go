@@ -81,6 +81,45 @@ type box struct {
 	typ                 string
 }
 
+type memoryBox struct {
+	payload, end int
+	typ          string
+}
+
+func readMemoryBox(data []byte, off int, allowZero bool) (memoryBox, error) {
+	if off < 0 || off > len(data) || len(data)-off < 8 {
+		return memoryBox{}, invalid("short child box header")
+	}
+	size := uint64(binary.BigEndian.Uint32(data[off:]))
+	header := 8
+	if size == 1 {
+		if len(data)-off < 16 {
+			return memoryBox{}, truncated("short extended child box header")
+		}
+		size = binary.BigEndian.Uint64(data[off+8:])
+		header = 16
+	} else if size == 0 {
+		if !allowZero {
+			return memoryBox{}, invalid("zero-sized child box")
+		}
+		size = uint64(len(data) - off)
+	}
+	if size < uint64(header) {
+		return memoryBox{}, invalid("child box size is smaller than its header")
+	}
+	if size > uint64(len(data)-off) {
+		return memoryBox{}, truncated("child box exceeds parent")
+	}
+	if size > uint64(^uint(0)>>1)-uint64(off) {
+		return memoryBox{}, invalid("child box offset overflows")
+	}
+	end := off + int(size)
+	if end <= off {
+		return memoryBox{}, invalid("child box does not advance")
+	}
+	return memoryBox{payload: off + header, end: end, typ: string(data[off+4 : off+8])}, nil
+}
+
 func (p *parser) parse() (*cascade.SegmentInfo, error) {
 	var top []box
 	for off := int64(0); off < p.size; {
@@ -369,17 +408,14 @@ func (p *parser) parseStsd(stsd box) (*trackInfo, error) {
 	if count == 0 || count > 16 {
 		return nil, invalid("invalid stsd entry count")
 	}
-	off := int64(8)
+	off := 8
 	var first *trackInfo
 	for i := uint32(0); i < count; i++ {
-		if off+8 > int64(len(v)) {
-			return nil, truncated("short stsd entry")
+		entry, err := readMemoryBox(v, off, true)
+		if err != nil {
+			return nil, err
 		}
-		sz := int64(binary.BigEndian.Uint32(v[off:]))
-		if sz < 86 || off+sz > int64(len(v)) {
-			return nil, invalid("invalid video sample entry")
-		}
-		typ := string(v[off+4 : off+8])
+		typ := entry.typ
 		codec := ""
 		configType := ""
 		switch typ {
@@ -388,19 +424,22 @@ func (p *parser) parseStsd(stsd box) (*trackInfo, error) {
 		case "hvc1", "hev1":
 			codec, configType = "h265", "hvcC"
 		default:
-			off += sz
+			off = entry.end
 			continue
 		}
+		if entry.payload+78 > entry.end {
+			return nil, invalid("short video sample entry")
+		}
 		info := &trackInfo{codec: codec}
-		if err := p.parseCodecConfig(v[off+86:off+sz], configType, info); err != nil {
+		if err := p.parseCodecConfig(v[entry.payload+78:entry.end], configType, info); err != nil {
 			return nil, err
 		}
 		if first == nil {
 			first = info
 		}
-		off += sz
+		off = entry.end
 	}
-	if off != int64(len(v)) {
+	if off != len(v) {
 		return nil, invalid("stsd has trailing data")
 	}
 	if first != nil {
@@ -413,37 +452,34 @@ func (p *parser) parseCodecConfig(data []byte, typ string, info *trackInfo) erro
 	off := 0
 	found := false
 	for off < len(data) {
-		if len(data)-off < 8 {
-			return invalid("trailing sample-entry bytes")
+		child, err := readMemoryBox(data, off, true)
+		if err != nil {
+			return err
 		}
-		sz := int(binary.BigEndian.Uint32(data[off:]))
-		if sz < 8 || sz > len(data)-off {
-			return invalid("invalid codec configuration box")
-		}
-		childType := string(data[off+4 : off+8])
+		childType := child.typ
 		if childType == typ {
 			if found {
 				return invalid("duplicate codec configuration")
 			}
-			config := data[off+8 : off+sz]
+			config := data[child.payload:child.end]
 			if len(config) > maxConfigSize {
 				return invalid("codec configuration is too large")
 			}
 			found = true
-			var err error
+			var parseErr error
 			if typ == "avcC" {
-				err = parseAVCC(config, info)
+				parseErr = parseAVCC(config, info)
 			} else {
-				err = parseHVCC(config, info)
+				parseErr = parseHVCC(config, info)
 			}
-			if err != nil {
-				return err
+			if parseErr != nil {
+				return parseErr
 			}
 		}
 		if (typ == "avcC" && childType == "hvcC") || (typ == "hvcC" && childType == "avcC") {
 			return invalid("conflicting codec configuration")
 		}
-		off += sz
+		off = child.end
 	}
 	if !found {
 		return invalid("missing codec configuration")
