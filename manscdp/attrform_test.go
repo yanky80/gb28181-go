@@ -46,6 +46,16 @@ func TestDecodeDeviceStatusQueryAttributeForm(t *testing.T) {
 	require.Equal(t, "34020000001320000042", query.DeviceID)
 }
 
+func TestDecodeDeviceInfoQuery(t *testing.T) {
+	ct, payload, err := Decode([]byte(`<Query><CmdType>DeviceInfo</CmdType><SN>10</SN><DeviceID>34020000001320000001</DeviceID></Query>`))
+	require.NoError(t, err)
+	require.Equal(t, CmdDeviceInfo, ct)
+	query, ok := payload.(DeviceInfoQuery)
+	require.True(t, ok)
+	require.Equal(t, 10, query.SN)
+	require.Equal(t, "34020000001320000001", query.DeviceID)
+}
+
 func TestBuildSSRCServerIDLengths(t *testing.T) {
 	// Canonical 10-digit layout: prefix + 5-digit domain + 4-digit seq.
 	require.Len(t, SSRC(false, "34020000002000000001", 1), 10)

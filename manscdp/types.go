@@ -116,6 +116,25 @@ type DeviceInfo struct {
 	Result       string   `xml:"Result"`
 }
 
+// DeviceInfoQuery is a platform-to-device request for device metadata.
+type DeviceInfoQuery struct {
+	XMLName     xml.Name `xml:"Query"`
+	CmdType     CmdType  `xml:"CmdType"`
+	SN          int      `xml:"SN"`
+	DeviceID    string   `xml:"DeviceID"`
+	CmdTypeAttr CmdType  `xml:"CmdType,attr,omitempty"`
+	SNAttr      int      `xml:"SN,attr,omitempty"`
+}
+
+func (m *DeviceInfoQuery) normalize() {
+	if m.CmdType == "" {
+		m.CmdType = m.CmdTypeAttr
+	}
+	if m.SN == 0 {
+		m.SN = m.SNAttr
+	}
+}
+
 // DeviceStatus is a device's response to a platform DeviceStatus query.
 type DeviceStatus struct {
 	XMLName  xml.Name `xml:"Response"`

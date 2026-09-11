@@ -124,6 +124,8 @@ func decodeOnce(data []byte) (CmdType, any, error) {
 		return unmarshalAs[RecordInfoQuery](body, CmdRecordInfo)
 	case probe.CmdType == CmdDeviceStatus && probe.XMLName.Local == "Query":
 		return unmarshalAs[DeviceStatusQuery](body, CmdDeviceStatus)
+	case probe.CmdType == CmdDeviceInfo && probe.XMLName.Local == "Query":
+		return unmarshalAs[DeviceInfoQuery](body, CmdDeviceInfo)
 	}
 	switch probe.CmdType {
 	case CmdCatalog:

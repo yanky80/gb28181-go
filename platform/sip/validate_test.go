@@ -37,6 +37,23 @@ func TestPlatformConfigValidateStubSkipsRequirements(t *testing.T) {
 	}
 }
 
+func TestPlatformConfigValidateProtocolVersion(t *testing.T) {
+	var cfg Config
+	if got := cfg.EffectiveProtocolVersion(); got != "3.0" {
+		t.Fatalf("default protocol version = %q, want 3.0", got)
+	}
+	for _, version := range []string{"2.0", "3.0"} {
+		cfg.ProtocolVersion = version
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("protocol version %q rejected: %v", version, err)
+		}
+	}
+	cfg.ProtocolVersion = "1.0"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("invalid protocol version accepted")
+	}
+}
+
 func TestPlatformConfigValidateEnums(t *testing.T) {
 	cases := []struct {
 		mutate  func(*Config)

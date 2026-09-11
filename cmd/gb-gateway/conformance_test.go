@@ -6,6 +6,7 @@ import (
 	"net"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,8 +29,15 @@ func TestGatewayConformanceH265UDP(t *testing.T) {
 	s.connectPeer("back", 1)
 
 	require.Eventually(t, func() bool {
-		return s.gateway.cascade.Online() && s.gateway.cascade.UpperProtocolVersion() == "3.0" &&
-			len(s.upperDM.Channels(conformanceGatewayID)) == 2
+		if !s.gateway.cascade.Online() || s.gateway.cascade.UpperProtocolVersion() != "3.0" {
+			return false
+		}
+		for _, channel := range s.upperDM.Channels(conformanceGatewayID) {
+			if channel.Name == "Front" {
+				return true
+			}
+		}
+		return false
 	}, 10*time.Second, 20*time.Millisecond, "gateway registration and catalog must converge")
 
 	channels := s.upperDM.Channels(conformanceGatewayID)
@@ -39,10 +47,23 @@ func TestGatewayConformanceH265UDP(t *testing.T) {
 	}
 	frontChannel := byName["Front"]
 	require.NotNil(t, frontChannel)
-
 	var mu sync.Mutex
 	var got [][][]byte
 	require.NoError(t, s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID))
+	require.NoError(t, s.upper.SendMessage(conformanceGatewayID, []byte(fmt.Sprintf(
+		"<Query><CmdType>DeviceInfo</CmdType><SN>71</SN><DeviceID>%s</DeviceID></Query>", conformanceGatewayID))))
+	require.NoError(t, s.upper.SendMessage(conformanceGatewayID, []byte(fmt.Sprintf(
+		"<Query><CmdType>DeviceStatus</CmdType><SN>72</SN><DeviceID>%s</DeviceID></Query>", conformanceGatewayID))))
+	require.Eventually(t, func() bool {
+		device, ok := s.upperDM.Device(conformanceGatewayID)
+		if !ok {
+			return false
+		}
+		device.Mu.RLock()
+		defer device.Mu.RUnlock()
+		return device.Status.Load() == platform.DeviceOnline &&
+			device.Name == "GB28181 Platform" && device.Manufacturer == "Unknown" && device.Model == "Unknown"
+	}, 5*time.Second, 20*time.Millisecond, "DeviceInfo and DeviceStatus responses must reach the upper")
 	hub := awaitUpperHub(t, s.upperSM, frontChannel.ID)
 	require.NoError(t, hub.Subscribe("conformance", func(_ int64, au [][]byte, _ bool) {
 		mu.Lock()
@@ -76,6 +97,71 @@ func TestGatewayConformanceH265UDP(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond, "BYE must release the upper session and gateway lease")
 }
 
+func TestGatewayConformanceH264Profiles(t *testing.T) {
+	for _, tt := range []struct {
+		name, version, marker string
+	}{
+		{name: "2022+h264", version: "2022", marker: "3.0"},
+		{name: "2016+h264", version: "2016", marker: "2.0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newGatewayScenario(t, tt.version, "h264", "udp", tt.marker, false)
+			peer := s.connectPeer("front", 1)
+			frontChannel := s.waitForFrontChannel()
+			require.NoError(t, s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID))
+			hub := awaitUpperHub(t, s.upperSM, frontChannel.ID)
+			got := make(chan [][]byte, 1)
+			require.NoError(t, hub.Subscribe("conformance-h264", func(_ int64, au [][]byte, _ bool) { got <- au }))
+			commands := readPeerMessages(t, peer.control, 2)
+			require.Equal(t, edgeipc.MessageStart, commands[0].Type)
+			require.Equal(t, edgeipc.MessageRequestIDR, commands[1].Type)
+			writeMedia(t, peer.media, edgeipc.MediaFrame{
+				Codec: edgeipc.CodecH264, Flags: edgeipc.FlagIDR, CameraID: "front",
+				PTS90kHz: 9000, Sequence: 1, Payload: h264IDR(),
+			})
+			require.Equal(t, edgeipc.MessageRequestIDR, readPeerMessages(t, peer.control, 1)[0].Type)
+			select {
+			case au := <-got:
+				require.Equal(t, h264IDR(), annexBFromNALUs(au))
+			case <-time.After(5 * time.Second):
+				t.Fatal("H.264 access unit did not reach the upper")
+			}
+			require.NoError(t, s.upper.ByeChannel(conformanceGatewayID, frontChannel.ID))
+			require.Eventually(t, func() bool {
+				return s.upperSM.GetHub(frontChannel.ID) == nil && s.gateway.cascade.ForwardCount() == 0
+			}, 5*time.Second, 20*time.Millisecond, "H.264 BYE must release the dialog")
+		})
+	}
+}
+
+func TestGatewayConformanceInvalidProfilesRejectStartup(t *testing.T) {
+	for _, tt := range []struct {
+		name, version, codec string
+	}{
+		{name: "2011+h264", version: "2011", codec: "h264"},
+		{name: "2016+h265", version: "2016", codec: "h265"},
+		{name: "unknown+h264", version: "2030", codec: "h264"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := Config{
+				GB: GBConfig{
+					ProtocolVersion: tt.version, SIPListen: freeSIPListenAddress(t),
+					Heartbeat: time.Second, RegisterExpires: 1, IDRTimeout: time.Second,
+				},
+				IPC: IPCConfig{
+					ControlSocket: filepath.Join(dir, "control.sock"),
+					MediaSocket:   filepath.Join(dir, "media.sock"), MaxAUBytes: maxAUBytes,
+					StatusDir: filepath.Join(dir, "status"),
+				},
+				Cameras: []CameraConfig{{Index: 1, LocalCameraID: "front", Expose: true, Name: "Front", Codec: tt.codec}},
+			}
+			_, err := NewGateway(cfg, Credentials{})
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestGatewayConformanceH265TCPActive(t *testing.T) {
 	s := newGatewayScenario(t, "2022", "h265", "tcp-passive", "3.0", false)
 	peer := s.connectPeer("front", 1)
@@ -98,6 +184,50 @@ func TestGatewayConformanceH265TCPActive(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("TCP-active media did not reach the upper platform")
 	}
+}
+
+func TestGatewayConformanceDeterministicOnePercentLoss(t *testing.T) {
+	s := newGatewayScenario(t, "2022", "h265", "udp", "3.0", false)
+	peer := s.connectPeer("front", 1)
+	frontChannel := s.waitForFrontChannel()
+	require.NoError(t, s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID))
+	hub := awaitUpperHub(t, s.upperSM, frontChannel.ID)
+	var idrs atomic.Int32
+	require.NoError(t, hub.Subscribe("conformance-loss", func(_ int64, au [][]byte, _ bool) {
+		if string(annexBFromNALUs(au)) == string(h265IDR()) {
+			idrs.Add(1)
+		}
+	}))
+	commands := readPeerMessages(t, peer.control, 2)
+	require.Equal(t, edgeipc.MessageStart, commands[0].Type)
+	require.Equal(t, edgeipc.MessageRequestIDR, commands[1].Type)
+
+	writeMedia(t, peer.media, edgeipc.MediaFrame{
+		Codec: edgeipc.CodecH265, Flags: edgeipc.FlagIDR, CameraID: "front",
+		PTS90kHz: 9000, Sequence: 1, Payload: h265IDR(),
+	})
+	require.Equal(t, edgeipc.MessageRequestIDR, readPeerMessages(t, peer.control, 1)[0].Type)
+	for sequence := uint64(2); sequence <= 100; sequence++ {
+		if sequence == 50 { // one deterministic loss in a 100-frame window
+			continue
+		}
+		writeMedia(t, peer.media, edgeipc.MediaFrame{
+			Codec: edgeipc.CodecH265, CameraID: "front", PTS90kHz: sequence * 9000,
+			Sequence: sequence, Payload: h265PFrame(),
+		})
+	}
+	require.Equal(t, edgeipc.MessageRequestIDR, readPeerMessages(t, peer.control, 1)[0].Type)
+	writeMedia(t, peer.media, edgeipc.MediaFrame{
+		Codec: edgeipc.CodecH265, Flags: edgeipc.FlagIDR, CameraID: "front",
+		PTS90kHz: 101 * 9000, Sequence: 101, Payload: h265IDR(),
+	})
+	require.Eventually(t, func() bool { return idrs.Load() == 2 }, 5*time.Second, 20*time.Millisecond,
+		"one-percent deterministic loss must recover on the next IDR")
+
+	require.NoError(t, s.upper.ByeChannel(conformanceGatewayID, frontChannel.ID))
+	require.Eventually(t, func() bool {
+		return s.upperSM.GetHub(frontChannel.ID) == nil && s.gateway.cascade.ForwardCount() == 0
+	}, 5*time.Second, 20*time.Millisecond, "loss recovery must not leak the dialog")
 }
 
 func TestGatewayConformanceVersionMismatchRejectsMedia(t *testing.T) {
@@ -155,6 +285,30 @@ func TestGatewayConformanceRecoveryEpochGapAndDuplicateDialog(t *testing.T) {
 		t.Fatal("IDR after a deterministic sequence gap was not recovered")
 	}
 
+	require.NoError(t, s.upper.ByeChannel(conformanceGatewayID, frontChannel.ID))
+	require.Equal(t, edgeipc.MessageStop, readPeerMessages(t, newPeer.control, 1)[0].Type)
+	require.Eventually(t, func() bool {
+		return s.upperSM.GetHub(frontChannel.ID) == nil && s.gateway.cascade.ForwardCount() == 0
+	}, 5*time.Second, 20*time.Millisecond, "first dialog must release before the replacement dialog")
+
+	require.NoError(t, s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID))
+	secondHub := awaitUpperHub(t, s.upperSM, frontChannel.ID)
+	secondGot := make(chan struct{}, 1)
+	require.NoError(t, secondHub.Subscribe("conformance-recovery-second-dialog", func(_ int64, _ [][]byte, _ bool) { secondGot <- struct{}{} }))
+	secondCommands := readPeerMessages(t, newPeer.control, 2)
+	require.Equal(t, edgeipc.MessageStart, secondCommands[0].Type)
+	require.Equal(t, edgeipc.MessageRequestIDR, secondCommands[1].Type)
+	writeMedia(t, newPeer.media, edgeipc.MediaFrame{
+		Codec: edgeipc.CodecH265, Flags: edgeipc.FlagIDR, CameraID: "front",
+		Sequence: 4, PTS90kHz: 36000, Payload: h265IDR(),
+	})
+	select {
+	case <-secondGot:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement dialog did not publish media")
+	}
+	// A duplicate INVITE against the live replacement dialog is idempotent:
+	// it does not send a second START or replace the owning epoch.
 	require.NoError(t, s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID))
 	assertNoPeerMessage(t, newPeer.control, 50*time.Millisecond)
 	_ = newPeer.control.Close()
@@ -285,16 +439,22 @@ func newGatewayScenario(t *testing.T, version, codec, mediaTransport, upperVersi
 	mediaBase := freeGatewayPort(t)
 	upperDM := platform.NewDeviceManager(2 * time.Second)
 	upperSM := platform.NewSessionManager(platform.NewPortManager(uint16(mediaBase), uint16(mediaBase+20)), conformanceUpperID)
+	noCatalogSubscription := false
+	// Keep signaling UDP-only: a two-camera Catalog exceeds gosip's UDP
+	// threshold and auto-promotes to its TCP connection pool, whose upstream
+	// shutdown path is not deterministic. The second UDS peer still exercises
+	// registry/epoch isolation; cascade loopbacks cover full Catalog/TCP SIP.
 	upper := platformsip.NewServer(platformsip.Config{
-		Enabled:         true,
-		SIPListen:       upperAddr,
-		ServerID:        conformanceUpperID,
-		Realm:           "conformance",
-		Password:        "conformance-pw",
-		PortRange:       fmt.Sprintf("%d-%d", mediaBase, mediaBase+20),
-		MediaTransport:  mediaTransport,
-		SIPTransport:    "tcp",
-		ProtocolVersion: upperVersion,
+		Enabled:          true,
+		SIPListen:        upperAddr,
+		ServerID:         conformanceUpperID,
+		Realm:            "conformance",
+		Password:         "conformance-pw",
+		PortRange:        fmt.Sprintf("%d-%d", mediaBase, mediaBase+20),
+		MediaTransport:   mediaTransport,
+		SIPTransport:     "udp",
+		ProtocolVersion:  upperVersion,
+		SubscribeCatalog: &noCatalogSubscription,
 	}, upperDM, upperSM, nil)
 	require.NoError(t, upper.Start(context.Background()))
 	t.Cleanup(func() { require.NoError(t, upper.Stop()) })
@@ -323,7 +483,7 @@ func newGatewayScenario(t *testing.T, version, codec, mediaTransport, upperVersi
 		},
 		Cameras: []CameraConfig{
 			{Index: 1, LocalCameraID: "front", Expose: true, Name: "Front", Codec: codec, PTZMode: "vendor"},
-			{Index: 2, LocalCameraID: "back", Expose: true, Name: "Back", Codec: codec, PTZMode: "none"},
+			{Index: 2, LocalCameraID: "back", Expose: false, Name: "Back", Codec: codec, PTZMode: "none"},
 		},
 	}
 	gateway, err := NewGateway(cfg, Credentials{values: map[string]string{"sip.password": "conformance-pw"}})
