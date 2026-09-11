@@ -151,8 +151,23 @@ func TestLoopbackMediaPump(t *testing.T) {
 	sdp := "v=0\r\no=" + lbUpperDevice + " 0 0 IN IP4 " + lbLocalHost + "\r\ns=Play\r\n" +
 		"c=IN IP4 " + lbLocalHost + "\r\nt=0 0\r\n" +
 		"m=video " + strconv.Itoa(media.LocalAddr().(*net.UDPAddr).Port) + " RTP/AVP 96\r\na=recvonly\r\na=rtpmap:96 PS/90000\r\ny=4242\r\n"
-	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, sdp, "application/sdp"))
+	invite := up.request(sip.INVITE, lbChannelOne, sdp, "application/sdp")
+	res := up.roundTrip(invite)
 	require.Equal(t, 200, int(res.StatusCode()))
+	callID, ok := invite.CallID()
+	require.True(t, ok)
+
+	svc.mu.Lock()
+	ms := svc.sessions[callID.String()]
+	var actualPort int
+	if ms != nil {
+		actualPort = ms.conn.LocalAddr().(*net.UDPAddr).Port
+	}
+	svc.mu.Unlock()
+	require.NotNil(t, ms)
+	require.Contains(t, string(res.Body()),
+		"m=video "+strconv.Itoa(actualPort)+" RTP/AVP 96",
+		"UDP answer must advertise the actual media socket port")
 
 	// Broadcast IDR frames until the (asynchronously subscribed) session
 	// picks one up and forwards it — poll, never sleep.

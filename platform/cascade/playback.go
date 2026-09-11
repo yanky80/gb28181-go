@@ -133,13 +133,13 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	ps.sdpBody = fmt.Sprintf(
 		"v=0\r\no=- 0 0 IN IP4 %s\r\ns=%s\r\nc=IN IP4 %s\r\nt=%s %s\r\n"+
 			"m=video %d RTP/AVP 96\r\na=sendonly\r\na=rtpmap:96 PS/90000\r\ny=%d\r\n",
-		ps.localHost(), sdpName, ps.localHost(), sd.rawT0, sd.rawT1, ps.localPort(), sd.ssrc)
+		ps.localHost(), sdpName, ps.localHost(), sd.rawT0, sd.rawT1, answerMediaPort(ps.conn, sd.tcp), sd.ssrc)
 	if sd.tcp {
 		ps.sdpBody = fmt.Sprintf(
 			"v=0\r\no=- 0 0 IN IP4 %s\r\ns=%s\r\nc=IN IP4 %s\r\nt=%s %s\r\n"+
 				"m=video %d TCP/RTP/AVP 96\r\na=sendonly\r\na=setup:active\r\na=connection:new\r\n"+
 				"a=rtpmap:96 PS/90000\r\ny=%d\r\n",
-			ps.localHost(), sdpName, ps.localHost(), sd.rawT0, sd.rawT1, ps.localPort(), sd.ssrc)
+			ps.localHost(), sdpName, ps.localHost(), sd.rawT0, sd.rawT1, answerMediaPort(ps.conn, sd.tcp), sd.ssrc)
 	}
 
 	s.mu.Lock()
@@ -182,11 +182,6 @@ func (s *Service) playbackRecordings(cameraID string, start, end time.Time) ([]R
 func (ps *playbackSession) localHost() string {
 	h, _ := ps.svc.localHostPort(ps.upper)
 	return h
-}
-
-func (ps *playbackSession) localPort() int {
-	_, p := ps.svc.localHostPort(ps.upper)
-	return p
 }
 
 // pump drives playOnce passes until the window is exhausted (then BYE) or a

@@ -373,14 +373,14 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	ms.sdpBody = fmt.Sprintf(
 		"v=0\r\no=- 0 0 IN IP4 %s\r\ns=Play\r\nc=IN IP4 %s\r\nt=0 0\r\n"+
 			"m=video %d RTP/AVP 96\r\na=sendonly\r\na=rtpmap:96 PS/90000\r\ny=%d\r\n",
-		ms.localHost(), ms.localHost(), ms.localPort(), sd.ssrc)
+		ms.localHost(), ms.localHost(), answerMediaPort(ms.conn, sd.tcp), sd.ssrc)
 	if sd.tcp {
 		// Answer as the TCP-active side: we dialed, per the offer's setup:passive.
 		ms.sdpBody = fmt.Sprintf(
 			"v=0\r\no=- 0 0 IN IP4 %s\r\ns=Play\r\nc=IN IP4 %s\r\nt=0 0\r\n"+
 				"m=video %d TCP/RTP/AVP 96\r\na=sendonly\r\na=setup:active\r\na=connection:new\r\n"+
 				"a=rtpmap:96 PS/90000\r\ny=%d\r\n",
-			ms.localHost(), ms.localHost(), ms.localPort(), sd.ssrc)
+			ms.localHost(), ms.localHost(), answerMediaPort(ms.conn, sd.tcp), sd.ssrc)
 	}
 
 	s.mu.Lock()
@@ -423,9 +423,16 @@ func (ms *mediaSession) localHost() string {
 	return h
 }
 
-func (ms *mediaSession) localPort() int {
-	_, p := ms.svc.localHostPort(ms.upper)
-	return p
+const mediaDiscardPort = 9
+
+func answerMediaPort(conn net.Conn, tcp bool) int {
+	if tcp {
+		return mediaDiscardPort
+	}
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return addr.Port
+	}
+	return 0
 }
 
 // run subscribes to the camera's hub and pumps frames until stopped.
