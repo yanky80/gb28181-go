@@ -213,6 +213,15 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
 		return
 	}
+	cam, ok := s.cameraInfo(cameraID)
+	if !ok {
+		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
+		return
+	}
+	if !s.mediaVersionAllowed(s.upperOf(req), cam) {
+		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+		return
+	}
 
 	// Supersede synchronously so the replacement never overlaps the old
 	// session's Hub subscription or main-stream lease. Admission is serialized
@@ -230,7 +239,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		other.teardown("superseded by new-dialog re-INVITE")
 	}
 
-	if cam, ok := s.cameraInfo(cameraID); ok && cam.CascadeHidden {
+	if cam.CascadeHidden {
 		// Catalog convergence: the channel was allocated once (allocation rows
 		// persist) but the camera is now hidden — the upper may still hold the
 		// stale binding and INVITE it. Refuse like an unknown channel.
@@ -286,12 +295,17 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	// Sub-stream forwarding (#512): acquisition happens in run() AFTER the
 	// INVITE is answered — the ready wait (first keyframe) must never block
 	// the SIP transaction. Cameras on the sub tier also skip the main
-	// stream's codec hint (profiles can differ) and sniff instead.
-	if cam, ok := s.cameraInfo(cameraID); ok && cam.SubStream && s.subAcq != nil {
+	// stream still uses the camera's selected protocol-profile codec.
+	_, codec, profileErr := cameraProtocolProfile(s.cfg, cam)
+	if profileErr != nil {
+		releaseMain()
+		_, _ = s.srv.RespondOnRequest(req, 488, "Unsupported Protocol Profile", "", nil)
+		return
+	}
+	ms.codecHint = codec
+	ms.mux.SetVideoCodec(codec)
+	if cam.SubStream && s.subAcq != nil {
 		ms.wantSub = true
-	} else if cam, ok := s.cameraInfo(cameraID); ok && cam.Encoding != "" {
-		ms.codecHint = cam.Encoding
-		ms.mux.SetVideoCodec(cam.Encoding)
 	}
 	ms.mu.Lock()
 	ms.hub = hub
@@ -415,10 +429,6 @@ func (ms *mediaSession) run(hub *platform.FrameHub) {
 		for _, nalu := range au {
 			annexB = append(annexB, 0, 0, 0, 1)
 			annexB = append(annexB, nalu...)
-		}
-		if ms.codecHint == "" {
-			ms.codecHint = sniffCodec(au[0])
-			ms.mux.SetVideoCodec(ms.codecHint)
 		}
 		// Take the audio buffered since the last video AU and mux it into
 		// THIS PS burst — one RTP stream, one marker per access unit. A

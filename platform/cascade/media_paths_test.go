@@ -106,7 +106,7 @@ func TestLoopbackInviteTCPDialFailure(t *testing.T) {
 func TestLoopbackPlaybackReInviteWindow(t *testing.T) {
 	hub := platform.NewFrameHub()
 	db := newCascadeTestDB(t)
-	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, hub}, db)
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
 

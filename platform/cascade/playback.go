@@ -77,6 +77,16 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
 		return
 	}
+	cam, ok := s.cameraInfo(cameraID)
+	if !ok {
+		_, _ = s.srv.RespondOnRequest(req, 404, "Unknown Channel", "", nil)
+		return
+	}
+	_, expectedCodec, profileErr := cameraProtocolProfile(s.cfg, cam)
+	if profileErr != nil || !s.mediaVersionAllowed(s.upperOf(req), cam) {
+		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+		return
+	}
 	if !sd.hasT {
 		_, _ = s.srv.RespondOnRequest(req, 400, "Playback without time range", "", nil)
 		return
@@ -90,11 +100,33 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	if end.Sub(start) > pbMaxWindow {
 		end = start.Add(pbMaxWindow)
 	}
-	if recs, err := s.playbackRecordings(cameraID, start, end); err == nil && len(recs) == 0 {
-		slog.Info("gb28181-cascade: playback INVITE for empty window",
-			"channel", channelID, "start", start, "end", end)
-		_, _ = s.srv.RespondOnRequest(req, 404, "No Records", "", nil)
-		return
+	if recs, err := s.playbackRecordings(cameraID, start, end); err == nil {
+		if len(recs) == 0 {
+			slog.Info("gb28181-cascade: playback INVITE for empty window",
+				"channel", channelID, "start", start, "end", end)
+			_, _ = s.srv.RespondOnRequest(req, 404, "No Records", "", nil)
+			return
+		}
+		compatible := false
+		for _, rec := range recs {
+			if string(rec.Format) == expectedCodec {
+				compatible = true
+				break
+			}
+		}
+		if !compatible {
+			_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+			return
+		}
+		for _, rec := range recs {
+			seg, err := s.parseSegment(rec.FilePath)
+			if err == nil {
+				if err := s.validatePlaybackSegment(cameraID, seg); err != nil {
+					_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+					return
+				}
+			}
+		}
 	}
 
 	dst := &net.UDPAddr{IP: net.ParseIP(sd.host), Port: sd.port}
@@ -230,8 +262,8 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 				"path", rec.FilePath, "error", err)
 			continue
 		}
-		if seg.Codec != "h264" && seg.Codec != "h265" {
-			continue
+		if err := ps.svc.validatePlaybackSegment(ps.camera, seg); err != nil {
+			return false, nil, err
 		}
 		f, err := os.Open(rec.FilePath)
 		if err != nil {
@@ -342,6 +374,28 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 		_ = f.Close()
 	}
 	return true, nil, nil
+}
+
+func (s *Service) validatePlaybackSegment(cameraID string, seg *SegmentInfo) error {
+	cam, ok := s.cameraInfo(cameraID)
+	if !ok {
+		return fmt.Errorf("camera %q is unavailable", cameraID)
+	}
+	_, expectedCodec, err := cameraProtocolProfile(s.cfg, cam)
+	if err != nil {
+		return err
+	}
+	if seg == nil || seg.Codec != expectedCodec {
+		return fmt.Errorf("recording codec %q does not match profile codec %q", segCodec(seg), expectedCodec)
+	}
+	return nil
+}
+
+func segCodec(seg *SegmentInfo) string {
+	if seg == nil {
+		return ""
+	}
+	return seg.Codec
 }
 
 // applyCtrl folds one MANSRTSP control into the pacing state. rel is the
