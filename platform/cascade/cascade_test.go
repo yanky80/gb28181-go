@@ -470,7 +470,7 @@ func TestSDPFromInvite(t *testing.T) {
 	// Unix-era t= values pass through unchanged.
 	sd, err = sdpFromInvite([]byte(
 		"v=0\r\no=- 0 0 IN IP4 10.0.0.3\r\ns=Playback\r\nc=IN IP4 10.0.0.3\r\nt=1760000000 1760000060\r\n" +
-			"m=video 30014 RTP/AVP 96\r\na=recvonly\r\ny=9\r\n"))
+			"m=video 30014 RTP/AVP 96\r\na=recvonly\r\na=rtpmap:96 PS/90000\r\ny=9\r\n"))
 	require.NoError(t, err)
 	require.True(t, sd.hasT)
 	require.EqualValues(t, 1760000000, sd.t0)

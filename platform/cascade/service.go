@@ -328,10 +328,7 @@ func (s *Service) Start(ctx context.Context) error {
 	// push channel additions/removals without waiting for the upper's
 	// polling fallback (#370).
 	_ = srv.OnRequest(sip.SUBSCRIBE, s.onSubscribe)
-	_ = srv.OnRequest(sip.OPTIONS, func(req sip.Request, tx sip.ServerTransaction) {
-		allow := sip.AllowHeader{sip.REGISTER, sip.MESSAGE, sip.INVITE, sip.ACK, sip.BYE, sip.CANCEL, sip.OPTIONS}
-		_, _ = srv.RespondOnRequest(req, 200, "OK", "", []sip.Header{&allow})
-	})
+	_ = srv.OnRequest(sip.OPTIONS, s.onOptions)
 	// MANSRTSP playback controls (pause/resume/seek/scale) ride in-dialog INFO
 	// messages; onInfo routes them to the channel's playback session.
 	_ = srv.OnRequest(sip.INFO, s.onInfo)
@@ -535,26 +532,66 @@ func upperAddr(u *upper) (*net.UDPAddr, error) {
 	return net.ResolveUDPAddr("udp", u.cfg.ServerAddr)
 }
 
-// upperOf resolves which upper platform an incoming request belongs to: the
-// From user of a platform's requests is its server ID (ServerDomain). Falls
-// back to the sole upper; unknown senders on a multi-upper deployment land
-// on the first (their dialogs still route by Call-ID).
+// upperOf resolves a trusted incoming request to its configured upper. Both
+// the From user and the packet source IP must match; source ports are ignored
+// because UDP NAT may rewrite them.
 func (s *Service) upperOf(req sip.Request) *upper {
-	if len(s.uppers) == 0 {
+	if req == nil {
 		return nil
 	}
-	if len(s.uppers) == 1 {
-		return s.uppers[0]
+	from, ok := req.From()
+	if !ok || from.Address == nil {
+		return nil
 	}
-	if from, ok := req.From(); ok {
-		user := from.Address.User().String()
-		for _, u := range s.uppers {
-			if u.cfg.ServerDomain == user {
-				return u
-			}
+	user := from.Address.User().String()
+	for _, u := range s.uppers {
+		if u.cfg.ServerDomain == user && sourceMatchesUpper(req.Source(), u) {
+			return u
 		}
 	}
-	return s.uppers[0]
+	return nil
+}
+
+func sourceMatchesUpper(source string, u *upper) bool {
+	if u == nil || source == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(source)
+	if err != nil {
+		host = strings.Trim(source, "[]")
+	}
+	sourceIP := net.ParseIP(host)
+	target, err := upperAddr(u)
+	return sourceIP != nil && err == nil && sourceIP.Equal(target.IP)
+}
+
+// requireUpper rejects untrusted requests without logging headers or bodies.
+// In particular, Authorization may contain a digest secret and must never be
+// included in diagnostics.
+func (s *Service) requireUpper(req sip.Request) *upper {
+	if u := s.upperOf(req); u != nil {
+		return u
+	}
+	if req != nil {
+		fromUser := ""
+		if from, ok := req.From(); ok && from.Address != nil {
+			fromUser = from.Address.User().String()
+		}
+		slog.Warn("gb28181-cascade: unauthorized upper request",
+			"method", req.Method(), "from", fromUser, "source", req.Source())
+		if s.srv != nil {
+			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		}
+	}
+	return nil
+}
+
+func (s *Service) onOptions(req sip.Request, _ sip.ServerTransaction) {
+	if s.requireUpper(req) == nil {
+		return
+	}
+	allow := sip.AllowHeader{sip.REGISTER, sip.MESSAGE, sip.INVITE, sip.ACK, sip.BYE, sip.CANCEL, sip.OPTIONS}
+	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", []sip.Header{&allow})
 }
 
 func (s *Service) upperForDeviceStatus(req sip.Request) *upper {
@@ -808,20 +845,22 @@ func (s *Service) sendKeepalive(u *upper) error {
 // ---- upper-platform requests (UAS side) ----
 
 func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
+	u := s.requireUpper(req)
+	if u == nil {
+		return
+	}
 	cmd, payload, err := manscdp.Decode([]byte(req.Body()))
 	if err != nil {
 		_, _ = s.srv.RespondOnRequest(req, 400, "Bad MANSCDP", "", nil)
 		return
 	}
-	var u *upper
 	if cmd == manscdp.CmdDeviceStatus {
-		u = s.upperForDeviceStatus(req)
-		if u == nil {
+		statusUpper := s.upperForDeviceStatus(req)
+		if statusUpper == nil {
 			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 			return
 		}
-	} else {
-		u = s.upperOf(req)
+		u = statusUpper
 	}
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	switch cmd {

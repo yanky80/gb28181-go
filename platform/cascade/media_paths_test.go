@@ -26,7 +26,19 @@ func tcpPlaySDP(t *testing.T, tcpPort int) string {
 	return "v=0\r\no=" + lbUpperDevice + " 0 0 IN IP4 " + lbLocalHost + "\r\ns=Play\r\n" +
 		"c=IN IP4 " + lbLocalHost + "\r\nt=0 0\r\n" +
 		"m=video " + strconv.Itoa(tcpPort) + " TCP/RTP/AVP 96\r\n" +
-		"a=setup:passive\r\na=connection:new\r\n" +
+		"a=recvonly\r\na=setup:passive\r\na=connection:new\r\n" +
+		"a=rtpmap:96 PS/90000\r\ny=12345678\r\n"
+}
+
+func tcpPlaybackSDP(t *testing.T, tcpPort int, now time.Time) string {
+	t.Helper()
+	start := now.Add(-10 * time.Minute)
+	end := now.Add(-5 * time.Minute)
+	return "v=0\r\no=" + lbUpperDevice + " 0 0 IN IP4 " + lbLocalHost + "\r\n" +
+		"s=Playback\r\nc=IN IP4 " + lbLocalHost + "\r\n" +
+		"t=" + strconv.FormatInt(start.Unix(), 10) + " " + strconv.FormatInt(end.Unix(), 10) + "\r\n" +
+		"m=video " + strconv.Itoa(tcpPort) + " TCP/RTP/AVP 96\r\n" +
+		"a=recvonly\r\na=setup:passive\r\na=connection:new\r\n" +
 		"a=rtpmap:96 PS/90000\r\ny=12345678\r\n"
 }
 
@@ -63,6 +75,8 @@ func TestLoopbackInviteTCPMediaForward(t *testing.T) {
 	// Answer as the TCP-active side: we dialed.
 	require.Contains(t, string(res.Body()), "TCP/RTP/AVP 96")
 	require.Contains(t, string(res.Body()), "a=setup:active")
+	require.Contains(t, string(res.Body()), "m=video 9 TCP/RTP/AVP 96",
+		"TCP-active answer must use discard port 9")
 
 	// Frames fed through the hub must arrive as RTP/PS bytes on the TCP conn.
 	var conn net.Conn
@@ -134,6 +148,48 @@ func TestLoopbackPlaybackReInviteWindow(t *testing.T) {
 	require.Equal(t, 200, int(res.StatusCode()))
 	require.Eventually(t, func() bool { return len(playbackIDs(svc)) <= 1 },
 		5*time.Second, 20*time.Millisecond)
+}
+
+func TestLoopbackPlaybackTCPAnswerUsesDiscardPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			accepted <- c
+		}
+	}()
+	t.Cleanup(func() {
+		select {
+		case c := <-accepted:
+			_ = c.Close()
+		default:
+		}
+	})
+
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, db)
+	_, err = svc.catalogItems()
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	createPacedPlaybackSegment(t, db, "cam-1", now.Add(-10*time.Minute))
+
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne,
+		tcpPlaybackSDP(t, ln.Addr().(*net.TCPAddr).Port, now), "application/sdp"))
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Contains(t, string(res.Body()), "m=video 9 TCP/RTP/AVP 96",
+		"TCP-active playback answer must use discard port 9")
+	require.Contains(t, string(res.Body()), "a=setup:active")
+
+	select {
+	case c := <-accepted:
+		_ = c.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("cascade never dialed the TCP playback media address")
+	}
 }
 
 func TestLoopbackDeviceControlIgnoredCommands(t *testing.T) {

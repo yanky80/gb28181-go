@@ -43,8 +43,7 @@ type playbackSession struct {
 	end      time.Time
 	download bool // s=Download: send at file speed, no 1x pacing (#378)
 
-	conn    *net.UDPConn
-	dst     *net.UDPAddr
+	conn    net.Conn
 	ssrc    uint32
 	rtp     *psmux.RTPPacketizer
 	mux     *psmux.Muxer
@@ -70,7 +69,7 @@ type pbCtrl struct {
 // a sendonly s= answer, and pump the media. Downloads skip the 1x pacing and
 // stream at file speed. 404 when the channel is unknown or the window holds
 // no recordings (the platform surfaces that as a fetch error).
-func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP) {
+func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP, u *upper) {
 	cameraID, ok := s.cameraOfChannel(channelID)
 	if !ok {
 		slog.Warn("gb28181-cascade: playback INVITE for unknown channel", "channel", channelID)
@@ -129,31 +128,51 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		}
 	}
 
-	dst := &net.UDPAddr{IP: net.ParseIP(sd.host), Port: sd.port}
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
-		return
+	var conn net.Conn
+	var rtp *psmux.RTPPacketizer
+	var err error
+	target := net.JoinHostPort(sd.host, strconv.Itoa(sd.port))
+	if sd.tcp {
+		conn, err = (&net.Dialer{Timeout: 5 * time.Second}).DialContext(s.ctx, "tcp", target)
+		if err != nil {
+			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
+			return
+		}
+		rtp = psmux.NewRTPPacketizerTCP(conn, sd.ssrc, uint16(time.Now().UnixNano()&0xFFFF))
+	} else {
+		dst := &net.UDPAddr{IP: net.ParseIP(sd.host), Port: sd.port}
+		conn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		if err != nil {
+			_, _ = s.srv.RespondOnRequest(req, 500, "Internal Error", "", nil)
+			return
+		}
+		rtp = psmux.NewRTPPacketizer(conn, dst, sd.ssrc, uint16(time.Now().UnixNano()&0xFFFF))
 	}
 
 	sdpName := "Playback"
 	if strings.EqualFold(sd.name, "Download") {
 		sdpName = "Download"
 	}
-	u := s.upperOf(req)
 	ps := &playbackSession{
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
 		upper: u, start: start, end: end, download: sdpName == "Download",
-		conn: conn, dst: dst, ssrc: sd.ssrc,
+		conn: conn, ssrc: sd.ssrc,
 		mux:  psmux.New(),
-		rtp:  psmux.NewRTPPacketizer(conn, dst, sd.ssrc, uint16(time.Now().UnixNano()&0xFFFF)),
+		rtp:  rtp,
 		ctrl: make(chan pbCtrl, 8),
 		done: make(chan struct{}),
 	}
 	ps.sdpBody = fmt.Sprintf(
 		"v=0\r\no=- 0 0 IN IP4 %s\r\ns=%s\r\nc=IN IP4 %s\r\nt=%s %s\r\n"+
 			"m=video %d RTP/AVP 96\r\na=sendonly\r\na=rtpmap:96 PS/90000\r\ny=%d\r\n",
-		ps.localHost(), sdpName, ps.localHost(), sd.rawT0, sd.rawT1, ps.localPort(), sd.ssrc)
+		ps.localHost(), sdpName, ps.localHost(), sd.rawT0, sd.rawT1, answerMediaPort(ps.conn, sd.tcp), sd.ssrc)
+	if sd.tcp {
+		ps.sdpBody = fmt.Sprintf(
+			"v=0\r\no=- 0 0 IN IP4 %s\r\ns=%s\r\nc=IN IP4 %s\r\nt=%s %s\r\n"+
+				"m=video %d TCP/RTP/AVP 96\r\na=sendonly\r\na=setup:active\r\na=connection:new\r\n"+
+				"a=rtpmap:96 PS/90000\r\ny=%d\r\n",
+			ps.localHost(), sdpName, ps.localHost(), sd.rawT0, sd.rawT1, answerMediaPort(ps.conn, sd.tcp), sd.ssrc)
+	}
 
 	s.mu.Lock()
 	s.playbacks[callID] = ps
@@ -163,7 +182,7 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	go ps.pump()
 	slog.Info("gb28181-cascade: fetch INVITE accepted — streaming",
 		"kind", sdpName, "channel", channelID, "camera", cameraID, "start", start, "end", end,
-		"to", dst.String(), "ssrc", sd.ssrc)
+		"to", target, "ssrc", sd.ssrc)
 }
 
 // playbackRecordings lists the fMP4 recordings of cameraID overlapping the
@@ -195,11 +214,6 @@ func (s *Service) playbackRecordings(cameraID string, start, end time.Time) ([]R
 func (ps *playbackSession) localHost() string {
 	h, _ := ps.svc.localHostPort(ps.upper)
 	return h
-}
-
-func (ps *playbackSession) localPort() int {
-	_, p := ps.svc.localHostPort(ps.upper)
-	return p
 }
 
 // pump drives playOnce passes until the window is exhausted (then BYE) or a
@@ -458,17 +472,31 @@ func (ps *playbackSession) stop() {
 // onInfo answers the upper platform's in-dialog INFO and routes MANSRTSP
 // playback controls to the channel's playback session.
 func (s *Service) onInfo(req sip.Request, _ sip.ServerTransaction) {
-	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
+	u := s.requireUpper(req)
+	if u == nil {
+		return
+	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
 	}
 	s.mu.Lock()
+	ms := s.sessions[callID]
 	ps := s.playbacks[callID]
 	s.mu.Unlock()
 	if ps == nil {
+		if ms != nil && ms.upper != u {
+			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+			return
+		}
+		_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 		return // INFO on a live-forward dialog: nothing to control
 	}
+	if ps.upper != u {
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
+	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 
 	m := parseMANSRTSP(string(req.Body()))
 	switch pbActionFor(m) {
