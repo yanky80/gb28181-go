@@ -66,6 +66,28 @@ func TestRoundTripVideoH265LargeAU(t *testing.T) {
 	require.Equal(t, big[13:], nalus[1])
 }
 
+func TestRoundTripVideoH265CarriesParameterSetsAndPSM(t *testing.T) {
+	m := New()
+	m.SetVideoCodec("h265")
+	d := gb.NewPSDemuxer()
+	vps := []byte{0x40, 0x01, 0x0c, 0x01}
+	sps := []byte{0x42, 0x01, 0x01, 0x60}
+	pps := []byte{0x44, 0x01, 0xc0, 0xf1}
+	idr := []byte{0x26, 0x01, 0x02, 0x03}
+	au := append([]byte{0, 0, 0, 1}, vps...)
+	for _, nalu := range [][]byte{sps, pps, idr} {
+		au = append(au, 0, 0, 0, 1)
+		au = append(au, nalu...)
+	}
+
+	ps := m.WriteAU(au, 90000, true)
+	require.True(t, bytes.Contains(ps, []byte{0, 0, 1, 0xbc}))
+	require.True(t, bytes.Contains(ps, []byte{0x24, 0xe0}))
+	nalus, err := d.FeedAU(ps, 9000, true)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{vps, sps, pps, idr}, nalus)
+}
+
 func TestRoundTripAudioOnlyAfterPSM(t *testing.T) {
 	// PSM sent once (IDR) must keep declaring audio for subsequent AUs that
 	// carry only audio — mirrors the gbsim discipline.

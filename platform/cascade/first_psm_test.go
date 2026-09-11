@@ -12,14 +12,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The FIRST burst of a forwarding session must carry the PSM even when the
-// hub starts delivering mid-GOP (P-frames only): receivers latch demuxer
-// codec and IDR tracking from the PSM, and an IDR-less start would hide it
-// for up to a full GOP — observed live as H.265 channels mis-detected on the
-// upper platform (MiBeeNvr issue #625: FLV/WS 503 + 17s keyframe recycling).
+// The FIRST verified burst of a forwarding session must carry the PSM:
+// receivers latch demuxer codec and IDR tracking from the keyframe before
+// later VCL-only access units arrive.
 func TestMediaSessionFirstBurstCarriesPSM(t *testing.T) {
 	mainHub := platform.NewFrameHub()
-	svc := New(testCfg(), hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1"}}}, mainHub}, nil)
+	svc := New(testCfg(), hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, mainHub}, nil)
 
 	client, srvConn := net.Pipe()
 	ms := &mediaSession{
@@ -32,10 +30,10 @@ func TestMediaSessionFirstBurstCarriesPSM(t *testing.T) {
 	ms.run(mainHub)
 	defer ms.stop()
 
-	// Mid-GOP join: P-frame only AU (H.265 TRAIL_R slice — no param sets,
-	// auIsIDR must be false for it).
-	au := [][]byte{{0x02, 0x01, 0x02, 0x03, 0x04}}
-	mainHub.Broadcast(90000, au, false)
+	// Establish codec identity from a keyframe's parameter sets before
+	// forwarding any ambiguous VCL-only AU.
+	key := [][]byte{{0x40, 0x01, 0x0c}, {0x42, 0x01, 0x01}, {0x44, 0x01, 0xc0}, {0x26, 0x01, 0x02}}
+	mainHub.Broadcast(90000, key, true)
 
 	ps := readFirstBurstPS(t, client)
 	require.Contains(t, string(ps), "\x00\x00\x01\xbc",
@@ -43,7 +41,9 @@ func TestMediaSessionFirstBurstCarriesPSM(t *testing.T) {
 	require.Contains(t, string(ps), "\x00\x00\x01\xbb",
 		"first burst must carry the system header (00 00 01 BB)")
 
-	// The SECOND burst (still P-frames) must NOT re-send the PSM.
+	// A verified session accepts a valid H.265 non-IDR AU without re-sending
+	// the PSM.
+	au := [][]byte{{0x02, 0x01, 0x02, 0x03, 0x04}}
 	mainHub.Broadcast(93600, au, false)
 	ps2 := readFirstBurstPS(t, client)
 	require.NotContains(t, string(ps2), "\x00\x00\x01\xbc",

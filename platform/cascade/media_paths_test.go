@@ -65,7 +65,7 @@ func TestLoopbackInviteTCPMediaForward(t *testing.T) {
 
 	hub := platform.NewFrameHub()
 	db := newCascadeTestDB(t)
-	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, hub}, db)
 	_, err = svc.catalogItems()
 	require.NoError(t, err)
 
@@ -120,7 +120,7 @@ func TestLoopbackInviteTCPDialFailure(t *testing.T) {
 func TestLoopbackPlaybackReInviteWindow(t *testing.T) {
 	hub := platform.NewFrameHub()
 	db := newCascadeTestDB(t)
-	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, hub}, db)
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
 
@@ -171,7 +171,7 @@ func TestLoopbackPlaybackTCPAnswerUsesDiscardPort(t *testing.T) {
 	})
 
 	db := newCascadeTestDB(t)
-	svc, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, db)
+	svc, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, db)
 	_, err = svc.catalogItems()
 	require.NoError(t, err)
 	now := time.Now().UTC()

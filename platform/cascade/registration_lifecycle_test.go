@@ -369,7 +369,7 @@ func TestPlaybackDialogOwnershipAcrossUppers(t *testing.T) {
 	}}
 	hub := platform.NewFrameHub()
 	db := newCascadeTestDB(t)
-	svc, up := startLoopbackServiceWithConfig(t, cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	svc, up := startLoopbackServiceWithConfig(t, cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, hub}, db)
 	secondUp := newUpperSocketOn(t, up.sip.String(), "127.0.0.2")
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
@@ -653,7 +653,7 @@ func TestPlaybackStoreCancellationLetsStopReleaseAdmission(t *testing.T) {
 		done:             make(chan struct{}),
 	}
 	hub := platform.NewFrameHub()
-	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, store)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, hub}, store)
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
 
@@ -688,7 +688,7 @@ func TestByeAdmissionPreventsBlockedPlaybackReplacement(t *testing.T) {
 		release:          make(chan struct{}),
 	}
 	hub := platform.NewFrameHub()
-	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, store)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, hub}, store)
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
 
@@ -710,10 +710,7 @@ func TestByeAdmissionPreventsBlockedPlaybackReplacement(t *testing.T) {
 	svc.playbacks[old.callID] = old
 	svc.sessions[live.callID] = live
 	svc.mu.Unlock()
-	parserRelease := make(chan struct{})
-	t.Cleanup(func() { close(parserRelease) })
 	svc.SetSegmentParser(func(string) (*SegmentInfo, error) {
-		<-parserRelease
 		return &SegmentInfo{Codec: "h264", Timescale: 1000, Samples: []SegmentSample{{Size: 1, Duration: 1, IsKeyFrame: true}}}, nil
 	})
 

@@ -8,6 +8,7 @@
 ```go
 cfg := cascade.Config{
     Enabled:       true,
+    ProtocolVersion: "",                 // 空值 = GB/T 28181-2022
     ServerDomain:  "34020000002000000001", // 上级平台的国标 ID
     ServerAddr:    "192.0.2.20:5060",      // 上级平台 SIP 地址
     LocalDeviceID: "34020000002000000002", // 本平台对上的国标 ID
@@ -17,6 +18,11 @@ cfg := cascade.Config{
     UserAgent:     "",                     // "" = "gb28181-go/cascade"
 }
 ```
+
+支持的 profile 为 `2022+h265`（默认）、`2022+h264` 和 `2016+h264`。空的
+`CameraInfo.Encoding` 为保持源码兼容仍默认 H.265；H.264 相机请显式设为
+`h264`。REGISTER 会用 `X-GB-Ver` 宣告所选版本；上级返回 `2.0` 或缺少该标识
+时，级联会拒绝 2022/H.265 媒体，不会静默降级。
 
 目录身份默认中性（厂商/型号 `Unknown`），经
 `CatalogDefaultManufacturer` / `CatalogDefaultModel` 覆盖——你的级联

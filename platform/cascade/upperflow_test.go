@@ -230,7 +230,7 @@ func TestLoopbackMediaPump(t *testing.T) {
 	// Broadcast IDR frames until the (asynchronously subscribed) session
 	// picks one up and forwards it — poll, never sleep.
 	buf := make([]byte, 2048)
-	idr := [][]byte{{0x67, 0x64, 0x00, 0x1f}, {0x68, 0xeb, 0xe3, 0xcb}}
+	idr := [][]byte{{0x67, 0x64, 0x00, 0x1f}, {0x68, 0xeb, 0xe3, 0xcb}, {0x65, 0x88, 0x84}}
 	require.Eventually(t, func() bool {
 		hub.Broadcast(1000, idr, true)
 		_ = media.SetReadDeadline(time.Now().Add(150 * time.Millisecond))

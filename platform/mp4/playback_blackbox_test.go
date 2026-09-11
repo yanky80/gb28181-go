@@ -103,6 +103,7 @@ func blackBoxServeRegister(conn *net.UDPConn, stop <-chan struct{}) {
 				response.WriteString(name + ": " + header.Value() + "\r\n")
 			}
 		}
+		response.WriteString("X-GB-Ver: 3.0\r\n")
 		response.WriteString("Content-Length: 0\r\n\r\n")
 		_, _ = conn.WriteToUDP([]byte(response.String()), src)
 		return
@@ -112,7 +113,7 @@ func blackBoxServeRegister(conn *net.UDPConn, stop <-chan struct{}) {
 type blackBoxCameraSource struct{}
 
 func (blackBoxCameraSource) Cameras() []cascade.CameraInfo {
-	return []cascade.CameraInfo{{ID: "front", Name: "Front"}}
+	return []cascade.CameraInfo{{ID: "front", Name: "Front", Encoding: "h265"}}
 }
 
 func (blackBoxCameraSource) Hub(string) *platform.FrameHub { return nil }

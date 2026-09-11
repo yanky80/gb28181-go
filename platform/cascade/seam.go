@@ -2,6 +2,7 @@ package cascade
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -10,6 +11,10 @@ import (
 // MiBeeNvr's config.GB28181CascadeConfig.
 type Config struct {
 	Enabled bool `yaml:"enabled"`
+
+	// ProtocolVersion selects the GB/T 28181 protocol profile. Empty uses the
+	// box-side default, 2022.
+	ProtocolVersion string `yaml:"protocol_version,omitempty"`
 
 	// ServerDomain is the upper platform's 20-digit GB ID.
 	ServerDomain string `yaml:"server_domain"`
@@ -68,6 +73,16 @@ type Config struct {
 	// (neutral; the previous product-name defaults are gone).
 	CatalogDefaultManufacturer string `yaml:"catalog_default_manufacturer,omitempty"`
 	CatalogDefaultModel        string `yaml:"catalog_default_model,omitempty"`
+}
+
+// EffectiveProtocolVersion returns the configured protocol version or the
+// box-side default.
+func (c Config) EffectiveProtocolVersion() string {
+	version := strings.TrimSpace(c.ProtocolVersion)
+	if version == "" {
+		return "2022"
+	}
+	return version
 }
 
 // EffectiveUserAgent resolves the outbound SIP User-Agent (neutral default).
