@@ -144,23 +144,38 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
 		return
 	}
+	usable := 0
+	preflightStatus := 0
 	for _, rec := range recs {
 		if !recordingOverlaps(rec, start, end) {
 			continue
 		}
 		seg, err := s.parseSegment(rec.FilePath)
 		if err != nil {
-			_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
-			return
+			if preflightStatus == 0 {
+				preflightStatus = 500
+			}
+			continue
 		}
 		if err := s.validatePlaybackSegment(cameraID, seg); err != nil {
-			_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
-			return
+			preflightStatus = 488
+			continue
 		}
 		if err := validatePlaybackFile(rec.FilePath, seg); err != nil {
-			_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
-			return
+			if preflightStatus == 0 {
+				preflightStatus = 500
+			}
+			continue
 		}
+		usable++
+	}
+	if usable == 0 {
+		if preflightStatus == 488 {
+			_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+		} else {
+			_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
+		}
+		return
 	}
 
 	var conn net.Conn
@@ -319,13 +334,19 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 		}
 		seg, err := ps.svc.parseSegment(rec.FilePath)
 		if err != nil {
-			return false, nil, fmt.Errorf("parse recording %q: %w", rec.FilePath, err)
+			slog.Debug("gb28181-cascade: skipping unreadable recording",
+				"path", rec.FilePath, "error", err)
+			continue
 		}
 		if err := ps.svc.validatePlaybackSegment(ps.camera, seg); err != nil {
-			return false, nil, err
+			slog.Debug("gb28181-cascade: skipping incompatible recording",
+				"path", rec.FilePath, "error", err)
+			continue
 		}
 		if err := validatePlaybackFile(rec.FilePath, seg); err != nil {
-			return false, nil, err
+			slog.Debug("gb28181-cascade: skipping unavailable recording",
+				"path", rec.FilePath, "error", err)
+			continue
 		}
 		f, err := os.Open(rec.FilePath)
 		if err != nil {

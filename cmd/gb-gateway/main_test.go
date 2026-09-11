@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/mickeyzzc/gb28181-go/edgeipc"
 	"github.com/mickeyzzc/gb28181-go/platform/cascade"
+	"github.com/mickeyzzc/gb28181-go/platform/mp4"
 )
 
 func TestNewGatewayRestoresChannelsAndUsesConfiguredCodec(t *testing.T) {
@@ -55,6 +57,9 @@ func TestNewGatewayRestoresChannelsAndUsesConfiguredCodec(t *testing.T) {
 	if len(channels) != 1 || channels[0] != channel {
 		t.Fatalf("restored channels = %#v, want %#v", channels, []cascade.CascadeChannel{channel})
 	}
+	if gateway.recordings != nil {
+		t.Fatal("recording capability must be disabled")
+	}
 	if _, err := gateway.store.ListRecordings(context.Background(), cascade.RecordingFilter{}); err != nil {
 		t.Fatal(err)
 	}
@@ -66,6 +71,57 @@ func TestNewGatewayRestoresChannelsAndUsesConfiguredCodec(t *testing.T) {
 func TestDefaultConfigUsesDurableGatewayState(t *testing.T) {
 	if got := defaultConfig().IPC.StatusDir; got != "/var/lib/edge-gateway" {
 		t.Fatalf("default status directory = %q, want durable gateway state directory", got)
+	}
+}
+
+func TestGatewayUsesPersistedRecordingIndexAndRealParserPath(t *testing.T) {
+	dir := t.TempDir()
+	statusDir := filepath.Join(dir, "status")
+	relativePath := filepath.Join("front", "20260911", "segment.mp4")
+	path := filepath.Join(statusDir, "recordings", relativePath)
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("not an mp4"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Date(2026, 9, 11, 10, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	event, err := json.Marshal(recordingIndexEvent{
+		Version: recordingIndexVersion, Op: "upsert", ID: filepath.ToSlash(relativePath),
+		CameraID: "front", File: filepath.ToSlash(relativePath), Format: cascade.FormatH265,
+		Size: 10, StartedAt: started, EndedAt: started.Add(time.Second),
+		Timescale: 1000, Frames: 1, Keyframes: []recordingKeyframe{{TimeMS: 0, Offset: 0, Size: 10}},
+	})
+	if err := os.MkdirAll(statusDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(statusDir, "recordings.jsonl"), append(event, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig()
+	cfg.IPC.StatusDir = statusDir
+	cfg.IPC.ControlSocket = filepath.Join(dir, "control.sock")
+	cfg.IPC.MediaSocket = filepath.Join(dir, "media.sock")
+	cfg.Cameras = []CameraConfig{{Index: 1, LocalCameraID: "front", Expose: true, Name: "Front", Codec: "h265", PTZMode: "none"}}
+	cfg.GB.RecordPlayback = true
+	gateway, err := NewGateway(cfg, Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Stop()
+
+	recordings, err := gateway.recordings.ListRecordings(context.Background(), cascade.RecordingFilter{
+		CameraID: "front", StartTime: started.Add(-time.Second), EndTime: started.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recordings) != 1 || recordings[0].FilePath != path {
+		t.Fatalf("recordings = %#v, want persisted absolute path %q", recordings, path)
+	}
+	if _, err := mp4.ParseSegment(recordings[0].FilePath); err == nil {
+		t.Fatal("real parser accepted a non-MP4 recording")
 	}
 }
 
@@ -248,6 +304,9 @@ func TestGatewayStartsSocketsBeforeCascadeAndStopsCleanly(t *testing.T) {
 	}
 	if gateway.cascade == nil {
 		t.Fatal("gateway did not assemble cascade service")
+	}
+	if gateway.recordings == nil {
+		t.Fatal("recording capability was not initialized")
 	}
 
 	cancel()
