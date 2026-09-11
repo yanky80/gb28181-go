@@ -37,11 +37,12 @@ or UTF-8, and payload length before allocating the payload. Short reads and
 concatenated frames are handled with exact-read semantics.
 
 Every payload is one Annex-B access unit. H.264 NAL units must have a clear
-`forbidden_zero_bit`; an IDR-marked H.264 AU must contain NAL type 5. H.265
-NAL units must have a valid two-byte header (`forbidden_zero_bit` clear and
-`nuh_temporal_id_plus1` nonzero). An IDR-marked H.265 AU must contain VPS,
-SPS, PPS, and IDR NAL types 32, 33, 34, and 19 or 20. `DISCONTINUITY` is only
-a flag; it does not change sequence or codec rules.
+`forbidden_zero_bit`, a known NAL type, and at least one VCL NAL; an
+IDR-marked H.264 AU must contain NAL type 5. H.265 NAL units must have a valid
+two-byte header (`forbidden_zero_bit` clear and `nuh_temporal_id_plus1`
+nonzero), a known NAL type, and at least one VCL NAL. An IDR-marked H.265 AU
+must contain VPS, SPS, PPS, and IDR NAL types 32, 33, 34, and 19 or 20.
+`DISCONTINUITY` is only a flag; it does not change sequence or codec rules.
 
 ## `control.sock`
 
@@ -83,3 +84,21 @@ Example default H.265 exchange:
 
 Errors are returned to the caller. The package does not send an `error`
 message, close a socket, retry, or alter process state.
+
+## Gateway media host
+
+`cmd/gb-gateway` owns the Unix `SOCK_STREAM` media listener configured by
+`ipc.media_socket`. It sets the socket mode to `0660`, binds each connection
+to the first valid `camera_id`, and replaces an older connection for that
+camera. Each connection has a bounded reader and is independent of other
+cameras.
+
+The host snapshots the camera's current `stream_epoch` and configured codec
+when it binds. A sequence gap, non-increasing PTS, `DISCONTINUITY`, invalid
+access unit, new connection, or stream replacement enters `WAIT_IDR`. While
+waiting it drops non-IDR AUs and invokes the injected `REQUEST_IDR` callback
+once. A valid H.265 IDR must contain VPS/SPS/PPS; H.264 compatibility uses
+SPS/PPS. Dropped WAIT_IDR AUs do not advance the accepted sequence/PTS
+baseline. A valid IDR restores broadcast to that camera's `FrameHub`; if the
+configured deadline (default three seconds) expires first, the host invokes
+the failure callback once.

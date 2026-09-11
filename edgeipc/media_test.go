@@ -84,6 +84,20 @@ func TestConfiguredMediaReaderRejectsPeerCodecBeforePayloadRead(t *testing.T) {
 	}
 }
 
+func TestMediaReaderHonorsHostPayloadLimitBeforeAllocation(t *testing.T) {
+	wire, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-1", Payload: h264AU(0x41)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewMediaReaderWithMaxPayload(bytes.NewReader(wire), len(h264AU(0x41))-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("error = %v, want payload-too-large", err)
+	}
+}
+
 func TestMediaFrameRejectsInvalidHeaderBeforePayloadAllocation(t *testing.T) {
 	base, err := MarshalMediaFrame(MediaFrame{Codec: CodecH264, CameraID: "cam-1", Payload: h264AU(0x41)})
 	if err != nil {
@@ -154,6 +168,10 @@ func TestH265IDRRequiresVPSPSPPSAndIDR(t *testing.T) {
 
 func TestH264IDRRejectsForbiddenNAL(t *testing.T) {
 	frame := MediaFrame{Codec: CodecH264, Flags: FlagIDR, CameraID: "cam-1", Payload: h264AU(0x65)}
+	if _, err := MarshalMediaFrame(frame); !errors.Is(err, ErrInvalidAccessUnit) {
+		t.Fatalf("missing SPS/PPS error = %v, want invalid AU", err)
+	}
+	frame.Payload = h264IDRAU()
 	if _, err := MarshalMediaFrame(frame); err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +189,26 @@ func TestMediaFrameRequiresAnnexBAccessUnit(t *testing.T) {
 	}
 }
 
+func TestMediaFrameRejectsUnknownOrIncompleteAccessUnit(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		codec Codec
+		au    []byte
+	}{
+		{name: "h264 unknown nal", codec: CodecH264, au: h264AU(0x1e)},
+		{name: "h264 parameter set only", codec: CodecH264, au: h264AU(0x67)},
+		{name: "h265 reserved nal", codec: CodecH265, au: []byte{0, 0, 1, 0x60, 1}},
+		{name: "h265 parameter set only", codec: CodecH265, au: []byte{0, 0, 1, 0x40, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := MarshalMediaFrame(MediaFrame{Codec: tc.codec, CameraID: "cam-1", Payload: tc.au})
+			if !errors.Is(err, ErrInvalidAccessUnit) {
+				t.Fatalf("error = %v, want invalid AU", err)
+			}
+		})
+	}
+}
+
 func TestMediaPayloadUpperBoundIsAccepted(t *testing.T) {
 	payload := make([]byte, MaxMediaPayload)
 	copy(payload, h264AU(0x41))
@@ -180,6 +218,10 @@ func TestMediaPayloadUpperBoundIsAccepted(t *testing.T) {
 }
 
 func h264AU(nal byte) []byte { return []byte{0, 0, 1, nal} }
+
+func h264IDRAU() []byte {
+	return []byte{0, 0, 1, 0x67, 0, 0, 1, 0x68, 0, 0, 1, 0x65}
+}
 
 func h265IDRAU() []byte {
 	return []byte{0, 0, 1, 0x40, 1, 0, 0, 1, 0x42, 1, 0, 0, 1, 0x44, 1, 0, 0, 1, 0x26, 1}

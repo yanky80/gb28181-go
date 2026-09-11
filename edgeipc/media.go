@@ -145,16 +145,28 @@ type MediaReader struct {
 	r          io.Reader
 	expected   Codec
 	configured bool
+	maxPayload uint32
 }
 
-func NewMediaReader(r io.Reader) *MediaReader { return &MediaReader{r: r} }
+func NewMediaReader(r io.Reader) *MediaReader {
+	return &MediaReader{r: r, maxPayload: MaxMediaPayload}
+}
+
+// NewMediaReaderWithMaxPayload applies a smaller host-side bound without
+// changing the Edge IPC v1 wire limit.
+func NewMediaReaderWithMaxPayload(r io.Reader, maxPayload int) (*MediaReader, error) {
+	if maxPayload < 1 || maxPayload > MaxMediaPayload {
+		return nil, ErrPayloadTooLarge
+	}
+	return &MediaReader{r: r, maxPayload: uint32(maxPayload)}, nil
+}
 
 // NewMediaReaderForCodec rejects frames that differ from the handshake codec.
 func NewMediaReaderForCodec(r io.Reader, codec Codec) (*MediaReader, error) {
 	if !validCodec(codec) {
 		return nil, ErrUnsupportedCodec
 	}
-	return &MediaReader{r: r, expected: codec, configured: true}, nil
+	return &MediaReader{r: r, expected: codec, configured: true, maxPayload: MaxMediaPayload}, nil
 }
 
 func (r *MediaReader) Read() (MediaFrame, error) {
@@ -168,6 +180,9 @@ func (r *MediaReader) Read() (MediaFrame, error) {
 	}
 	if r.configured && frame.Codec != r.expected {
 		return MediaFrame{}, ErrCodecMismatch
+	}
+	if payloadLen > r.maxPayload {
+		return MediaFrame{}, ErrPayloadTooLarge
 	}
 	cameraID := make([]byte, cameraLen)
 	if _, err := io.ReadFull(r.r, cameraID); err != nil {
