@@ -93,6 +93,41 @@ func TestParseSegmentStandardVersion1Mdhd(t *testing.T) {
 	require.Equal(t, uint32(1000), got.Timescale)
 }
 
+func TestParseSegmentAcceptsEmptyAndNamedHdlr(t *testing.T) {
+	codec := avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2}))
+	for _, hdlrLen := range []int{20, 27} {
+		data := fragmentedFileWithMoov(moovVersionsWithLengths(
+			[][]byte{codec}, 0, 0, nil, 80, 20, hdlrLen))
+		_, err := ParseSegment(writeSegment(t, data))
+		require.NoError(t, err)
+	}
+}
+
+func TestParseSegmentRejectsInvalidHdlrFields(t *testing.T) {
+	mutations := []struct {
+		name string
+		edit func([]byte)
+	}{
+		{"version", func(data []byte) { hdlrField(data, 0)[0] = 1 }},
+		{"flags", func(data []byte) { hdlrField(data, 1)[0] = 1 }},
+		{"pre-defined", func(data []byte) { hdlrField(data, 4)[0] = 1 }},
+		{"reserved", func(data []byte) { hdlrField(data, 12)[0] = 1 }},
+		{"invalid-utf8", func(data []byte) { hdlrField(data, 24)[0] = 0xff }},
+		{"early-nul", func(data []byte) { hdlrField(data, 25)[0] = 0 }},
+		{"missing-nul", func(data []byte) { hdlrField(data, 30)[0] = 'x' }},
+	}
+	for _, tt := range mutations {
+		t.Run(tt.name, func(t *testing.T) {
+			data := h264Segment([]byte{0x67, 1}, []byte{0x68, 2}, [][]sample{{
+				{duration: 40, data: []byte{0, 0, 0, 1, 0x65}, key: true},
+			}})
+			tt.edit(data)
+			_, err := ParseSegment(writeSegment(t, data))
+			require.ErrorIs(t, err, ErrInvalid)
+		})
+	}
+}
+
 func TestParseSegmentRejectsShortStandardFixedBoxes(t *testing.T) {
 	codec := avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2}))
 	tests := []struct {
@@ -122,6 +157,50 @@ func TestParseSegmentValidatesStsdEntriesAfterFirstCodec(t *testing.T) {
 	first := avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2}))
 	second := makeBox("hvc1", make([]byte, 10))
 	data := fragmentedFileWithMoov(moovVersions([][]byte{first, second}, 0, 0, nil))
+
+	_, err := ParseSegment(writeSegment(t, data))
+	require.ErrorIs(t, err, ErrInvalid)
+}
+
+func TestParseSegmentValidatesLaterSupportedCodecConfig(t *testing.T) {
+	first := avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2}))
+	second := hvc1Box(nil)
+	data := fragmentedFileWithMoov(moovVersions([][]byte{first, second}, 0, 0, nil))
+
+	_, err := ParseSegment(writeSegment(t, data))
+	require.ErrorIs(t, err, ErrInvalid)
+}
+
+func TestParseSegmentRejectsDamagedCodecConfigTail(t *testing.T) {
+	tests := []struct {
+		name string
+		box  []byte
+	}{
+		{"avcC", avc1BoxWithTail(avcC([]byte{0x67, 1}, []byte{0x68, 2}), []byte{0, 0, 0, 4})},
+		{"hvcC", hvc1BoxWithTail(hvcC([]byte{0x40, 1}, []byte{0x42, 1}, []byte{0x44, 1}), []byte{0, 0, 0, 4})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := fragmentedFileWithMoov(moovVersions([][]byte{tt.box}, 0, 0, nil))
+			_, err := ParseSegment(writeSegment(t, data))
+			require.ErrorIs(t, err, ErrInvalid)
+		})
+	}
+}
+
+func TestParseSegmentRejectsDuplicateCodecConfig(t *testing.T) {
+	config := avcC([]byte{0x67, 1}, []byte{0x68, 2})
+	data := fragmentedFileWithMoov(moovVersions([][]byte{avc1BoxWithTail(config, config)}, 0, 0, nil))
+
+	_, err := ParseSegment(writeSegment(t, data))
+	require.ErrorIs(t, err, ErrInvalid)
+}
+
+func TestParseSegmentRejectsConflictingCodecConfig(t *testing.T) {
+	data := fragmentedFileWithMoov(moovVersions([][]byte{avc1BoxWithTail(
+		avcC([]byte{0x67, 1}, []byte{0x68, 2}),
+		hvcC([]byte{0x40, 1}, []byte{0x42, 1}, []byte{0x44, 1}),
+	)}, 0, 0, nil))
 
 	_, err := ParseSegment(writeSegment(t, data))
 	require.ErrorIs(t, err, ErrInvalid)
@@ -404,13 +483,29 @@ func moovVersionsWithLengths(entries [][]byte, tkhdVersion, mdhdVersion byte, st
 }
 
 func avc1Box(config []byte) []byte {
-	payload := append(make([]byte, 78), config...)
-	return makeBox("avc1", payload)
+	return avc1BoxWithTail(config, nil)
 }
 
 func hvc1Box(config []byte) []byte {
+	return hvc1BoxWithTail(config, nil)
+}
+
+func avc1BoxWithTail(config, tail []byte) []byte {
 	payload := append(make([]byte, 78), config...)
-	return makeBox("hvc1", payload)
+	return makeBox("avc1", append(payload, tail...))
+}
+
+func hvc1BoxWithTail(config, tail []byte) []byte {
+	payload := append(make([]byte, 78), config...)
+	return makeBox("hvc1", append(payload, tail...))
+}
+
+func hdlrField(data []byte, offset int) []byte {
+	idx := bytes.Index(data, []byte("hdlr"))
+	if idx < 0 {
+		panic("hdlr fixture missing")
+	}
+	return data[idx+4+offset : idx+4+offset+1]
 }
 
 func avcC(sps, pps []byte) []byte {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"unicode/utf8"
 
 	"github.com/mickeyzzc/gb28181-go/platform/cascade"
 )
@@ -290,20 +291,32 @@ func (p *parser) parseTrak(trak box) (*trackInfo, bool, error) {
 				timescale = binary.BigEndian.Uint32(v[12:16])
 			}
 		case "hdlr":
-			v, err := p.readPrefix(b, 24)
+			v, err := p.readSmall(b, maxConfigSize)
 			if err != nil {
 				return nil, false, err
 			}
-			if b.end-b.payload > 24 {
-				var terminator [1]byte
-				if _, err := p.r.ReadAt(terminator[:], b.end-1); err != nil {
-					if errors.Is(err, io.EOF) {
-						return nil, false, truncated("short hdlr name")
-					}
-					return nil, false, err
-				}
-				if terminator[0] != 0 {
+			if len(v) < 24 {
+				return nil, false, truncated("short hdlr")
+			}
+			if v[0] != 0 || v[1] != 0 || v[2] != 0 || v[3] != 0 {
+				return nil, false, invalid("invalid hdlr version or flags")
+			}
+			if !allZero(v[4:8]) || !allZero(v[12:24]) {
+				return nil, false, invalid("invalid hdlr fixed fields")
+			}
+			name := v[24:]
+			if len(name) > 0 {
+				if name[len(name)-1] != 0 {
 					return nil, false, invalid("hdlr name is not null-terminated")
+				}
+				name = name[:len(name)-1]
+				for _, value := range name {
+					if value == 0 {
+						return nil, false, invalid("hdlr name has an early terminator")
+					}
+				}
+				if !utf8.Valid(name) {
+					return nil, false, invalid("hdlr name is not valid UTF-8")
 				}
 			}
 			handler = string(v[8:12])
@@ -378,11 +391,11 @@ func (p *parser) parseStsd(stsd box) (*trackInfo, error) {
 			off += sz
 			continue
 		}
+		info := &trackInfo{codec: codec}
+		if err := p.parseCodecConfig(v[off+86:off+sz], configType, info); err != nil {
+			return nil, err
+		}
 		if first == nil {
-			info := &trackInfo{codec: codec}
-			if err := p.parseCodecConfig(v[off+86:off+sz], configType, info); err != nil {
-				return nil, err
-			}
 			first = info
 		}
 		off += sz
@@ -398,6 +411,7 @@ func (p *parser) parseStsd(stsd box) (*trackInfo, error) {
 
 func (p *parser) parseCodecConfig(data []byte, typ string, info *trackInfo) error {
 	off := 0
+	found := false
 	for off < len(data) {
 		if len(data)-off < 8 {
 			return invalid("trailing sample-entry bytes")
@@ -406,19 +420,35 @@ func (p *parser) parseCodecConfig(data []byte, typ string, info *trackInfo) erro
 		if sz < 8 || sz > len(data)-off {
 			return invalid("invalid codec configuration box")
 		}
-		if string(data[off+4:off+8]) == typ {
+		childType := string(data[off+4 : off+8])
+		if childType == typ {
+			if found {
+				return invalid("duplicate codec configuration")
+			}
 			config := data[off+8 : off+sz]
 			if len(config) > maxConfigSize {
 				return invalid("codec configuration is too large")
 			}
+			found = true
+			var err error
 			if typ == "avcC" {
-				return parseAVCC(config, info)
+				err = parseAVCC(config, info)
+			} else {
+				err = parseHVCC(config, info)
 			}
-			return parseHVCC(config, info)
+			if err != nil {
+				return err
+			}
+		}
+		if (typ == "avcC" && childType == "hvcC") || (typ == "hvcC" && childType == "avcC") {
+			return invalid("conflicting codec configuration")
 		}
 		off += sz
 	}
-	return invalid("missing codec configuration")
+	if !found {
+		return invalid("missing codec configuration")
+	}
+	return nil
 }
 
 func parseAVCC(v []byte, info *trackInfo) error {
@@ -883,6 +913,15 @@ func inMdat(start, end int64, mdats []box) bool {
 		}
 	}
 	return false
+}
+
+func allZero(v []byte) bool {
+	for _, value := range v {
+		if value != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func addInt64(a, b int64) (int64, bool) {
