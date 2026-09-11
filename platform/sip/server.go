@@ -1392,7 +1392,11 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 
 	switch ct {
 	case manscdp.CmdKeepalive:
-		p := payload.(manscdp.Keepalive)
+		p, ok := payload.(manscdp.Keepalive)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid Keepalive payload", nil)
+			return
+		}
 		// A keepalive must come from the device it vouches for — otherwise a
 		// spoofed MESSAGE keeps a dead device "online" forever.
 		if fromUser != "" && fromUser != p.DeviceID {
@@ -1439,17 +1443,26 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 		}
 		p, ok := payload.(manscdp.Catalog)
 		if !ok {
-			break
+			s.respond(req, tx, statusBadRequest, "Invalid Catalog payload", nil)
+			return
 		}
 		slog.Info("gb28181: catalog received", "device", p.DeviceID, "channels", len(p.Item))
 		s.mergeCatalogChannels(p.DeviceID, p.Item)
 	case manscdp.CmdRecordInfo:
-		p := payload.(manscdp.RecordInfo)
+		p, ok := payload.(manscdp.RecordInfo)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid RecordInfo payload", nil)
+			return
+		}
 		slog.Info("gb28181: record info received", "device", p.DeviceID,
 			"sn", p.SN, "sum_num", p.SumNum, "items", len(p.RecordList))
 		s.feedRecordQuery(p.DeviceID, p)
 	case manscdp.CmdDeviceInfo:
-		p := payload.(manscdp.DeviceInfo)
+		p, ok := payload.(manscdp.DeviceInfo)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid DeviceInfo payload", nil)
+			return
+		}
 		slog.Info("gb28181: device info received", "device", p.DeviceID, "name", p.DeviceName, "manufacturer", p.Manufacturer, "model", p.Model)
 		if d, ok := s.deviceMgr.Device(p.DeviceID); ok {
 			d.Mu.Lock()
@@ -1487,7 +1500,11 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 			}
 		}
 	case manscdp.CmdDeviceStatus:
-		p := payload.(manscdp.DeviceStatus)
+		p, ok := payload.(manscdp.DeviceStatus)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid DeviceStatus payload", nil)
+			return
+		}
 		slog.Info("gb28181: device status received", "device", p.DeviceID, "status", p.Status, "time", p.Time)
 		if p.Status != "" && p.Status != "OK" && p.Status != "ON" {
 			slog.Warn("gb28181: device reports abnormal status", "device", p.DeviceID, "status", p.Status)
@@ -1495,9 +1512,18 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 	case manscdp.CmdAlarm:
 		// Some firmwares deliver alarms as MESSAGE instead of NOTIFY —
 		// route both into the same pipeline.
-		s.handleAlarm(payload.(manscdp.Alarm))
+		p, ok := payload.(manscdp.Alarm)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid Alarm payload", nil)
+			return
+		}
+		s.handleAlarm(p)
 	case manscdp.CmdUploadSnapShotFinished:
-		p := payload.(manscdp.UploadSnapShotFinished)
+		p, ok := payload.(manscdp.UploadSnapShotFinished)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid UploadSnapShotFinished payload", nil)
+			return
+		}
 		slog.Info("gb28181: snapshot finished notify", "device", p.DeviceID,
 			"session", p.SessionID, "files", len(p.SnapShotList))
 		if bus := s.eventBusSnapshot(); bus != nil {
@@ -1513,7 +1539,11 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 		// Device clock query (GB/T 28181-2016 § 9.6): answer with the
 		// platform wall clock so device-side timestamps (and RecordInfo
 		// ranges) stay aligned. The query may arrive with a Query root.
-		p := payload.(manscdp.TimeSyncQuery)
+		p, ok := payload.(manscdp.TimeSyncQuery)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid TimeSync payload", nil)
+			return
+		}
 		slog.Info("gb28181: time sync query", "device", p.DeviceID, "sn", p.SN)
 		go func(devID string, sn int) {
 			body, err := manscdp.Encode(manscdp.TimeSyncResponse{

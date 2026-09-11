@@ -47,6 +47,21 @@ func TestHandleMessageWireBranches(t *testing.T) {
 		require.Equal(t, 400, int(res.StatusCode()))
 	})
 
+	for _, tc := range []struct {
+		name string
+		body any
+	}{
+		{name: "catalog query", body: manscdp.CatalogQuery{CmdType: manscdp.CmdCatalog, SN: 11, DeviceID: testDeviceID}},
+		{name: "record info query", body: manscdp.RecordInfoQuery{CmdType: manscdp.CmdRecordInfo, SN: 12, DeviceID: testDeviceID}},
+		{name: "device info query", body: manscdp.DeviceInfoQuery{CmdType: manscdp.CmdDeviceInfo, SN: 13, DeviceID: testDeviceID}},
+		{name: "device status query", body: manscdp.DeviceStatusQuery{CmdType: manscdp.CmdDeviceStatus, SN: 14, DeviceID: testDeviceID}},
+	} {
+		t.Run(tc.name+" role mismatch 400", func(t *testing.T) {
+			res := client.roundTrip(manscdpMessage(t, cfg, client, testDeviceID, tc.body))
+			require.Equal(t, 400, int(res.StatusCode()))
+		})
+	}
+
 	t.Run("keepalive ok touches device", func(t *testing.T) {
 		res := client.roundTrip(manscdpMessage(t, cfg, client, testDeviceID, manscdp.Keepalive{
 			CmdType: manscdp.CmdKeepalive, SN: 31, DeviceID: testDeviceID, Status: "OK",

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -146,7 +147,7 @@ func TestGatewayConformanceInvalidProfilesRejectStartup(t *testing.T) {
 			dir := t.TempDir()
 			cfg := Config{
 				GB: GBConfig{
-					ProtocolVersion: tt.version, SIPListen: freeSIPListenAddress(t),
+					ProtocolVersion: tt.version, SIPListen: freeUDPListenAddress(t),
 					Heartbeat: time.Second, RegisterExpires: 1, IDRTimeout: time.Second,
 				},
 				IPC: IPCConfig{
@@ -435,8 +436,8 @@ type gatewayPeer struct {
 
 func newGatewayScenario(t *testing.T, version, codec, mediaTransport, upperVersion string, recordPlayback bool) *gatewayScenario {
 	t.Helper()
-	upperAddr := freeSIPListenAddress(t)
-	mediaBase := freeGatewayPort(t)
+	upperAddr := freeUDPListenAddress(t)
+	mediaBase := freeGatewayPort(t, mediaTransport)
 	upperDM := platform.NewDeviceManager(2 * time.Second)
 	upperSM := platform.NewSessionManager(platform.NewPortManager(uint16(mediaBase), uint16(mediaBase+20)), conformanceUpperID)
 	noCatalogSubscription := false
@@ -470,7 +471,7 @@ func newGatewayScenario(t *testing.T, version, codec, mediaTransport, upperVersi
 			Realm:           "conformance",
 			Heartbeat:       time.Second,
 			RegisterExpires: 3600,
-			SIPListen:       freeSIPListenAddress(t),
+			SIPListen:       freeUDPListenAddress(t),
 			StopGrace:       0,
 			IDRTimeout:      time.Second,
 			RecordPlayback:  recordPlayback,
@@ -513,20 +514,18 @@ func (s *gatewayScenario) codec(cameraID string) edgeipc.Codec {
 	return edgeipc.DefaultCodec
 }
 
-func freeGatewayPort(t *testing.T) int {
+func freeGatewayPort(t *testing.T, mediaTransport string) int {
 	t.Helper()
+	if strings.HasPrefix(mediaTransport, "tcp-") {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer listener.Close()
+		return listener.Addr().(*net.TCPAddr).Port
+	}
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).Port
-}
-
-func freeSIPListenAddress(t *testing.T) string {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer listener.Close()
-	return listener.Addr().String()
 }
 
 func awaitUpperHub(t *testing.T, sessions *platform.SessionManager, channelID string) *platform.FrameHub {

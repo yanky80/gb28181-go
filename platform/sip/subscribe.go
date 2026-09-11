@@ -183,13 +183,27 @@ func (s *Server) handleNotify(req sip.Request, tx sip.ServerTransaction) {
 	// effects already applied.
 	switch ct {
 	case manscdp.CmdCatalog:
-		p := payload.(manscdp.CatalogNotify)
+		p, ok := payload.(manscdp.CatalogNotify)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid Catalog notify payload", nil)
+			return
+		}
 		slog.Info("gb28181: catalog change notified", "device", p.DeviceID, "channels", len(p.Item))
 		s.mergeCatalogChannels(p.DeviceID, p.Item)
 	case manscdp.CmdAlarm:
-		s.handleAlarm(payload.(manscdp.Alarm))
+		p, ok := payload.(manscdp.Alarm)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid Alarm notify payload", nil)
+			return
+		}
+		s.handleAlarm(p)
 	case manscdp.CmdMobilePosition:
-		s.handleMobilePosition(payload.(manscdp.MobilePosition))
+		p, ok := payload.(manscdp.MobilePosition)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid MobilePosition notify payload", nil)
+			return
+		}
+		s.handleMobilePosition(p)
 	default:
 		slog.Debug("gb28181: unhandled NOTIFY CmdType", "cmdtype", ct)
 	}

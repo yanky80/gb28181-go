@@ -634,6 +634,39 @@ func TestLoopbackRecordInfoQuery(t *testing.T) {
 	require.Contains(t, string(answer.Body()), "<SumNum>2</SumNum>", "both recordings must be reported")
 }
 
+func TestLoopbackTwoCameraCatalogTCPPromotionIsBounded(t *testing.T) {
+	_, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{
+		{ID: "cam-1", Name: "Front", Encoding: "h265"},
+		{ID: "cam-2", Name: "Back", Encoding: "h265"},
+	}}, newCascadeTestDB(t))
+
+	body, err := manscdp.Encode(manscdp.CatalogQuery{
+		CmdType: manscdp.CmdCatalog, SN: 8, DeviceID: lbChannelOne,
+	})
+	require.NoError(t, err)
+	res := up.roundTrip(up.request(sip.MESSAGE, lbChannelOne, string(body), "Application/MANSCDP+xml"))
+	require.Equal(t, 200, int(res.StatusCode()))
+
+	// Characterize gosip's current boundary: this two-camera response is
+	// promoted to TCP although the upper socket is UDP-only. Keep the probe
+	// bounded so the gateway suite cannot inherit the upstream shutdown hang.
+	buf := make([]byte, 65535)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		require.NoError(t, up.conn.SetReadDeadline(deadline))
+		n, _, readErr := up.conn.ReadFromUDP(buf)
+		if readErr != nil {
+			netErr, ok := readErr.(net.Error)
+			require.True(t, ok && netErr.Timeout())
+			break
+		}
+		msg, parseErr := parser.ParseMessage(buf[:n], log.NewDefaultLogrusLogger())
+		if req, ok := msg.(sip.Request); parseErr == nil && ok && req.Method() == sip.MESSAGE && strings.Contains(string(req.Body()), "<CmdType>Catalog</CmdType>") {
+			t.Fatal("two-camera Catalog unexpectedly arrived over UDP")
+		}
+	}
+}
+
 // createPacedPlaybackSegment writes a REAL 5-sample H.264 MP4 (2s per sample)
 // and registers its recording row. The pump streams samples at realtime pace
 // from base=now, so the dialog stays alive for ~10s — long enough for the
