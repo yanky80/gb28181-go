@@ -26,9 +26,6 @@ var (
 	ErrChannelStoreCorrupt  = errors.New("channel store is corrupt")
 	ErrChannelStoreVersion  = errors.New("unsupported channel store version")
 	ErrChannelStoreConflict = errors.New("channel store mapping conflict")
-
-	openChannelStoreDir = os.Open
-	syncChannelStoreDir = func(directory *os.File) error { return directory.Sync() }
 )
 
 type channelStoreFile struct {
@@ -47,9 +44,11 @@ type channelStoreChannel struct {
 // the gateway. Mutations are serialized so a failed disk write cannot publish
 // an in-memory mapping that was never persisted.
 type ChannelStore struct {
-	mu       sync.RWMutex
-	path     string
-	channels map[string]cascade.CascadeChannel
+	mu            sync.RWMutex
+	path          string
+	channels      map[string]cascade.CascadeChannel
+	openDirectory func(string) (*os.File, error)
+	syncDirectory func(*os.File) error
 }
 
 var _ cascade.Store = (*ChannelStore)(nil)
@@ -60,7 +59,12 @@ func NewChannelStore(path string) (*ChannelStore, error) {
 	if path == "" {
 		return nil, fmt.Errorf("channel store path is empty")
 	}
-	s := &ChannelStore{path: path, channels: make(map[string]cascade.CascadeChannel)}
+	s := &ChannelStore{
+		path:          path,
+		channels:      make(map[string]cascade.CascadeChannel),
+		openDirectory: os.Open,
+		syncDirectory: (*os.File).Sync,
+	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -319,12 +323,12 @@ func (s *ChannelStore) write(channels map[string]cascade.CascadeChannel) error {
 	}
 	removeTemp = false
 
-	directory, err := openChannelStoreDir(dir)
+	directory, err := s.openDirectory(dir)
 	if err != nil {
 		return fmt.Errorf("open channel store directory: %w", err)
 	}
 	defer directory.Close()
-	if err := syncChannelStoreDir(directory); err != nil {
+	if err := s.syncDirectory(directory); err != nil {
 		return fmt.Errorf("sync channel store directory: %w", err)
 	}
 	s.channels = channels

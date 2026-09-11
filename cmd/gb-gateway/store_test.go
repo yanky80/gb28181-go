@@ -280,6 +280,7 @@ func TestChannelStoreWriteFailureDoesNotPublishMapping(t *testing.T) {
 }
 
 func TestChannelStoreRetriesAfterDirectoryFault(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		allocate bool
@@ -291,25 +292,21 @@ func TestChannelStoreRetriesAfterDirectoryFault(t *testing.T) {
 		{name: "allocate sync", allocate: true, fault: "sync"},
 	}
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			path := filepath.Join(t.TempDir(), "channels.json")
 			store, err := NewChannelStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			originalOpen := openChannelStoreDir
-			originalSync := syncChannelStoreDir
-			t.Cleanup(func() {
-				openChannelStoreDir = originalOpen
-				syncChannelStoreDir = originalSync
-			})
 			if tt.fault == "open" {
-				openChannelStoreDir = func(string) (*os.File, error) {
+				store.openDirectory = func(string) (*os.File, error) {
 					return nil, errors.New("injected directory open failure")
 				}
 			} else {
-				syncChannelStoreDir = func(*os.File) error {
+				store.syncDirectory = func(*os.File) error {
 					return errors.New("injected directory sync failure")
 				}
 			}
@@ -336,8 +333,8 @@ func TestChannelStoreRetriesAfterDirectoryFault(t *testing.T) {
 				t.Fatalf("channels after failed write = %#v, want empty", channels)
 			}
 
-			openChannelStoreDir = originalOpen
-			syncChannelStoreDir = originalSync
+			store.openDirectory = os.Open
+			store.syncDirectory = (*os.File).Sync
 			if tt.allocate {
 				channel, err = store.AllocateCascadeChannel(ctx, channel.CameraID, "3402000000132", channel.Name)
 			} else {
