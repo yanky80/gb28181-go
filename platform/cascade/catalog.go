@@ -18,8 +18,8 @@ var catalogAllocationMu sync.Mutex
 // with GB channel IDs allocated on first sight and persisted
 // (cascade_channels) so the upper platform's bindings survive restarts.
 // Format: <LocalDeviceID[:10]> + "132" + 7-digit serial.
-func (s *Service) catalogItems() ([]manscdp.Item, error) {
-	ctx := s.storeContext()
+func (s *Service) catalogItems(ctxs ...context.Context) ([]manscdp.Item, error) {
+	ctx := s.storeContext(ctxs...)
 	cams := s.src.Cameras()
 
 	alloc := map[string]string{} // cameraID → gbChannelID

@@ -250,6 +250,37 @@ func TestBareCallID(t *testing.T) {
 	require.Equal(t, "", bareCallID(""))
 }
 
+func TestPlaybackFinishCannotDeleteReplacement(t *testing.T) {
+	svc := New(testCfg(), fakeSource{}, newCascadeTestDB(t))
+	oldConn, oldPeer := net.Pipe()
+	newConn, newPeer := net.Pipe()
+	t.Cleanup(func() {
+		_ = oldPeer.Close()
+		_ = newPeer.Close()
+	})
+	old := &playbackSession{svc: svc, callID: "same-call", conn: oldConn, done: make(chan struct{})}
+	replacement := &playbackSession{svc: svc, callID: "same-call", conn: newConn, done: make(chan struct{})}
+	svc.mu.Lock()
+	svc.playbacks[old.callID] = old
+	svc.mu.Unlock()
+
+	svc.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		old.finish("natural end", false)
+		close(done)
+	}()
+	require.Eventually(t, old.closed.Load, time.Second, time.Millisecond)
+	svc.playbacks[old.callID] = replacement
+	svc.mu.Unlock()
+	<-done
+
+	svc.mu.Lock()
+	got := svc.playbacks[old.callID]
+	svc.mu.Unlock()
+	require.Same(t, replacement, got, "old natural completion must not delete a replacement")
+}
+
 // TestDownloadFastPump: an s=Download dialog streams the whole window without
 // 1x pacing — 165ms of media must land nearly instantly (playback pacing
 // would take at least the media duration).

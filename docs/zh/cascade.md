@@ -74,14 +74,19 @@ svc.Start(ctx)
 `SegmentInfo`（编码 + 参数集 + 带时间戳的 sample）；fMP4 管线的宿主
 用一个薄包装适配自己的解析器即可（字段名已对齐）。
 
+未配置 `Store` 或 `SegmentParser` 时，Playback/Download INVITE 会在发送
+`200 OK` 前以 `503` 拒绝。`RecordInfo` 仍可诊断：没有 `Store` 时返回空结果。
+回放查询窗口采用半开区间；空窗口返回 `404`，非法时间范围返回 `400`，
+录像结果按每页 40 条分页，`SumNum` 表示总数。
+
 ## 上级平台看到什么
 
 - **目录**——你的相机作为通道上报，**通道 ID 按首次出现保持稳定**
   （向上身份跨重启不变）。
 - **直播**——上级的 INVITE 订阅你的 `FrameHub`，经 `psmux` 推
   RTP/PS 上行（UDP 或 TCP）。
-- **回放**——RecordInfo 来自你的 `Store`；回放 INVITE 把录像段灌进
-  同一条媒体路径。
+- **回放**——RecordInfo 来自你的 `Store`；能力已配置的回放 INVITE 才会
+  把录像段灌进同一条媒体路径。
 - **信令**——BYE/SUBSCRIBE/MESSAGE/INFO/OPTIONS 全部应答。
 
 支持多个上级平台（`upstreams` 配置）；每个是共享 listener 上的独立

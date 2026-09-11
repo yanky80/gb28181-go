@@ -79,6 +79,12 @@ yields `SegmentInfo` (codec + parameter sets + timestamped samples)
 per segment file; hosts with an fMP4 pipeline adapt their parser with
 a thin wrapper (field names already match).
 
+Playback and Download INVITEs are rejected with `503` before `200 OK` when
+either `Store` or `SegmentParser` is not configured. `RecordInfo` remains
+diagnosable: without a `Store` it returns an empty result. Playback windows
+are half-open, empty windows return `404`, invalid ranges return `400`, and
+recording results are paged in batches of 40 with `SumNum` carrying the total.
+
 For recorded segments in the supported fragmented MP4 format,
 `platform/mp4.ParseSegment` can be passed directly to `SetSegmentParser`.
 Its H.264/H.265 samples use 4-byte big-endian NAL length prefixes;
@@ -90,8 +96,8 @@ other `lengthSizeMinusOne` values are rejected.
   channel IDs** (upward identity survives restarts).
 - **Live** — INVITEs from above subscribe your `FrameHub`, flow
   through `psmux`, and push RTP/PS upward (UDP or TCP).
-- **Playback** — RecordInfo from your `Store`; playback INVITEs pump
-  recorded segments through the same media path.
+- **Playback** — RecordInfo from your `Store`; configured playback INVITEs
+  pump recorded segments through the same media path.
 - **Signaling** — BYE/SUBSCRIBE/MESSAGE/INFO/OPTIONS all answered.
 
 Multiple upper platforms are supported (`upstreams` config); each is

@@ -15,7 +15,7 @@
 - H.265 PS/RTP 已有，PSM stream type 为 `0x24`（`psmux/mux.go:13-18,52-63`）。
 - `cascade.Config` 没有 `ProtocolVersion`，REGISTER 构造/发送没有 `X-GB-Ver`，也没有上级版本解析或 `VERSION_MISMATCH` 状态（`platform/cascade/seam.go:8-71`; `platform/cascade/service.go:434-472,504-545`）。
 - `cmd/gb-gateway`、UDS 服务端、CameraRegistry、GatewayStore 实现、PTZAdapter、fMP4 parser/index 和 `docs/edge-ipc.md` 均不存在；这些现在明确属于本仓（设计 `:256-294,769-807`）。
-- DeviceStatus、动态 ON/OFF、主直播流 acquire/release、完整源可用性和回放能力门控仍缺失（设计 `:283-292`；代码 `platform/cascade/service.go:53-65,642-673`; `platform/cascade/catalog.go:62-74`）。
+- DeviceStatus、动态 ON/OFF、主直播流 acquire/release 和完整源可用性仍缺失；回放能力门控已由 issue #14 补齐：未配置 Store/SegmentParser 时 Playback/Download 在 200 OK 前拒绝（设计 `:283-292`；代码 `platform/cascade/service.go`, `platform/cascade/playback.go`）。
 
 因此 Wayfinder 地图必须以 2022/H.265 为主干，并覆盖本仓的协议 profile、网关宿主、PTZ 和回放；旧地图中“2016/H.264 主路径”“H.265 条件启用”以及“网关宿主在盒端仓库”的决定全部作废。
 
@@ -54,7 +54,7 @@ PTZ、回放、网关归属和两仓 seam 未再次改变：PTZ 仍是阶段 2�
 | SDP/来源 | TCP-active 仅接受 `setup:passive`；只接受配置上级（设计 `:298-305,650-656`） | 任意 TCP/RTP/AVP 均设 TCP；未知多上级回退首项（`platform/cascade/media.go:98-138`; `platform/cascade/service.go:412-432`） | **边界缺口** |
 | UDS/WAIT_IDR | 严格 framing、sequence/epoch、完整参数集和 3 秒 IDR 超时（设计 `:307-396`） | FrameHub 仅有界丢帧，无 UDS/epoch/WAIT_IDR（`platform/framehub.go:14-35,61-113`） | **网关缺口** |
 | PTZ | Adapter、幂等/超时 Stop、拒绝并审计无等价命令（设计 `:488-505`） | 基础方向/对角/zoom/stop 与拒绝路径已有；无 Adapter、租约超时或审计 sink（`platform/cascade/records.go:101-169,189-233`） | **内核已有，宿主缺口** |
-| 回放 | index、fMP4 parser、H.264 AVCC/H.265 HVCC、跨片段控制；未就绪时关闭（设计 `:519-555`） | Store/SegmentParser seam 和控制泵已有；nil parser 仍可先答 INVITE（`platform/cascade/seam.go:118-181`; `platform/cascade/playback.go:68-160`; `platform/cascade/service.go:82-85,188-197`） | **框架已有，交付缺口** |
+| 回放 | index、fMP4 parser、H.264 AVCC/H.265 HVCC、跨片段控制；未就绪时关闭（设计 `:519-555`） | Store/SegmentParser seam 和控制泵已有；issue #14 增加 nil capability 门控、空窗口/半开窗口、分页时区和片段元数据预检 | **能力门控已关闭；索引/parser 仍是交付缺口** |
 | 发布 | 同提交构建 `cmd/gb-gateway`，arm64 无 cgo 独立附件（设计 `:801-807`） | Go 1.26；release workflow 已存在，但无 gateway target（`go.mod:1-10`; `.github/workflows/release.yml`） | **目标缺失** |
 
 ## Wayfinder 地图/任务影响

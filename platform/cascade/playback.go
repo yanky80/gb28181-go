@@ -1,6 +1,7 @@
 package cascade
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -34,14 +35,15 @@ const pbMaxWindow = 24 * time.Hour
 // playbackSession is one s=Playback / s=Download dialog: local recordings →
 // psmux → RTP/UDP toward the upper platform's receive address.
 type playbackSession struct {
-	svc      *Service
-	callID   string
-	channel  string // GB channel ID the upper platform INVITEd
-	camera   string // local camera ID
-	upper    *upper // owning upper platform (#370 dialog routing)
-	start    time.Time
-	end      time.Time
-	download bool // s=Download: send at file speed, no 1x pacing (#378)
+	svc        *Service
+	callID     string
+	channel    string // GB channel ID the upper platform INVITEd
+	camera     string // local camera ID
+	upper      *upper // owning upper platform (#370 dialog routing)
+	generation uint64
+	start      time.Time
+	end        time.Time
+	download   bool // s=Download: send at file speed, no 1x pacing (#378)
 
 	conn    net.Conn
 	ssrc    uint32
@@ -69,7 +71,7 @@ type pbCtrl struct {
 // a sendonly s= answer, and pump the media. Downloads skip the 1x pacing and
 // stream at file speed. 404 when the channel is unknown or the window holds
 // no recordings (the platform surfaces that as a fetch error).
-func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP, u *upper) {
+func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP, u *upper, generation uint64) {
 	cameraID, ok := s.cameraOfChannel(channelID)
 	if !ok {
 		slog.Warn("gb28181-cascade: playback INVITE for unknown channel", "channel", channelID)
@@ -95,6 +97,9 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		_, _ = s.srv.RespondOnRequest(req, 400, "Playback without time range", "", nil)
 		return
 	}
+	s.mu.Lock()
+	current := s.playbacks[callID]
+	s.mu.Unlock()
 	start := time.Unix(sd.t0, 0)
 	end := time.Unix(sd.t1, 0)
 	if !end.After(start) {
@@ -104,9 +109,22 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	if end.Sub(start) > pbMaxWindow {
 		end = start.Add(pbMaxWindow)
 	}
-	recs, err := s.playbackRecordings(cameraID, start, end)
+	if current != nil && abs64(sd.t0-current.start.Unix()) < 2 && abs64(sd.t1-current.end.Unix()) < 2 {
+		_, _ = s.srv.RespondOnRequest(req, 200, "OK", current.sdpBody, nil)
+		return
+	}
+	ctx := s.storeContext()
+	recs, err := s.playbackRecordings(ctx, cameraID, start, end)
 	if err != nil {
-		_, _ = s.srv.RespondOnRequest(req, 500, "Playback Unavailable", "", nil)
+		if ctx.Err() != nil {
+			_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+		} else {
+			_, _ = s.srv.RespondOnRequest(req, 500, "Recording Store Unavailable", "", nil)
+		}
+		return
+	}
+	if s.stopping.Load() || ctx.Err() != nil {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
 		return
 	}
 	if len(recs) == 0 {
@@ -173,10 +191,11 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
 		upper: u, start: start, end: end, download: sdpName == "Download",
 		conn: conn, ssrc: sd.ssrc,
-		mux:  psmux.New(),
-		rtp:  rtp,
-		ctrl: make(chan pbCtrl, 8),
-		done: make(chan struct{}),
+		generation: generation,
+		mux:        psmux.New(),
+		rtp:        rtp,
+		ctrl:       make(chan pbCtrl, 8),
+		done:       make(chan struct{}),
 	}
 	ps.sdpBody = fmt.Sprintf(
 		"v=0\r\no=- 0 0 IN IP4 %s\r\ns=%s\r\nc=IN IP4 %s\r\nt=%s %s\r\n"+
@@ -191,8 +210,12 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	}
 
 	s.mu.Lock()
+	old := s.playbacks[callID]
 	s.playbacks[callID] = ps
 	s.mu.Unlock()
+	if old != nil {
+		old.stop()
+	}
 
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", ps.sdpBody, nil)
 	go ps.pump()
@@ -206,11 +229,11 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 // start is padded — ListRecordings filters on "started_at within window", so
 // a recording straddling the window start would otherwise be missed; the
 // sample-level wall-time trim in playOnce aligns playback to the exact edge.
-func (s *Service) playbackRecordings(cameraID string, start, end time.Time) ([]Recording, error) {
+func (s *Service) playbackRecordings(ctx context.Context, cameraID string, start, end time.Time) ([]Recording, error) {
 	if s.db == nil {
 		return nil, fmt.Errorf("cascade: no recording store")
 	}
-	recs, err := s.db.ListRecordings(s.storeContext(), RecordingFilter{
+	recs, err := s.db.ListRecordings(ctx, RecordingFilter{
 		CameraID:  cameraID,
 		StartTime: start.Add(-2 * time.Hour),
 		EndTime:   end,
@@ -268,7 +291,8 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 	if math.IsNaN(seekNPT) || math.IsInf(seekNPT, 0) || seekNPT < 0 {
 		return false, nil, fmt.Errorf("invalid seek position %v", seekNPT)
 	}
-	recs, err := ps.svc.playbackRecordings(ps.camera, ps.start, ps.end)
+	ctx := ps.svc.storeContext()
+	recs, err := ps.svc.playbackRecordings(ctx, ps.camera, ps.start, ps.end)
 	if err != nil {
 		slog.Warn("gb28181-cascade: playback recordings query failed",
 			"camera", ps.camera, "error", err)
@@ -546,7 +570,9 @@ func (ps *playbackSession) finish(reason string, bye bool) {
 	}
 	close(ps.done)
 	ps.svc.mu.Lock()
-	delete(ps.svc.playbacks, ps.callID)
+	if current := ps.svc.playbacks[ps.callID]; current == ps {
+		delete(ps.svc.playbacks, ps.callID)
+	}
 	ps.svc.mu.Unlock()
 	_ = ps.conn.Close()
 	if bye {
@@ -579,21 +605,15 @@ func (s *Service) onInfo(req sip.Request, _ sip.ServerTransaction) {
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
 	}
+	if !s.requireDialogOwner(req, u) {
+		return
+	}
 	s.mu.Lock()
-	ms := s.sessions[callID]
 	ps := s.playbacks[callID]
 	s.mu.Unlock()
 	if ps == nil {
-		if ms != nil && ms.upper != u {
-			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-			return
-		}
 		_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 		return // INFO on a live-forward dialog: nothing to control
-	}
-	if ps.upper != u {
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-		return
 	}
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 

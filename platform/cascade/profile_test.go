@@ -584,6 +584,7 @@ func TestH265PlaybackRejectsMismatchedParsedCodec(t *testing.T) {
 		_ = svc.Stop()
 	})
 	require.NoError(t, svc.Start(context.Background()))
+	svc.setOnline(svc.uppers[0], true)
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
 	now := time.Now().UTC()

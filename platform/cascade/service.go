@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net"
 	"regexp"
 	"strconv"
@@ -85,6 +86,9 @@ type upper struct {
 	cfg                 Upstream // resolved — defaults filled in
 	online              bool
 	regTS               time.Time
+	wake                chan struct{}
+	generation          atomic.Uint64
+	stale               atomic.Bool
 	protocolVersion     string
 	protocolVersionSeen bool
 }
@@ -129,10 +133,17 @@ type Service struct {
 	// New; per-upper Backoff objects live inside registerLoop.
 	retryBase time.Duration
 	retryMax  time.Duration
+	retryMu   sync.Mutex
+	retryRand func(int64) int64
+	now       func() time.Time
+	wait      func(context.Context, time.Duration, <-chan struct{}) bool
 
 	uppers []*upper // #370: one entry per upper platform
 
-	mu         sync.Mutex
+	mu sync.Mutex
+	// ponytail: one global admission lock; split by upper only if INVITE
+	// throughput makes serialized admission measurable.
+	stopDone   chan struct{}
 	sessions   map[string]*mediaSession    // SIP Call-ID → active live forward
 	playbacks  map[string]*playbackSession // SIP Call-ID → active playback dialog
 	subs       map[string]*catalogSub      // catalog subscriptions (SUBSCRIBE → NOTIFY, #370)
@@ -159,7 +170,7 @@ func buildUppers(cfg Config) []*upper {
 			Password:          cfg.Password,
 			HeartbeatInterval: cfg.HeartbeatInterval,
 			RegisterExpires:   cfg.RegisterExpires,
-		}})
+		}, wake: make(chan struct{}, 1)})
 	}
 	for _, u := range cfg.Upstreams {
 		if u.ServerAddr == "" {
@@ -180,7 +191,7 @@ func buildUppers(cfg Config) []*upper {
 		if u.RegisterExpires == 0 {
 			u.RegisterExpires = cfg.RegisterExpires
 		}
-		uppers = append(uppers, &upper{cfg: u})
+		uppers = append(uppers, &upper{cfg: u, wake: make(chan struct{}, 1)})
 	}
 	return uppers
 }
@@ -194,19 +205,31 @@ func (s *Service) SetSubStreamAcquirer(a SubStreamAcquirer) { s.subAcq = a }
 func (s *Service) SetMainStreamAcquirer(a MainStreamAcquirer) { s.mainAcq = a }
 
 func New(cfg Config, src CameraSource, db Store) *Service {
+	retryBase := parseRetryDuration(cfg.RegisterRetryBase, registerRetryBaseDefault)
+	retryMax := parseRetryDuration(cfg.RegisterRetryMax, registerRetryMaxDefault)
+	if retryMax < retryBase {
+		retryMax = retryBase
+	}
 	return &Service{
 		cfg: cfg, src: src, db: db,
-		retryBase:       parseRetryDuration(cfg.RegisterRetryBase, registerRetryBaseDefault),
-		retryMax:        parseRetryDuration(cfg.RegisterRetryMax, registerRetryMaxDefault),
+		retryBase:       retryBase,
+		retryMax:        retryMax,
+		retryRand:       rand.Int63n,
+		now:             time.Now,
+		wait:            waitCtx,
 		uppers:          buildUppers(cfg),
 		sessions:        make(map[string]*mediaSession),
 		playbacks:       make(map[string]*playbackSession),
 		subs:            make(map[string]*catalogSub),
 		channelBindings: make(map[string]string),
+		stopDone:        make(chan struct{}),
 	}
 }
 
-func (s *Service) storeContext() context.Context {
+func (s *Service) storeContext(ctxs ...context.Context) context.Context {
+	if len(ctxs) > 0 && ctxs[0] != nil {
+		return ctxs[0]
+	}
 	s.storeMu.RLock()
 	ctx := s.storeCtx
 	if ctx == nil {
@@ -241,18 +264,24 @@ func (s *Service) resetStoreContext() {
 	}
 }
 
-// NotifyNetworkChange cancels in-flight Store work and gives later work a
-// fresh context after the host's network identity changes.
-func (s *Service) NotifyNetworkChange() {
-	s.cancelStoreContext()
-	s.resetStoreContext()
+// SetRegisterRetryRandomSource replaces the bounded-jitter source. It is a
+// wiring/test seam and should be called before Start; nil restores the
+// standard-library source.
+func (s *Service) SetRegisterRetryRandomSource(random func(int64) int64) {
+	if random == nil {
+		random = rand.Int63n
+	}
+	s.retryMu.Lock()
+	s.retryRand = random
+	s.retryMu.Unlock()
 }
 
 // REGISTER retry backoff bounds (issue #44): base doubles per
 // consecutive failure, capped; a successful registration resets.
 const (
-	registerRetryBaseDefault = time.Second
-	registerRetryMaxDefault  = 5 * time.Minute
+	registerRetryBaseDefault   = time.Second
+	registerRetryMaxDefault    = 5 * time.Minute
+	registerRetryJitterDivisor = 10 // positive jitter is bounded to 10% of wait
 )
 
 // parseRetryDuration parses a config duration, falling back to def for
@@ -399,6 +428,11 @@ func (s *Service) Start(ctx context.Context) error {
 	_ = srv.OnRequest(sip.INFO, s.onInfo)
 
 	if len(s.uppers) == 0 {
+		s.stopping.Store(true)
+		if s.cancel != nil {
+			s.cancel()
+		}
+		srv.Shutdown()
 		return fmt.Errorf("gb28181-cascade: no upper platform configured (server_addr / upstreams)")
 	}
 	for _, u := range s.uppers {
@@ -407,6 +441,10 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	s.wg.Add(1)
 	go s.catalogNotifyLoop() //nolint:contextcheck // the loop reads Service.ctx directly (struct field)
+	go func() {
+		<-s.ctx.Done()
+		_ = s.Stop()
+	}()
 	slog.Info("gb28181-cascade: started",
 		"listen", listen, "uppers", len(s.uppers), "device", s.cfg.LocalDeviceID)
 	return nil
@@ -418,13 +456,14 @@ func (s *Service) Stop() error {
 }
 
 func (s *Service) stop() error {
+	defer close(s.stopDone)
 	s.stopping.Store(true)
 	s.cancelStoreContext()
 	if s.cancel != nil {
 		s.cancel()
 	}
-	// Wait for an INVITE already in the admission critical section. New
-	// INVITEs observe stopping and reject before acquiring any lease.
+	// Stop must not race an INVITE that is acquiring a stream or creating a
+	// dialog. New INVITEs reject before entering this critical section.
 	s.admissionMu.Lock()
 	s.admissionMu.Unlock()
 	s.wg.Wait()
@@ -440,9 +479,15 @@ func (s *Service) stop() error {
 	for _, ps := range s.playbacks {
 		playbacks = append(playbacks, ps)
 	}
+	subs := make([]*catalogSub, 0, len(s.subs))
+	for _, sub := range s.subs {
+		subs = append(subs, sub)
+	}
 	s.playbacks = make(map[string]*playbackSession)
+	s.subs = make(map[string]*catalogSub)
 	for _, u := range s.uppers {
 		u.online = false
+		u.regTS = time.Time{}
 	}
 	s.mu.Unlock()
 	for _, ms := range sessions {
@@ -450,6 +495,13 @@ func (s *Service) stop() error {
 	}
 	for _, ps := range playbacks {
 		ps.stop()
+	}
+	for _, sub := range subs {
+		if sub.cancel != nil {
+			sub.cancel()
+		}
+		sub.sendMu.Lock()
+		sub.sendMu.Unlock()
 	}
 	if s.srv != nil {
 		for _, u := range s.uppers {
@@ -465,6 +517,7 @@ func (s *Service) stop() error {
 
 func (s *Service) registerLoop(u *upper) {
 	defer s.wg.Done()
+	defer s.setOnline(u, false)
 	expires := u.cfg.RegisterExpires
 	if expires <= 0 {
 		expires = 3600
@@ -474,18 +527,25 @@ func (s *Service) registerLoop(u *upper) {
 		if s.ctx.Err() != nil {
 			return
 		}
+		generation := u.generation.Load()
 		if err := s.sendRegister(u, expires); err != nil {
-			wait := retry.Next()
+			wait := s.jitterRetry(retry.Next())
 			slog.Warn("gb28181-cascade: register failed, retrying",
 				"upper", u.cfg.ServerAddr, "retry_in", wait.String(), "error", err)
 			s.setOnline(u, false)
-			if !sleepCtx(s.ctx, wait) {
+			if !s.wait(s.ctx, wait, u.wake) {
 				return
 			}
 			continue
 		}
+		if u.generation.Load() != generation {
+			drainWake(u.wake)
+			continue
+		}
+		if !s.setOnlineForGeneration(u, true, generation) {
+			continue
+		}
 		retry.Reset()
-		s.setOnline(u, true)
 		// Keepalive cadence while registered.
 		hb := 60 * time.Second
 		if d, err := time.ParseDuration(u.cfg.HeartbeatInterval); err == nil && d > 0 {
@@ -493,8 +553,11 @@ func (s *Service) registerLoop(u *upper) {
 		}
 		reRegister := time.Duration(expires)*8/10*time.Second - hb
 		for i := time.Duration(0); i < reRegister; i += hb {
-			if !sleepCtx(s.ctx, hb) {
+			if !s.wait(s.ctx, hb, u.wake) {
 				return
+			}
+			if u.generation.Load() != generation {
+				break
 			}
 			if err := s.sendKeepalive(u); err != nil {
 				// A keepalive failure usually means the upper platform
@@ -511,13 +574,33 @@ func (s *Service) registerLoop(u *upper) {
 }
 
 func (s *Service) setOnline(u *upper, v bool) {
+	if u == nil {
+		return
+	}
+	s.setOnlineForGeneration(u, v, u.generation.Load())
+}
+
+func (s *Service) setOnlineForGeneration(u *upper, v bool, generation uint64) bool {
+	if u == nil {
+		return false
+	}
 	s.mu.Lock()
+	if u.generation.Load() != generation {
+		s.mu.Unlock()
+		return false
+	}
 	changed := u.online != v
 	u.online = v
 	if v {
-		u.regTS = time.Now()
+		u.regTS = s.now()
+		u.stale.Store(false)
+	} else if changed {
+		u.regTS = time.Time{}
 	}
 	s.mu.Unlock()
+	if !v {
+		s.closeUpperDialogs(u)
+	}
 	if changed {
 		state := "offline"
 		if v {
@@ -526,6 +609,7 @@ func (s *Service) setOnline(u *upper, v bool) {
 		slog.Info("gb28181-cascade: registration state",
 			"upper", u.cfg.ServerAddr, "state", state)
 	}
+	return true
 }
 
 // Online reports the registration state (diagnostics).
@@ -583,7 +667,116 @@ func (s *Service) RegistrationSince() (time.Duration, bool) {
 	if oldest.IsZero() {
 		return 0, false
 	}
-	return time.Since(oldest), true
+	return s.now().Sub(oldest), true
+}
+
+// NotifyNetworkChange invalidates every upper-platform dialog and wakes each
+// registration loop. A changed local address/NAT mapping makes old SIP and
+// media dialogs unusable even when the registration state was still online.
+func (s *Service) NotifyNetworkChange() {
+	s.cancelStoreContext()
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	s.resetStoreContext()
+	for _, u := range s.uppers {
+		s.mu.Lock()
+		u.generation.Add(1)
+		u.stale.Store(true)
+		u.online = false
+		u.regTS = time.Time{}
+		s.mu.Unlock()
+		s.closeUpperDialogsLocked(u)
+		if u.wake != nil {
+			select {
+			case u.wake <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+func (s *Service) closeUpperDialogs(u *upper) {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	s.closeUpperDialogsLocked(u)
+}
+
+func (s *Service) closeUpperDialogsLocked(u *upper) {
+	s.mu.Lock()
+	var sessions []*mediaSession
+	for callID, ms := range s.sessions {
+		if ms.upper == u {
+			delete(s.sessions, callID)
+			sessions = append(sessions, ms)
+		}
+	}
+	var playbacks []*playbackSession
+	for callID, ps := range s.playbacks {
+		if ps.upper == u {
+			delete(s.playbacks, callID)
+			playbacks = append(playbacks, ps)
+		}
+	}
+	var subs []*catalogSub
+	for callID, sub := range s.subs {
+		if sub.upper == u {
+			delete(s.subs, callID)
+			subs = append(subs, sub)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, ms := range sessions {
+		ms.stop()
+	}
+	for _, ps := range playbacks {
+		ps.stop()
+	}
+	for _, sub := range subs {
+		if sub.cancel != nil {
+			sub.cancel()
+		}
+		sub.sendMu.Lock()
+		sub.sendMu.Unlock()
+	}
+}
+
+func (s *Service) jitterRetry(wait time.Duration) time.Duration {
+	if wait <= 0 {
+		return wait
+	}
+	jitter := wait / registerRetryJitterDivisor
+	low := wait - jitter
+	high := wait + jitter
+	if high > s.retryMax {
+		high = s.retryMax
+	}
+	if low < 0 {
+		low = 0
+	}
+	span := high - low
+	if span <= 0 {
+		return wait
+	}
+	s.retryMu.Lock()
+	n := s.retryRand(int64(span) + 1)
+	s.retryMu.Unlock()
+	if n < 0 {
+		n = 0
+	} else if n > int64(span) {
+		n = int64(span)
+	}
+	return low + time.Duration(n)
+}
+
+func drainWake(wake <-chan struct{}) {
+	if wake == nil {
+		return
+	}
+	select {
+	case <-wake:
+	default:
+	}
 }
 
 // ForwardCount returns the number of active media dialogs (live forwards +
@@ -652,6 +845,43 @@ func (s *Service) requireUpper(req sip.Request) *upper {
 	return nil
 }
 
+func requestCallID(req sip.Request) string {
+	if req == nil {
+		return ""
+	}
+	if h, ok := req.CallID(); ok {
+		return h.String()
+	}
+	return ""
+}
+
+// requireDialogOwner enforces Call-ID ownership after source authentication
+// and before any dialog-specific gate or Store lookup. The caller owns the
+// admission/lifecycle lock when it needs ordering against BYE or replacement.
+func (s *Service) requireDialogOwner(req sip.Request, u *upper) bool {
+	callID := requestCallID(req)
+	if callID == "" {
+		return true
+	}
+	s.mu.Lock()
+	foreign := false
+	if ms := s.sessions[callID]; ms != nil && ms.upper != u {
+		foreign = true
+	}
+	if ps := s.playbacks[callID]; ps != nil && ps.upper != u {
+		foreign = true
+	}
+	if sub := s.subs[callID]; sub != nil && sub.upper != u {
+		foreign = true
+	}
+	s.mu.Unlock()
+	if foreign {
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return false
+	}
+	return true
+}
+
 func (s *Service) onOptions(req sip.Request, _ sip.ServerTransaction) {
 	if s.requireUpper(req) == nil {
 		return
@@ -661,17 +891,7 @@ func (s *Service) onOptions(req sip.Request, _ sip.ServerTransaction) {
 }
 
 func (s *Service) upperForDeviceStatus(req sip.Request) *upper {
-	from, ok := req.From()
-	if !ok || from.Address == nil {
-		return nil
-	}
-	user := from.Address.User().String()
-	for _, u := range s.uppers {
-		if u.cfg.ServerDomain == user {
-			return u
-		}
-	}
-	return nil
+	return s.requireUpper(req)
 }
 
 // buildCoreRequest assembles a REGISTER/MESSAGE request toward the upper
@@ -920,14 +1140,6 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 400, "Bad MANSCDP", "", nil)
 		return
 	}
-	if cmd == manscdp.CmdDeviceStatus {
-		statusUpper := s.upperForDeviceStatus(req)
-		if statusUpper == nil {
-			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-			return
-		}
-		u = statusUpper
-	}
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	switch cmd {
 	case manscdp.CmdCatalog:
@@ -950,7 +1162,7 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 		// never reaches the cascade.
 		if q, ok := payload.(manscdp.RecordInfoQuery); ok && q.SN > 0 {
 			s.admissionMu.Lock()
-			if s.stopping.Load() || s.storeContext().Err() != nil {
+			if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
 				s.admissionMu.Unlock()
 				return
 			}
@@ -1061,6 +1273,19 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	select {
 	case <-ctx.Done():
 		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func waitCtx(ctx context.Context, d time.Duration, wake <-chan struct{}) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-wake:
+		return true
 	case <-t.C:
 		return true
 	}

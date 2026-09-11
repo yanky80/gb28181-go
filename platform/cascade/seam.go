@@ -201,5 +201,6 @@ type SegmentSample struct {
 }
 
 // SegmentParser reads one recorded segment file. Injected by the host;
-// nil disables cascade playback (RecordInfo still answers if a Store is set).
+// nil makes Playback/Download INVITEs fail closed (RecordInfo still answers
+// if a Store is set).
 type SegmentParser func(filePath string) (*SegmentInfo, error)

@@ -26,11 +26,12 @@ import (
 // Audio passthrough lands together with a hub-level law field (#364
 // follow-up).
 type mediaSession struct {
-	svc     *Service
-	callID  string
-	channel string // GB channel ID the upper platform INVITEd
-	camera  string // local camera ID
-	upper   *upper // owning upper platform (#370 dialog routing)
+	svc        *Service
+	callID     string
+	channel    string // GB channel ID the upper platform INVITEd
+	camera     string // local camera ID
+	upper      *upper // owning upper platform (#370 dialog routing)
+	generation uint64
 
 	conn net.Conn     // UDP socket or the dialed TCP media connection
 	dst  *net.UDPAddr // nil for TCP media
@@ -238,24 +239,40 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	}
 	_, channelID := reqIDs(req)
 
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if !s.requireDialogOwner(req, u) {
+		return
+	}
 	sd, err := sdpFromInvite([]byte(req.Body()))
 	if err != nil {
 		slog.Warn("gb28181-cascade: INVITE SDP parse failed", "error", err)
 		_, _ = s.srv.RespondOnRequest(req, 400, "Bad SDP", "", nil)
 		return
 	}
-
-	s.admissionMu.Lock()
-	defer s.admissionMu.Unlock()
-	if s.stopping.Load() {
+	if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
 		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+		return
+	}
+	s.mu.Lock()
+	generation := u.generation.Load()
+	admitted := u.online && !u.stale.Load() && generation == u.generation.Load()
+	s.mu.Unlock()
+	if !admitted {
+		if cameraID, ok := s.cameraOfChannel(channelID); ok {
+			if cam, exists := s.cameraInfo(cameraID); exists && !s.mediaVersionAllowed(u, cam) {
+				_, _ = s.srv.RespondOnRequest(req, 488, StatusVersionMismatch, "", nil)
+				return
+			}
+		}
+		_, _ = s.srv.RespondOnRequest(req, 503, "Registration Pending", "", nil)
 		return
 	}
 
 	// Playback/download dialogs take the recordings-backed path (download =
 	// same pump without 1x pacing, #378).
 	if strings.EqualFold(sd.name, "Playback") || strings.EqualFold(sd.name, "Download") {
-		s.onPlaybackInvite(req, callID, channelID, sd, u)
+		s.onPlaybackInvite(req, callID, channelID, sd, u, generation)
 		return
 	}
 	cameraID, ok := s.cameraOfChannel(channelID)
@@ -278,22 +295,12 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	// for a live playback restarts it when the requested window moved.
 	s.mu.Lock()
 	if ms, ok := s.sessions[callID]; ok {
-		if ms.upper != u {
-			s.mu.Unlock()
-			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-			return
-		}
 		sdp := ms.sdpBody
 		s.mu.Unlock()
 		_, _ = s.srv.RespondOnRequest(req, 200, "OK", sdp, nil)
 		return
 	}
 	if ps, ok := s.playbacks[callID]; ok {
-		if ps.upper != u {
-			s.mu.Unlock()
-			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-			return
-		}
 		sameWindow := sd.hasT && abs64(sd.t0-ps.start.Unix()) < 2 && abs64(sd.t1-ps.end.Unix()) < 2
 		if sameWindow {
 			sdp := ps.sdpBody
@@ -307,14 +314,13 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	} else {
 		s.mu.Unlock()
 	}
-
 	// Supersede synchronously so the replacement never overlaps the old
 	// session's Hub subscription or main-stream lease. Admission is serialized
 	// above, so concurrent new dialogs cannot replace each other out of order.
 	var replaced []*mediaSession
 	s.mu.Lock()
 	for otherID, other := range s.sessions {
-		if otherID != callID && other.channel == channelID {
+		if otherID != callID && other.upper == u && other.channel == channelID {
 			delete(s.sessions, otherID)
 			replaced = append(replaced, other)
 		}
@@ -373,6 +379,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
 		upper: u,
 		conn:  conn, dst: dst, ssrc: sd.ssrc,
+		generation:  generation,
 		releaseMain: releaseMain,
 		mux:         psmux.New(),
 		withAudio:   strings.Contains(string(req.Body()), "m=audio"),
@@ -419,8 +426,14 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", ms.sdpBody, nil)
 	go ms.run(hub)
+	mediaTarget := "<nil>"
+	if dst != nil {
+		mediaTarget = dst.String()
+	} else if conn != nil && conn.RemoteAddr() != nil {
+		mediaTarget = conn.RemoteAddr().String()
+	}
 	slog.Info("gb28181-cascade: INVITE accepted — forwarding",
-		"channel", channelID, "camera", cameraID, "to", dst.String(), "ssrc", sd.ssrc)
+		"channel", channelID, "camera", cameraID, "to", mediaTarget, "ssrc", sd.ssrc)
 }
 
 func abs64(v int64) int64 {
@@ -639,6 +652,11 @@ func (s *Service) onBye(req sip.Request, _ sip.ServerTransaction) {
 	if u == nil {
 		return
 	}
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if !s.requireDialogOwner(req, u) {
+		return
+	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
@@ -646,11 +664,6 @@ func (s *Service) onBye(req sip.Request, _ sip.ServerTransaction) {
 	s.mu.Lock()
 	ms := s.sessions[callID]
 	ps := s.playbacks[callID]
-	if (ms != nil && ms.upper != u) || (ps != nil && ps.upper != u) {
-		s.mu.Unlock()
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-		return
-	}
 	delete(s.sessions, callID)
 	delete(s.playbacks, callID)
 	s.mu.Unlock()
