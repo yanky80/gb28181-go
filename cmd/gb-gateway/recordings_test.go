@@ -162,6 +162,200 @@ func TestRecordingStoreDoesNotPublishProbeForChangedTarget(t *testing.T) {
 	}
 }
 
+func TestRecordingStoreReprobesSameSizeReplacement(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	path := filepath.Join(root, "front", now.Format("20060102"), "segment.mp4")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("AAAAAAA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	phaseB := false
+	probe := func(_ context.Context, _ string) (recordingProbeResult, error) {
+		start := now
+		if phaseB {
+			start = now.Add(time.Minute)
+		}
+		return recordingProbeResult{
+			Codec: "h264", Timescale: 90000, Frames: 1, Keyframes: 1,
+			KeyframeAt: []recordingKeyframe{{TimeMS: 0, Offset: 0, Size: 7}},
+			StartedAt:  start, EndedAt: start.Add(time.Minute),
+		}, nil
+	}
+	store, err := newRecordingStore(filepath.Join(root, "recordings.jsonl"), root, probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	filter := cascade.RecordingFilter{CameraID: "front", StartTime: now.Add(-time.Minute), EndTime: now.Add(3 * time.Minute)}
+	got, err := store.ListRecordings(context.Background(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].StartedAt.Equal(now) {
+		t.Fatalf("initial recording = %#v, want metadata A", got)
+	}
+
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := path + ".replacement"
+	if err := os.WriteFile(replacement, []byte("BBBBBBB"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(replacement, oldInfo.ModTime(), oldInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	newInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newInfo.Size() != oldInfo.Size() || !newInfo.ModTime().Equal(oldInfo.ModTime()) {
+		t.Fatalf("replacement identity setup changed size/mtime: old=%v new=%v", oldInfo, newInfo)
+	}
+	if os.SameFile(oldInfo, newInfo) {
+		t.Fatal("replacement unexpectedly retained the original file identity")
+	}
+	phaseB = true
+
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.ListRecordings(context.Background(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("same-size replacement remained indexed before stabilization: %#v", got)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.ListRecordings(context.Background(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].StartedAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("same-size replacement metadata = %#v, want metadata B", got)
+	}
+}
+
+func TestRecordingStoreResetsObservationAfterProbeIdentityChange(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	path := filepath.Join(root, "front", now.Format("20060102"), "segment.mp4")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("AAAAAAA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	phaseB := false
+	probes := 0
+	probe := func(_ context.Context, _ string) (recordingProbeResult, error) {
+		probes++
+		if probes == 1 {
+			close(probeStarted)
+			<-releaseProbe
+		}
+		start := now
+		if phaseB {
+			start = now.Add(time.Minute)
+		}
+		return recordingProbeResult{
+			Codec: "h265", Timescale: 90000, Frames: 1, Keyframes: 1,
+			KeyframeAt: []recordingKeyframe{{TimeMS: 0, Offset: 0, Size: 7}},
+			StartedAt:  start, EndedAt: start.Add(time.Minute),
+		}, nil
+	}
+	store, err := newRecordingStore(filepath.Join(root, "recordings.jsonl"), root, probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	scanDone := make(chan error, 1)
+	go func() { scanDone <- store.scanAt(context.Background(), now) }()
+	<-probeStarted
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := path + ".replacement"
+	if err := os.WriteFile(replacement, []byte("BBBBBBB"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(replacement, oldInfo.ModTime(), oldInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	newInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newInfo.Size() != oldInfo.Size() || !newInfo.ModTime().Equal(oldInfo.ModTime()) || os.SameFile(oldInfo, newInfo) {
+		t.Fatalf("replacement identity setup = old=%v new=%v", oldInfo, newInfo)
+	}
+	phaseB = true
+	close(releaseProbe)
+	if err := <-scanDone; err != nil {
+		t.Fatal(err)
+	}
+
+	filter := cascade.RecordingFilter{CameraID: "front", StartTime: now.Add(-time.Minute), EndTime: now.Add(3 * time.Minute)}
+	got, err := store.ListRecordings(context.Background(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("changed probe target was indexed: %#v", got)
+	}
+	if probes != 1 {
+		t.Fatalf("probe calls after changed target = %d, want 1", probes)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.ListRecordings(context.Background(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || probes != 1 {
+		t.Fatalf("replacement probed/indexed after only one new stable scan: recordings=%#v probes=%d", got, probes)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.ListRecordings(context.Background(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].StartedAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("replacement after two new stable scans = %#v, want metadata B", got)
+	}
+}
+
 func TestRecordingStoreReloadsWithoutDuplicateAndIgnoresCrashTail(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
