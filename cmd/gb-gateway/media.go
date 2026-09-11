@@ -32,6 +32,9 @@ type MediaHostConfig struct {
 	IDRTimeout   time.Duration
 	RequestIDR   func(cameraID string)
 	OnIDRTimeout func(cameraID string, err error)
+	// OnIDRTimeoutEpoch is the epoch-safe timeout callback used by the
+	// gateway lifecycle. OnIDRTimeout remains for callers without that need.
+	OnIDRTimeoutEpoch func(cameraID string, streamEpoch uint64, err error)
 }
 
 // MediaHost accepts one Edge IPC media stream per connection and publishes
@@ -355,7 +358,9 @@ func (c *mediaConnection) idrTimeout() {
 	c.notified = true
 	c.timer = nil
 	c.mu.Unlock()
-	if c.server.config.OnIDRTimeout != nil {
+	if c.server.config.OnIDRTimeoutEpoch != nil {
+		c.server.config.OnIDRTimeoutEpoch(c.cameraID, c.epoch, context.DeadlineExceeded)
+	} else if c.server.config.OnIDRTimeout != nil {
 		c.server.config.OnIDRTimeout(c.cameraID, context.DeadlineExceeded)
 	}
 }

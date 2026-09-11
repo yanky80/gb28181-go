@@ -178,6 +178,29 @@ func TestMediaSessionSendErrorReleasesRealHubLease(t *testing.T) {
 	}, time.Second, time.Millisecond, "send error must release the lease and hub subscription")
 }
 
+func TestNotifyCameraUnavailableReleasesLiveLeaseImmediately(t *testing.T) {
+	hub := platform.NewFrameHub()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	svc := New(testCfg(), hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1"}}}, hub}, nil)
+	var releases atomic.Int32
+	ms := &mediaSession{
+		svc: svc, callID: "live-1", camera: "cam-1", channel: "channel",
+		hub: hub, subID: "cascade-live-1", conn: conn,
+		releaseMain: func() { releases.Add(1) },
+	}
+	require.NoError(t, hub.Subscribe(ms.subID, func(int64, [][]byte, bool) {}))
+	svc.mu.Lock()
+	svc.sessions[ms.callID] = ms
+	svc.mu.Unlock()
+
+	svc.NotifyCameraUnavailable("cam-1")
+	require.Eventually(t, func() bool {
+		return releases.Load() == 1 && svc.ForwardCount() == 0 && hub.ConsumerCount() == 0
+	}, time.Second, time.Millisecond)
+}
+
 func newCascadeTestDB(t *testing.T) *fakeCascadeStore {
 	t.Helper()
 	return newFakeCascadeStore()

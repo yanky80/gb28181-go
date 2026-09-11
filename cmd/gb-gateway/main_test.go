@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,24 +17,23 @@ import (
 func TestNewGatewayRestoresChannelsAndUsesConfiguredCodec(t *testing.T) {
 	dir := t.TempDir()
 	statusDir := filepath.Join(dir, "status")
-	if err := os.MkdirAll(statusDir, 0750); err != nil {
-		t.Fatal(err)
-	}
-	storePath := filepath.Join(statusDir, "channels.json")
-	store, err := NewChannelStore(storePath)
-	if err != nil {
-		t.Fatal(err)
-	}
 	channel := testCascadeChannel()
-	if err := store.UpsertCascadeChannel(context.Background(), channel); err != nil {
-		t.Fatal(err)
-	}
-
 	cfg := defaultConfig()
-	cfg.IPC.StatusDir = filepath.Join(dir, "status")
+	cfg.IPC.StatusDir = statusDir
 	cfg.IPC.ControlSocket = filepath.Join(dir, "control.sock")
 	cfg.IPC.MediaSocket = filepath.Join(dir, "media.sock")
 	cfg.Cameras = []CameraConfig{{Index: 1, LocalCameraID: "front", Expose: true, Name: "Front", Codec: "h264", PTZMode: "none"}}
+	first, err := NewGateway(cfg, Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.store.UpsertCascadeChannel(context.Background(), channel); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
 	gateway, err := NewGateway(cfg, Credentials{})
 	if err != nil {
 		t.Fatal(err)
@@ -56,6 +56,57 @@ func TestNewGatewayRestoresChannelsAndUsesConfiguredCodec(t *testing.T) {
 	}
 	if _, err := gateway.store.ListRecordings(cancelledContext(), cascade.RecordingFilter{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled recording query error = %v, want context canceled", err)
+	}
+}
+
+func TestDefaultConfigUsesDurableGatewayState(t *testing.T) {
+	if got := defaultConfig().IPC.StatusDir; got != "/var/lib/edge-gateway" {
+		t.Fatalf("default status directory = %q, want durable gateway state directory", got)
+	}
+}
+
+func TestGatewayIDRTimeoutDisconnectsTimedOutEpoch(t *testing.T) {
+	dir := t.TempDir()
+	cfg := defaultConfig()
+	cfg.GB.IDRTimeout = 20 * time.Millisecond
+	cfg.IPC.StatusDir = filepath.Join(dir, "status")
+	cfg.IPC.ControlSocket = filepath.Join(dir, "control.sock")
+	cfg.IPC.MediaSocket = filepath.Join(dir, "media.sock")
+	cfg.Cameras = []CameraConfig{{Index: 1, LocalCameraID: "front", Expose: true, Name: "Front", Codec: "h265", PTZMode: "none"}}
+	gateway, err := NewGateway(cfg, Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Stop()
+	if err := gateway.registry.HandleHello(hello("front", 1, edgeipc.CodecH265)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.registry.HandleHealth("front", 1, health()); err != nil {
+		t.Fatal(err)
+	}
+
+	serverConn, peer := net.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- gateway.media.ServeConn(serverConn) }()
+	writeMedia(t, peer, edgeipc.MediaFrame{Codec: edgeipc.CodecH265, CameraID: "front", Sequence: 1, PTS90kHz: 9000, Payload: h265PFrame()})
+	eventually(t, time.Second, func() bool {
+		return gateway.registry.CameraStatus("front") == "OFF" && gateway.registry.Hub("front").ConsumerCount() == 0
+	})
+
+	if err := gateway.registry.HandleHello(hello("front", 2, edgeipc.CodecH265)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.registry.HandleHealth("front", 2, health()); err != nil {
+		t.Fatal(err)
+	}
+	if got := gateway.registry.CameraStatus("front"); got != "ON" {
+		t.Fatalf("reconnected camera status = %q, want ON", got)
+	}
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("timed-out media connection error = %v", err)
 	}
 }
 
@@ -150,4 +201,15 @@ func waitForPath(path string) error {
 		time.Sleep(time.Millisecond)
 	}
 	return os.ErrNotExist
+}
+
+func eventually(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !condition() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !condition() {
+		t.Fatal("condition did not converge")
+	}
 }

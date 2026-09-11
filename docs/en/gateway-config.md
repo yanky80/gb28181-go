@@ -71,8 +71,10 @@ go build -o tmp/gb-gateway ./cmd/gb-gateway
   -credentials /etc/edge-gateway/credentials
 ```
 
-The process uses `channels.json` below `ipc.status_dir`, binds both UDS
-listeners, and stops them on SIGINT or SIGTERM. A local lifecycle smoke test
+The default `ipc.status_dir` is `/var/lib/edge-gateway`, a durable directory
+that preserves `channels.json` and stable channel mappings across reboot.
+Override it only with another durable path. The UDS listeners remain under
+`/run/edge-gateway` by default and stop on SIGINT or SIGTERM. A local lifecycle smoke test
 is:
 
 ```sh

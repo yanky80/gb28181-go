@@ -95,12 +95,6 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 
 	store := &gatewayStore{channels: channels, recordings: recordings}
 	control := NewControlServer(cfg.IPC.ControlSocket, registry, cfg.GB.StopGrace)
-	media := NewMediaHost(registry, MediaHostConfig{
-		Path:       cfg.IPC.MediaSocket,
-		MaxAUBytes: cfg.IPC.MaxAUBytes,
-		IDRTimeout: cfg.GB.IDRTimeout,
-		RequestIDR: control.RequestIDR,
-	})
 	gbPassword, _ := credentials.Lookup("sip.password")
 	cascadeService := cascade.New(cascade.Config{
 		Enabled:           cfg.GB.Enabled,
@@ -118,6 +112,16 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 	if recordings != nil {
 		cascadeService.SetSegmentParser(mp4.ParseSegment)
 	}
+	media := NewMediaHost(registry, MediaHostConfig{
+		Path:       cfg.IPC.MediaSocket,
+		MaxAUBytes: cfg.IPC.MaxAUBytes,
+		IDRTimeout: cfg.GB.IDRTimeout,
+		RequestIDR: control.RequestIDR,
+		OnIDRTimeoutEpoch: func(cameraID string, streamEpoch uint64, _ error) {
+			registry.HandleDisconnect(cameraID, streamEpoch)
+			cascadeService.NotifyCameraUnavailable(cameraID)
+		},
+	})
 
 	return &Gateway{
 		cfg: cfg, registry: registry, store: store, control: control,
