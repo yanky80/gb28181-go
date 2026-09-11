@@ -191,6 +191,37 @@ func (s *Service) stopUnavailableSessions() {
 	}
 }
 
+// NotifyCameraUnavailable immediately releases dialogs using one local camera.
+// The registry callback calls this after closing the camera's FrameHub.
+func (s *Service) NotifyCameraUnavailable(cameraID string) {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+
+	s.mu.Lock()
+	sessions := make([]*mediaSession, 0)
+	for callID, ms := range s.sessions {
+		if ms.camera == cameraID {
+			delete(s.sessions, callID)
+			sessions = append(sessions, ms)
+		}
+	}
+	playbacks := make([]*playbackSession, 0)
+	for callID, ps := range s.playbacks {
+		if ps.camera == cameraID {
+			delete(s.playbacks, callID)
+			playbacks = append(playbacks, ps)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, ms := range sessions {
+		ms.teardown("camera source unavailable")
+	}
+	for _, ps := range playbacks {
+		ps.finish("camera source unavailable", true)
+	}
+}
+
 // catalogNotifyBody mirrors manscdp.Catalog under a Notify root — the
 // subscription-push form of the catalog (GB/T 28181-2016 § 9.5.4).
 type catalogNotifyBody struct {

@@ -58,3 +58,25 @@ file must keep the same size for two scans before `ffprobe` metadata is
 recorded. `ListRecordings` returns overlap-filtered, `started_at`-ordered
 results; `Remove` appends a tombstone and `Compact` atomically rewrites the
 journal. The gateway owns the journal while the recorder owns media files.
+
+## Run
+
+Build and run the standalone gateway with a validated config and a separate
+0600 credentials file:
+
+```sh
+mkdir -p tmp
+go build -o tmp/gb-gateway ./cmd/gb-gateway
+./tmp/gb-gateway -config /etc/edge-gateway/gateway.conf \
+  -credentials /etc/edge-gateway/credentials
+```
+
+The default `ipc.status_dir` is `/var/lib/edge-gateway`, a durable directory
+that preserves `channels.json` and stable channel mappings across reboot.
+Override it only with another durable path. The UDS listeners remain under
+`/run/edge-gateway` by default and stop on SIGINT or SIGTERM. A local lifecycle smoke test
+is:
+
+```sh
+go test ./cmd/gb-gateway -run TestGatewayStartsSocketsBeforeCascadeAndStopsCleanly -count=1
+```

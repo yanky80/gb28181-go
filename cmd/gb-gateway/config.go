@@ -193,7 +193,7 @@ func defaultConfig() Config {
 			ControlSocket: "/run/edge-gateway/control.sock",
 			MediaSocket:   "/run/edge-gateway/media.sock",
 			MaxAUBytes:    maxAUBytes,
-			StatusDir:     "/run/edge-gateway",
+			StatusDir:     "/var/lib/edge-gateway",
 		},
 	}
 }

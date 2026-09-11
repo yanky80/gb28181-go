@@ -32,6 +32,9 @@ type MediaHostConfig struct {
 	IDRTimeout   time.Duration
 	RequestIDR   func(cameraID string)
 	OnIDRTimeout func(cameraID string, err error)
+	// OnIDRTimeoutEpoch is the epoch-safe timeout callback used by the
+	// gateway lifecycle. OnIDRTimeout remains for callers without that need.
+	OnIDRTimeoutEpoch func(cameraID string, streamEpoch uint64, err error)
 }
 
 // MediaHost accepts one Edge IPC media stream per connection and publishes
@@ -40,12 +43,14 @@ type MediaHost struct {
 	registry *CameraRegistry
 	config   MediaHostConfig
 
-	mu          sync.Mutex
-	listener    net.Listener
-	connections map[string]*mediaConnection
-	active      map[*mediaConnection]struct{}
-	nextOrder   atomic.Uint64
-	closed      bool
+	mu           sync.Mutex
+	listener     net.Listener
+	connections  map[string]*mediaConnection
+	active       map[*mediaConnection]struct{}
+	nextOrder    atomic.Uint64
+	connectionWG sync.WaitGroup
+	closeDone    chan struct{}
+	closed       bool
 }
 
 // NewMediaHost creates a media.sock host. A zero timeout uses the gateway
@@ -62,6 +67,7 @@ func NewMediaHost(registry *CameraRegistry, config MediaHostConfig) *MediaHost {
 		config:      config,
 		connections: make(map[string]*mediaConnection),
 		active:      make(map[*mediaConnection]struct{}),
+		closeDone:   make(chan struct{}),
 	}
 }
 
@@ -124,7 +130,18 @@ func (s *MediaHost) Serve(ctx context.Context) error {
 			}
 			return err
 		}
-		go func() { _ = s.ServeConn(conn) }()
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		s.connectionWG.Add(1)
+		s.mu.Unlock()
+		go func() {
+			defer s.connectionWG.Done()
+			_ = s.ServeConn(conn)
+		}()
 	}
 }
 
@@ -173,15 +190,24 @@ func (s *MediaHost) ServeConn(conn net.Conn) error {
 func (s *MediaHost) Close() error {
 	s.mu.Lock()
 	if s.closed {
+		done := s.closeDone
 		s.mu.Unlock()
+		<-done
 		return nil
 	}
 	s.closed = true
 	l := s.listener
 	s.listener = nil
-	connections := make([]*mediaConnection, 0, len(s.active))
+	connections := make([]*mediaConnection, 0, len(s.active)+len(s.connections))
+	seen := make(map[*mediaConnection]struct{}, len(s.active)+len(s.connections))
 	for c := range s.active {
 		connections = append(connections, c)
+		seen[c] = struct{}{}
+	}
+	for _, c := range s.connections {
+		if _, ok := seen[c]; !ok {
+			connections = append(connections, c)
+		}
 	}
 	s.mu.Unlock()
 
@@ -193,8 +219,11 @@ func (s *MediaHost) Close() error {
 		}
 	}
 	for _, c := range connections {
+		c.cancelDeadline()
 		c.close()
 	}
+	s.connectionWG.Wait()
+	close(s.closeDone)
 	return err
 }
 
@@ -216,6 +245,7 @@ type mediaConnection struct {
 	notified     bool
 	closed       bool
 	keepTimer    bool
+	deadline     uint64
 	timer        *time.Timer
 }
 
@@ -301,7 +331,9 @@ func (c *mediaConnection) waitForIDR() {
 	}
 	c.waiting = true
 	c.notified = false
-	c.timer = time.AfterFunc(c.server.config.IDRTimeout, c.idrTimeout)
+	c.deadline++
+	deadline := c.deadline
+	c.timer = time.AfterFunc(c.server.config.IDRTimeout, func() { c.idrTimeout(deadline) })
 	c.mu.Unlock()
 	if c.server.config.RequestIDR != nil {
 		c.server.config.RequestIDR(c.cameraID)
@@ -315,6 +347,7 @@ func (c *mediaConnection) recover() {
 		return
 	}
 	c.waiting = false
+	c.deadline++
 	if c.timer != nil {
 		c.timer.Stop()
 		c.timer = nil
@@ -328,18 +361,29 @@ func (c *mediaConnection) isWaiting() bool {
 	return c.waiting
 }
 
-func (c *mediaConnection) idrTimeout() {
+func (c *mediaConnection) idrTimeout(deadline uint64) {
 	c.mu.Lock()
-	if (c.closed && !c.keepTimer) || !c.waiting || c.notified {
+	if deadline != c.deadline || (c.closed && !c.keepTimer) || !c.waiting || c.notified {
 		c.mu.Unlock()
 		return
 	}
 	c.notified = true
 	c.timer = nil
 	c.mu.Unlock()
-	if c.server.config.OnIDRTimeout != nil {
+	c.server.mu.Lock()
+	if current := c.server.connections[c.cameraID]; current != nil && current != c {
+		c.server.mu.Unlock()
+		return
+	}
+	if c.server.connections[c.cameraID] == c {
+		delete(c.server.connections, c.cameraID)
+	}
+	if c.server.config.OnIDRTimeoutEpoch != nil {
+		c.server.config.OnIDRTimeoutEpoch(c.cameraID, c.epoch, context.DeadlineExceeded)
+	} else if c.server.config.OnIDRTimeout != nil {
 		c.server.config.OnIDRTimeout(c.cameraID, context.DeadlineExceeded)
 	}
+	c.server.mu.Unlock()
 }
 
 func (c *mediaConnection) keepTimeoutAfterClose() {
@@ -356,11 +400,29 @@ func (c *mediaConnection) close() {
 	}
 	c.closed = true
 	if c.timer != nil && !c.keepTimer {
+		c.deadline++
 		c.timer.Stop()
 		c.timer = nil
 	}
 	c.mu.Unlock()
 	_ = c.conn.Close()
+}
+
+func (c *mediaConnection) cancelDeadline() {
+	c.mu.Lock()
+	c.deadline++
+	c.keepTimer = false
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	c.mu.Unlock()
+}
+
+func (c *mediaConnection) timeoutPending() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.keepTimer && c.timer != nil
 }
 
 func (c *mediaConnection) isClosed() bool {
@@ -378,6 +440,9 @@ func (s *MediaHost) replaceConnection(c *mediaConnection) bool {
 		return false
 	}
 	s.connections[c.cameraID] = c
+	if old != nil && old != c {
+		old.cancelDeadline()
+	}
 	s.mu.Unlock()
 	if old != nil && old != c {
 		old.close()
@@ -392,7 +457,10 @@ func (s *MediaHost) removeConnection(c *mediaConnection) {
 		s.mu.Unlock()
 		return
 	}
-	if s.connections[c.cameraID] == c {
+	// A parser-failed connection remains the deadline owner until timeout so
+	// the existing recovery notification can fire; replacement or Close
+	// cancels that owner before another epoch can use the camera.
+	if s.connections[c.cameraID] == c && !c.timeoutPending() {
 		delete(s.connections, c.cameraID)
 	}
 	s.mu.Unlock()

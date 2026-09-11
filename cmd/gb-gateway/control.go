@@ -562,6 +562,27 @@ func (s *ControlServer) AcquireMainHub(ctx context.Context, cameraID string) (*p
 	return view.Hub, release, nil
 }
 
+// RequestIDR asks the current encoder peer for a keyframe when media recovery
+// needs one. A missing peer is expected while a camera is OFF.
+func (s *ControlServer) RequestIDR(cameraID string) {
+	s.mu.Lock()
+	state := s.leases[cameraID]
+	peer := s.peers[cameraID]
+	if state == nil || peer == nil || !state.desired || state.count == 0 {
+		s.mu.Unlock()
+		return
+	}
+	command := controlCommand{generation: state.generation, message: edgeipc.ControlMessage{
+		Type: edgeipc.MessageRequestIDR, Version: edgeipc.ProtocolVersion,
+		CameraID: cameraID, RequestID: s.nextRequestID.Add(1),
+	}}
+	err := peer.enqueue(command)
+	s.mu.Unlock()
+	if err != nil {
+		peer.close()
+	}
+}
+
 func (s *ControlServer) release(cameraID string) {
 	s.mu.Lock()
 	state := s.leaseStateLocked(cameraID)
