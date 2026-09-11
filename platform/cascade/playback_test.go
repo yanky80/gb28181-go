@@ -94,7 +94,7 @@ func createPlaybackSegment(t *testing.T, db interface {
 func newPlaybackHarness(t *testing.T) (*playbackSession, func() [][]byte) {
 	t.Helper()
 	db := newCascadeTestDB(t)
-	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}}, db)
+	svc := New(testCfg(), fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front", Encoding: "h264"}}}, db)
 	svc.SetSegmentParser(fakeSegmentParser)
 
 	rx, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})

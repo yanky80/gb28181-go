@@ -31,3 +31,15 @@ _Avoid_: Session
 **Recording segment**:
 One indexed time interval of locally recorded media that can contribute samples to a GB playback session.
 _Avoid_: Event clip
+
+**Protocol profile**:
+The explicitly selected GB/T 28181 version and video codec pair used by the cascade service.
+_Avoid_: Runtime codec fallback
+
+**Upstream protocol version**:
+The version marker reported by the upper platform in the REGISTER response.
+_Avoid_: Local protocol version
+
+**Version mismatch**:
+The registered upstream state in which a protocol profile cannot safely open its requested media stream.
+_Avoid_: Codec downgrade

@@ -37,8 +37,8 @@ type CameraInfo struct {
 	Name  string
 	Brand string
 	Model string
-	// Encoding is the camera's configured codec ("h264"|"h265"|"" unknown) —
-	// the preferred PSM type; sniffed from the first NAL when empty.
+	// Encoding is the camera's configured codec ("h264"|"h265"). Empty uses
+	// the selected protocol profile's default (H.265 for the default profile).
 	Encoding string
 	// SubStream selects the camera's low-res tier for forwarding when true
 	// (#512): the INVITE acquires the on-demand sub-stream instead of the
@@ -82,9 +82,11 @@ type MainStreamAcquirer interface {
 // legacy config form becomes uppers[0]; gb28181_cascade.upstreams appends
 // more.
 type upper struct {
-	cfg    Upstream // resolved — defaults filled in
-	online bool
-	regTS  time.Time
+	cfg                 Upstream // resolved — defaults filled in
+	online              bool
+	regTS               time.Time
+	protocolVersion     string
+	protocolVersionSeen bool
 }
 
 // Service is the cascade client (pkg/app.Service "gb28181-cascade").
@@ -300,6 +302,9 @@ func (s *Service) acquireMainHub(cameraID string) (*platform.FrameHub, func(), e
 func (s *Service) Name() string { return "gb28181-cascade" }
 
 func (s *Service) Start(ctx context.Context) error {
+	if err := s.validateProtocolProfiles(); err != nil {
+		return fmt.Errorf("gb28181-cascade: %w", err)
+	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	listen := s.cfg.SIPListen
@@ -467,6 +472,35 @@ func (s *Service) Online() bool {
 		}
 	}
 	return false
+}
+
+// Status reports the cascade registration/media admission state.
+func (s *Service) Status() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, u := range s.uppers {
+		if s.upperVersionMismatchLocked(u) {
+			return StatusVersionMismatch
+		}
+	}
+	for _, u := range s.uppers {
+		if u.online {
+			return StatusOnline
+		}
+	}
+	return StatusOffline
+}
+
+// UpperProtocolVersion returns the registered version marker for the first
+// configured upper platform. Empty means no successful versioned REGISTER
+// response has been received (or the response omitted X-GB-Ver).
+func (s *Service) UpperProtocolVersion() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.uppers) == 0 {
+		return ""
+	}
+	return s.uppers[0].protocolVersion
 }
 
 // RegistrationSince returns how long the OLDEST live registration has been
@@ -657,6 +691,7 @@ func (s *Service) sendRegister(u *upper, expires int) error {
 	}
 	exp := sip.Expires(uint32(expires))
 	req.AppendHeader(&exp)
+	s.appendProtocolVersion(req)
 
 	resp, err := s.request(req)
 	if err != nil {
@@ -673,6 +708,7 @@ func (s *Service) sendRegister(u *upper, expires int) error {
 		}
 		exp2 := sip.Expires(uint32(expires))
 		req2.AppendHeader(&exp2)
+		s.appendProtocolVersion(req2)
 		req2.AppendHeader(auth)
 		resp, err = s.request(req2)
 		if err != nil {
@@ -682,7 +718,33 @@ func (s *Service) sendRegister(u *upper, expires int) error {
 	if !resp.IsSuccess() {
 		return fmt.Errorf("register: status %d (%s)", resp.StatusCode(), resp.Reason())
 	}
+	s.saveUpperProtocolVersion(u, responseProtocolVersion(resp))
 	return nil
+}
+
+func (s *Service) appendProtocolVersion(req sip.Request) {
+	req.AppendHeader(&sip.GenericHeader{
+		HeaderName: "X-GB-Ver",
+		Contents:   profileVersionMarker(s.cfg.EffectiveProtocolVersion()),
+	})
+}
+
+func responseProtocolVersion(resp sip.Response) string {
+	if headers := resp.GetHeaders("X-GB-Ver"); len(headers) > 0 {
+		return strings.TrimSpace(headers[0].Value())
+	}
+	return ""
+}
+
+func (s *Service) saveUpperProtocolVersion(u *upper, version string) {
+	s.mu.Lock()
+	u.protocolVersion = strings.TrimSpace(version)
+	u.protocolVersionSeen = true
+	s.mu.Unlock()
+}
+
+func (s *Service) upperVersionMismatchLocked(u *upper) bool {
+	return u.protocolVersionSeen && s.requiresVersionGate() && u.protocolVersion != profileVersionMarker("2022")
 }
 
 var challengeRe = regexp.MustCompile(`(\w+)\s*=\s*"([^"]+)"`)
