@@ -71,16 +71,6 @@ type pbCtrl struct {
 // stream at file speed. 404 when the channel is unknown or the window holds
 // no recordings (the platform surfaces that as a fetch error).
 func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP, u *upper, generation uint64) {
-	s.mu.Lock()
-	live := s.sessions[callID]
-	current := s.playbacks[callID]
-	if (live != nil && live.upper != u) || (current != nil && current.upper != u) {
-		s.mu.Unlock()
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-		return
-	}
-	s.mu.Unlock()
-
 	cameraID, ok := s.cameraOfChannel(channelID)
 	if !ok {
 		slog.Warn("gb28181-cascade: playback INVITE for unknown channel", "channel", channelID)
@@ -101,6 +91,9 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		_, _ = s.srv.RespondOnRequest(req, 400, "Playback without time range", "", nil)
 		return
 	}
+	s.mu.Lock()
+	current := s.playbacks[callID]
+	s.mu.Unlock()
 	start := time.Unix(sd.t0, 0)
 	end := time.Unix(sd.t1, 0)
 	if !end.After(start) {
@@ -205,12 +198,6 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 
 	s.mu.Lock()
 	old := s.playbacks[callID]
-	if old != nil && old.upper != u {
-		s.mu.Unlock()
-		_ = conn.Close()
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-		return
-	}
 	s.playbacks[callID] = ps
 	s.mu.Unlock()
 	if old != nil {
@@ -515,21 +502,18 @@ func (ps *playbackSession) stop() {
 func (s *Service) onInfo(req sip.Request, _ sip.ServerTransaction) {
 	u := s.requireUpper(req)
 	if u == nil {
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 		return
 	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
 	}
-	s.mu.Lock()
-	ms := s.sessions[callID]
-	ps := s.playbacks[callID]
-	s.mu.Unlock()
-	if (ms != nil && ms.upper != u) || (ps != nil && ps.upper != u) {
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+	if !s.requireDialogOwner(req, u) {
 		return
 	}
+	s.mu.Lock()
+	ps := s.playbacks[callID]
+	s.mu.Unlock()
 	if ps == nil {
 		_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 		return // INFO on a live-forward dialog: nothing to control

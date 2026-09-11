@@ -43,6 +43,9 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 	}
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
+	if !s.requireDialogOwner(req, u) {
+		return
+	}
 	if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
 		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
 		return
@@ -85,6 +88,16 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 		callID = h.String()
 	}
 	fromUser, toUser := reqIDs(req)
+	s.mu.Lock()
+	old := s.subs[callID]
+	s.mu.Unlock()
+	if old != nil {
+		if old.cancel != nil {
+			old.cancel()
+		}
+		old.sendMu.Lock()
+		old.sendMu.Unlock()
+	}
 	expHdr := sip.Expires(uint32(expires))
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", []sip.Header{&expHdr})
 

@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ghettovoice/gosip/log"
 	"github.com/ghettovoice/gosip/sip"
+	"github.com/ghettovoice/gosip/sip/parser"
 	"github.com/mickeyzzc/gb28181-go/manscdp"
 	"github.com/mickeyzzc/gb28181-go/platform"
 	"github.com/stretchr/testify/require"
@@ -801,6 +803,54 @@ func TestUnknownMultiUpperSenderIsRejectedByEveryHandler(t *testing.T) {
 	require.Equal(t, 403, int(res.StatusCode()))
 }
 
+func TestUnauthorizedHandlersWriteExactlyOneForbidden(t *testing.T) {
+	_, up := startLoopbackService(t, fakeSource{}, newCascadeTestDB(t))
+	unauthorized := func(req sip.Request) sip.Request {
+		from, ok := req.From()
+		require.True(t, ok)
+		uri, ok := from.Address.(*sip.SipUri)
+		require.True(t, ok)
+		uri.SetUser(sip.String{Str: "wrong-upper"})
+		return req
+	}
+
+	requests := []sip.Request{
+		up.request(sip.MESSAGE, testCfg().LocalDeviceID, "not-manscdp", "Application/MANSCDP+xml"),
+		up.request(sip.BYE, lbChannelOne, "", ""),
+		up.request(sip.INFO, lbChannelOne, "", ""),
+	}
+	for _, req := range requests {
+		req = unauthorized(req)
+		callID, ok := req.CallID()
+		require.True(t, ok)
+		require.Equal(t, 1, countResponses(t, up, req, callID.String()), req.Method())
+	}
+}
+
+func countResponses(t *testing.T, up *upperSocket, req sip.Request, callID string) int {
+	t.Helper()
+	up.send(req)
+	count := 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	buf := make([]byte, 65535)
+	for {
+		require.NoError(t, up.conn.SetReadDeadline(deadline))
+		n, _, err := up.conn.ReadFromUDP(buf)
+		if err != nil {
+			break
+		}
+		msg, err := parser.ParseMessage(buf[:n], log.NewDefaultLogrusLogger())
+		require.NoError(t, err)
+		res, ok := msg.(sip.Response)
+		if ok && res.StatusCode() >= 200 {
+			if got, ok := res.CallID(); ok && got.String() == callID {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 func TestSingleUpperEveryEntryPointRequiresIDAndSource(t *testing.T) {
 	svc, up := startLoopbackService(t, fakeSource{}, newCascadeTestDB(t))
 	badFrom := func(req sip.Request) sip.Request {
@@ -834,6 +884,141 @@ func TestSingleUpperEveryEntryPointRequiresIDAndSource(t *testing.T) {
 	res = wrongSource.roundTrip(nonCatalog)
 	require.Equal(t, 403, int(res.StatusCode()))
 	require.Empty(t, sessionIDs(svc))
+}
+
+func TestForeignInviteOwnershipPrecedesAdmissionGates(t *testing.T) {
+	const foreignDevice = "34020000002000000003"
+	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
+	cfg.Upstreams = []Upstream{{ServerDomain: foreignDevice, ServerAddr: "127.0.0.2:5060"}}
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackServiceWithConfig(t, cfg,
+		hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, nil)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	foreign := newUpperSocketOn(t, up.sip.String(), "127.0.0.2")
+	localUpper, foreignUpper := svc.uppers[0], svc.uppers[1]
+
+	tests := []struct {
+		name      string
+		kind      string
+		online    bool
+		stale     bool
+		channelID string
+	}{
+		{name: "live online known channel", kind: "live", online: true, channelID: lbChannelOne},
+		{name: "live offline known channel", kind: "live", channelID: lbChannelOne},
+		{name: "live stale known channel", kind: "live", online: true, stale: true, channelID: lbChannelOne},
+		{name: "live online unknown channel", kind: "live", online: true, channelID: "unknown-channel"},
+		{name: "playback online known channel", kind: "playback", online: true, channelID: lbChannelOne},
+		{name: "playback offline known channel", kind: "playback", channelID: lbChannelOne},
+		{name: "playback stale known channel", kind: "playback", online: true, stale: true, channelID: lbChannelOne},
+		{name: "playback online unknown channel", kind: "playback", online: true, channelID: "unknown-channel"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := foreign.request(sip.INVITE, tt.channelID, playSDP(t, map[string]string{
+				"live":     "Play",
+				"playback": "Playback",
+			}[tt.kind], tt.kind == "playback"), "application/sdp")
+			from, ok := req.From()
+			require.True(t, ok)
+			uri, ok := from.Address.(*sip.SipUri)
+			require.True(t, ok)
+			uri.SetUser(sip.String{Str: foreignDevice})
+			callID, ok := req.CallID()
+			require.True(t, ok)
+			var existing interface{}
+			svc.mu.Lock()
+			foreignUpper.online = tt.online
+			foreignUpper.stale.Store(tt.stale)
+			if tt.kind == "live" {
+				ms := &mediaSession{svc: svc, callID: callID.String(), channel: tt.channelID, upper: localUpper}
+				svc.sessions[callID.String()] = ms
+				existing = ms
+			} else {
+				ps := &playbackSession{svc: svc, callID: callID.String(), channel: tt.channelID, upper: localUpper}
+				svc.playbacks[callID.String()] = ps
+				existing = ps
+			}
+			svc.mu.Unlock()
+			t.Cleanup(func() {
+				svc.mu.Lock()
+				delete(svc.sessions, callID.String())
+				delete(svc.playbacks, callID.String())
+				svc.mu.Unlock()
+			})
+
+			res := foreign.roundTrip(req)
+			require.Equal(t, 403, int(res.StatusCode()))
+			svc.mu.Lock()
+			var got interface{}
+			if tt.kind == "live" {
+				got = svc.sessions[callID.String()]
+			} else {
+				got = svc.playbacks[callID.String()]
+			}
+			svc.mu.Unlock()
+			require.Same(t, existing, got)
+		})
+	}
+}
+
+func TestSubscribeOwnershipAndReplacementLifecycle(t *testing.T) {
+	const foreignDevice = "34020000002000000003"
+	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
+	cfg.Upstreams = []Upstream{{ServerDomain: foreignDevice, ServerAddr: "127.0.0.2:5060"}}
+	svc, up := startLoopbackServiceWithConfig(t, cfg, fakeSource{}, nil)
+	foreign := newUpperSocketOn(t, up.sip.String(), "127.0.0.2")
+	event := &sip.GenericHeader{HeaderName: "Event", Contents: "Catalog"}
+	first := up.request(sip.SUBSCRIBE, testCfg().LocalDeviceID, "", "", event)
+	firstID, ok := first.CallID()
+	require.True(t, ok)
+	require.Equal(t, 200, int(up.roundTrip(first).StatusCode()))
+	svc.mu.Lock()
+	old := svc.subs[firstID.String()]
+	svc.mu.Unlock()
+	require.NotNil(t, old)
+
+	foreignReq := foreign.requestDialog(sip.SUBSCRIBE, testCfg().LocalDeviceID, "", "", firstID, event)
+	from, ok := foreignReq.From()
+	require.True(t, ok)
+	uri, ok := from.Address.(*sip.SipUri)
+	require.True(t, ok)
+	uri.SetUser(sip.String{Str: foreignDevice})
+	require.Equal(t, 403, int(foreign.roundTrip(foreignReq).StatusCode()))
+	svc.mu.Lock()
+	got := svc.subs[firstID.String()]
+	svc.mu.Unlock()
+	require.Same(t, old, got, "foreign SUBSCRIBE must not replace the existing subscription")
+
+	old.sendMu.Lock()
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			old.sendMu.Unlock()
+		}
+	})
+	replacement := up.requestDialog(sip.SUBSCRIBE, testCfg().LocalDeviceID, "", "", firstID, event)
+	up.send(replacement)
+	select {
+	case <-old.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("same-upper replacement must cancel the old subscription")
+	}
+	svc.mu.Lock()
+	got = svc.subs[firstID.String()]
+	svc.mu.Unlock()
+	require.Same(t, old, got, "replacement must wait for the old NOTIFY to finish")
+	old.sendMu.Unlock()
+	released = true
+	res := up.awaitResponse(firstID.String(), 2)
+	require.Equal(t, 200, int(res.StatusCode()))
+	svc.mu.Lock()
+	got = svc.subs[firstID.String()]
+	svc.mu.Unlock()
+	require.NotSame(t, old, got)
 }
 
 func TestInvalidatedSubscriptionSuppressesNotify(t *testing.T) {

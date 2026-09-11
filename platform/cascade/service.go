@@ -827,6 +827,43 @@ func (s *Service) requireUpper(req sip.Request) *upper {
 	return nil
 }
 
+func requestCallID(req sip.Request) string {
+	if req == nil {
+		return ""
+	}
+	if h, ok := req.CallID(); ok {
+		return h.String()
+	}
+	return ""
+}
+
+// requireDialogOwner enforces Call-ID ownership after source authentication
+// and before any dialog-specific gate or Store lookup. The caller owns the
+// admission/lifecycle lock when it needs ordering against BYE or replacement.
+func (s *Service) requireDialogOwner(req sip.Request, u *upper) bool {
+	callID := requestCallID(req)
+	if callID == "" {
+		return true
+	}
+	s.mu.Lock()
+	foreign := false
+	if ms := s.sessions[callID]; ms != nil && ms.upper != u {
+		foreign = true
+	}
+	if ps := s.playbacks[callID]; ps != nil && ps.upper != u {
+		foreign = true
+	}
+	if sub := s.subs[callID]; sub != nil && sub.upper != u {
+		foreign = true
+	}
+	s.mu.Unlock()
+	if foreign {
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return false
+	}
+	return true
+}
+
 func (s *Service) onOptions(req sip.Request, _ sip.ServerTransaction) {
 	if s.requireUpper(req) == nil {
 		return
@@ -1078,7 +1115,6 @@ func (s *Service) sendKeepalive(u *upper) error {
 func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 	u := s.requireUpper(req)
 	if u == nil {
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 		return
 	}
 	cmd, payload, err := manscdp.Decode([]byte(req.Body()))
