@@ -62,7 +62,7 @@ func TestStartRejectsUnsupportedProtocolProfiles(t *testing.T) {
 			cfg := testCfg()
 			cfg.ServerDomain = lbUpperDevice
 			cfg.ProtocolVersion = tt.version
-			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+			cfg.SIPListen = freeSIPListenAddress(t)
 			cams := []CameraInfo{{ID: "cam-1", Encoding: tt.codec}}
 			if tt.codec == "" {
 				cams = nil
@@ -81,7 +81,7 @@ func TestRegisterProtocolVersionHeaderAndResponse(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := testCfg()
 			cfg.ProtocolVersion = tt.configVersion
-			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+			cfg.SIPListen = freeSIPListenAddress(t)
 			up := newUpperSocket(t, cfg.SIPListen)
 			cfg.ServerAddr = up.conn.LocalAddr().String()
 
@@ -111,7 +111,7 @@ func TestRegisterWireCarriesProfileOnInitialAndDigestRetry(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := testCfg()
 			cfg.ProtocolVersion = tt.configVersion
-			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+			cfg.SIPListen = freeSIPListenAddress(t)
 			up := newUpperSocket(t, cfg.SIPListen)
 			cfg.ServerAddr = up.conn.LocalAddr().String()
 
@@ -139,7 +139,7 @@ func TestDynamicH265CameraUsesSavedPerUpperVersion(t *testing.T) {
 		t.Run("response-"+responseVersion, func(t *testing.T) {
 			cfg := testCfg()
 			cfg.ServerDomain = lbUpperDevice
-			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+			cfg.SIPListen = freeSIPListenAddress(t)
 			up := newUpperSocket(t, cfg.SIPListen)
 			cfg.ServerAddr = up.conn.LocalAddr().String()
 			src := &mutableStatusSource{fakeSource: fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h264"}}}}
@@ -463,7 +463,7 @@ func TestH265VersionMismatchBlocksInvite(t *testing.T) {
 		t.Run("response-"+responseVersion, func(t *testing.T) {
 			cfg := testCfg()
 			cfg.ServerDomain = lbUpperDevice
-			cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+			cfg.SIPListen = freeSIPListenAddress(t)
 			up := newUpperSocket(t, cfg.SIPListen)
 			cfg.ServerAddr = up.conn.LocalAddr().String()
 			hub := platform.NewFrameHub()
@@ -494,7 +494,7 @@ func TestH265VersionMismatchBlocksInvite(t *testing.T) {
 func TestH265InviteSDPPSMAndParameterSets(t *testing.T) {
 	cfg := testCfg()
 	cfg.ServerDomain = lbUpperDevice
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	cfg.SIPListen = freeSIPListenAddress(t)
 	up := newUpperSocket(t, cfg.SIPListen)
 	cfg.ServerAddr = up.conn.LocalAddr().String()
 
@@ -546,7 +546,7 @@ func TestH265InviteSDPPSMAndParameterSets(t *testing.T) {
 func TestH265PlaybackRejectsMismatchedParsedCodec(t *testing.T) {
 	cfg := testCfg()
 	cfg.ServerDomain = lbUpperDevice
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	cfg.SIPListen = freeSIPListenAddress(t)
 	up := newUpperSocket(t, cfg.SIPListen)
 	cfg.ServerAddr = up.conn.LocalAddr().String()
 	db := newCascadeTestDB(t)

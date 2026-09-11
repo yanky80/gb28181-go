@@ -337,8 +337,10 @@ func (s *Server) sendRequestTo(method sip.RequestMethod, deviceID, netAddr, serv
 	if expiresHdr != nil {
 		req.AppendHeader(expiresHdr)
 	}
-	if _, err := srv.Request(req); err != nil {
+	tx, err := srv.Request(req)
+	if err != nil {
 		return fmt.Errorf("gb28181: send %s to %s: %w", method, deviceID, err)
 	}
+	cleanupClientTransaction(tx)
 	return nil
 }

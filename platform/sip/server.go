@@ -50,9 +50,10 @@ const speculativeAckDelay = 2500 * time.Millisecond
 // threshold inside the GOP recycles healthy streams forever (observed: a
 // ~3min-GOP source recycled every ~80s, breaking every live view each cycle).
 const (
-	idrStaleAfter    = 10 * time.Minute
-	streamStaleAfter = 45 * time.Second
-	idrWatchInterval = 15 * time.Second
+	idrStaleAfter     = 10 * time.Minute
+	streamStaleAfter  = 45 * time.Second
+	idrWatchInterval  = 15 * time.Second
+	watchPollInterval = 100 * time.Millisecond
 )
 
 // CameraEnroller auto-creates a camera in the main cameras list when a GB28181
@@ -114,6 +115,7 @@ type CameraEnroller interface {
 type inviteDialog struct {
 	req  sip.Request
 	resp sip.Response
+	tx   sip.ClientTransaction
 }
 
 // Server implements the GB/T 28181 SIP platform (UAS) side. It owns the gosip
@@ -534,10 +536,51 @@ func (s *Server) SendMessage(deviceID string, body []byte) error {
 		return err
 	}
 
-	if _, err := srv.Request(req); err != nil {
+	tx, err := srv.Request(req)
+	if err != nil {
 		return fmt.Errorf("gb28181: send MESSAGE to %s: %w", deviceID, err)
 	}
+	cleanupClientTransaction(tx)
 	return nil
+}
+
+// cleanupClientTransaction closes fire-and-forget client transactions as soon
+// as their final response arrives. gosip otherwise keeps completed
+// non-INVITE transactions until Timer D, which makes repeated control traffic
+// accumulate goroutines for tens of seconds.
+func cleanupClientTransaction(tx sip.ClientTransaction) {
+	go func() {
+		responses := tx.Responses()
+		errs := tx.Errors()
+		for {
+			select {
+			case response, ok := <-responses:
+				if !ok {
+					return
+				}
+				if response.IsProvisional() {
+					continue
+				}
+				terminateClientTransaction(tx)
+				return
+			case _, ok := <-errs:
+				if !ok {
+					errs = nil
+					continue
+				}
+				terminateClientTransaction(tx)
+				return
+			case <-tx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func terminateClientTransaction(tx sip.ClientTransaction) {
+	if terminable, ok := tx.(interface{ Terminate() }); ok {
+		terminable.Terminate()
+	}
 }
 
 // buildRequest assembles a request with the headers GB28181 devices expect:
@@ -759,7 +802,7 @@ func (s *Server) inviteCore(deviceID string, ch *platform.Channel, netAddr, serv
 			slog.Warn("gb28181: send ACK failed", "channel", channelID, "error", err)
 		}
 		s.mu.Lock()
-		s.dialogs[channelID] = &inviteDialog{req: req, resp: resp}
+		s.dialogs[channelID] = &inviteDialog{req: req, resp: resp, tx: tx}
 		s.mu.Unlock()
 		// Seed the no-PSM audio fallback from the answer SDP: devices that
 		// mux audio into the PS stream without ever sending a Program Stream
@@ -801,7 +844,12 @@ func (s *Server) inviteCore(deviceID string, ch *platform.Channel, netAddr, serv
 // Each recycle re-INVITEs, which starts a fresh watchdog for the new session.
 func (s *Server) watchSession(deviceID, channelID string) {
 	for {
-		time.Sleep(idrWatchInterval)
+		for waited := time.Duration(0); waited < idrWatchInterval; waited += watchPollInterval {
+			time.Sleep(watchPollInterval)
+			if s.sessionMgr.GetReceiver(channelID) == nil {
+				return
+			}
+		}
 		rcv := s.sessionMgr.GetReceiver(channelID)
 		if rcv == nil {
 			return // session replaced or gone
@@ -950,10 +998,12 @@ func (s *Server) sendDialogReset(deviceID, channelID, deviceAddr string) {
 	if err != nil {
 		return
 	}
-	if _, err := srv.Request(bye); err != nil {
+	tx, err := srv.Request(bye)
+	if err != nil {
 		slog.Debug("gb28181: dialog-reset BYE send failed", "channel", channelID, "error", err)
 		return
 	}
+	cleanupClientTransaction(tx)
 	slog.Info("gb28181: dialog-reset BYE sent (486 recovery)", "channel", channelID, "device", deviceID)
 }
 
@@ -985,6 +1035,7 @@ func (s *Server) sendByeForChannel(channelID string) error {
 	if srv == nil || dialog == nil {
 		return nil
 	}
+	defer terminateClientTransaction(dialog.tx)
 	s.metrics.InviteSessionStopped()
 
 	fromHdr, hasFrom := dialog.resp.From()
@@ -1024,9 +1075,11 @@ func (s *Server) sendByeForChannel(channelID string) error {
 	if err != nil {
 		return fmt.Errorf("gb28181: build BYE request: %w", err)
 	}
-	if _, err := srv.Request(byeReq); err != nil {
+	tx, err := srv.Request(byeReq)
+	if err != nil {
 		return fmt.Errorf("gb28181: send BYE for %s: %w", channelID, err)
 	}
+	cleanupClientTransaction(tx)
 	slog.Info("gb28181: BYE sent", "channel", channelID)
 	return nil
 }

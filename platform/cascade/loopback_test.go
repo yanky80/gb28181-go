@@ -29,6 +29,7 @@ const (
 	lbUpperDevice = "34020000002000000002" // fake upper platform's device ID
 	lbChannelOne  = "34020000001320000001" // first allocated channel
 	lbLocalHost   = "127.0.0.1"
+	lbSIPHost     = "127.0.0.3" // isolate cascade SIP probes from other packages
 )
 
 // freeUDPPort returns a free UDP port on loopback.
@@ -38,6 +39,14 @@ func freeUDPPort(t *testing.T) int {
 	require.NoError(t, err)
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).Port
+}
+
+func freeSIPListenAddress(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(lbSIPHost)})
+	require.NoError(t, err)
+	defer conn.Close()
+	return conn.LocalAddr().String()
 }
 
 var lbSeq atomic.Int64
@@ -219,7 +228,7 @@ func startLoopbackService(t *testing.T, src CameraSource, db Store) (*Service, *
 
 func startLoopbackServiceWithConfig(t *testing.T, cfg Config, src CameraSource, db Store) (*Service, *upperSocket) {
 	t.Helper()
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	cfg.SIPListen = freeSIPListenAddress(t)
 
 	up := newUpperSocket(t, cfg.SIPListen)
 	cfg.ServerAddr = up.conn.LocalAddr().String() // register/NOTIFY traffic target

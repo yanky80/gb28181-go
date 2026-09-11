@@ -7,9 +7,7 @@ package cascade
 
 import (
 	"context"
-	"net"
 	"slices"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -101,7 +99,7 @@ func (r *rejectingRegistrar) arrivalGaps() []time.Duration {
 
 func TestRegisterRetryBacksOffExponentially(t *testing.T) {
 	cfg := testCfg()
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	cfg.SIPListen = freeSIPListenAddress(t)
 	cfg.HeartbeatInterval = "500ms"
 	cfg.RegisterRetryBase = "60ms"
 	cfg.RegisterRetryMax = "240ms"
@@ -133,7 +131,7 @@ func TestRegisterRetryBacksOffExponentially(t *testing.T) {
 
 func TestRegisterRetryBackoffResetsAfterSuccess(t *testing.T) {
 	cfg := testCfg()
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	cfg.SIPListen = freeSIPListenAddress(t)
 	cfg.HeartbeatInterval = "500ms"
 	cfg.RegisterRetryBase = "60ms"
 	cfg.RegisterRetryMax = "10s"
