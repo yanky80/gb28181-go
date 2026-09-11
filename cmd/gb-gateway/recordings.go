@@ -67,6 +67,7 @@ type recordingObservation struct {
 	ModTime     time.Time
 	Info        os.FileInfo
 	StableScans int
+	Verified    bool
 }
 
 type recordingIndexEntry struct {
@@ -206,13 +207,13 @@ func (s *RecordingStore) indexFile(ctx context.Context, id, path, cameraID strin
 	obs, observed := s.observed[id]
 	sameIdentity := observed && obs.Info != nil && os.SameFile(obs.Info, info)
 	sameObservation := sameIdentity && obs.Size == size && obs.ModTime.Equal(info.ModTime())
-	identityChanged := observed && !sameIdentity
+	observationChanged := observed && !sameObservation
 	if !sameObservation {
 		obs = recordingObservation{Size: size, ModTime: info.ModTime(), Info: info, StableScans: 1}
 	} else {
 		obs.StableScans++
 	}
-	if identityChanged {
+	if observationChanged {
 		if _, ok := s.entries[id]; ok {
 			if err := s.deleteLocked(ctx, id); err != nil {
 				s.mu.Unlock()
@@ -222,7 +223,7 @@ func (s *RecordingStore) indexFile(ctx context.Context, id, path, cameraID strin
 	}
 	s.observed[id] = obs
 	alreadyIndexed := false
-	if entry, ok := s.entries[id]; ok && entry.Size == size && sameObservation {
+	if entry, ok := s.entries[id]; ok && entry.Size == size && sameObservation && obs.Verified {
 		alreadyIndexed = true
 	}
 	s.mu.Unlock()
@@ -283,6 +284,8 @@ func (s *RecordingStore) indexFile(ctx context.Context, id, path, cameraID strin
 		return err
 	}
 	s.entries[id] = entry
+	current.Verified = true
+	s.observed[id] = current
 	return nil
 }
 

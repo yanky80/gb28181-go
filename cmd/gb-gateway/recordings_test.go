@@ -356,6 +356,172 @@ func TestRecordingStoreResetsObservationAfterProbeIdentityChange(t *testing.T) {
 	}
 }
 
+func TestRecordingStoreReprobesSameInodeAfterMtimeChange(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	path := filepath.Join(root, "front", now.Format("20060102"), "segment.mp4")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("AAAAAAA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	phaseB := false
+	probes := 0
+	probe := func(_ context.Context, _ string) (recordingProbeResult, error) {
+		probes++
+		start := now
+		if phaseB {
+			start = now.Add(time.Minute)
+		}
+		return recordingProbeResult{
+			Codec: "h264", Timescale: 90000, Frames: 1, Keyframes: 1,
+			KeyframeAt: []recordingKeyframe{{TimeMS: 0, Offset: 0, Size: 7}},
+			StartedAt:  start, EndedAt: start.Add(time.Minute),
+		}, nil
+	}
+	store, err := newRecordingStore(filepath.Join(root, "recordings.jsonl"), root, probe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("BBBBBBB"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newMtime := oldInfo.ModTime().Add(time.Hour)
+	if err := os.Chtimes(path, newMtime, newMtime); err != nil {
+		t.Fatal(err)
+	}
+	newInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(oldInfo, newInfo) || newInfo.Size() != oldInfo.Size() || newInfo.ModTime().Equal(oldInfo.ModTime()) {
+		t.Fatalf("in-place rewrite setup = old=%v new=%v", oldInfo, newInfo)
+	}
+	phaseB = true
+
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ListRecordings(context.Background(), cascade.RecordingFilter{
+		CameraID: "front", StartTime: now.Add(-time.Minute), EndTime: now.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || probes != 1 {
+		t.Fatalf("same-inode rewrite published/probed too early: recordings=%#v probes=%d", got, probes)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.ListRecordings(context.Background(), cascade.RecordingFilter{
+		CameraID: "front", StartTime: now.Add(-time.Minute), EndTime: now.Add(3 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].StartedAt.Equal(now.Add(time.Minute)) || probes != 2 {
+		t.Fatalf("same-inode rewrite metadata = %#v probes=%d, want metadata B after re-probe", got, probes)
+	}
+}
+
+func TestRecordingStoreRevalidatesLoadedEntryAfterSameSizeReplacement(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	path := filepath.Join(root, "front", now.Format("20060102"), "segment.mp4")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("AAAAAAA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	probeA := func(_ context.Context, _ string) (recordingProbeResult, error) {
+		return recordingProbeResult{
+			Codec: "h264", Timescale: 90000, Frames: 1, Keyframes: 1,
+			KeyframeAt: []recordingKeyframe{{TimeMS: 0, Offset: 0, Size: 7}},
+			StartedAt:  now, EndedAt: now.Add(time.Minute),
+		}, nil
+	}
+	indexPath := filepath.Join(root, "recordings.jsonl")
+	store, err := newRecordingStore(indexPath, root, probeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+
+	restartedProbeCalls := 0
+	probeB := func(_ context.Context, _ string) (recordingProbeResult, error) {
+		restartedProbeCalls++
+		start := now.Add(time.Minute)
+		return recordingProbeResult{
+			Codec: "h265", Timescale: 90000, Frames: 1, Keyframes: 1,
+			KeyframeAt: []recordingKeyframe{{TimeMS: 0, Offset: 0, Size: 7}},
+			StartedAt:  start, EndedAt: start.Add(time.Minute),
+		}, nil
+	}
+	restarted, err := newRecordingStore(indexPath, root, probeB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := path + ".replacement"
+	if err := os.WriteFile(replacement, []byte("BBBBBBB"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(replacement, oldInfo.ModTime(), oldInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		t.Fatal(err)
+	}
+	newInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(oldInfo, newInfo) || newInfo.Size() != oldInfo.Size() || !newInfo.ModTime().Equal(oldInfo.ModTime()) {
+		t.Fatalf("restarted replacement setup = old=%v new=%v", oldInfo, newInfo)
+	}
+
+	filter := cascade.RecordingFilter{CameraID: "front", StartTime: now.Add(-time.Minute), EndTime: now.Add(3 * time.Minute)}
+	if err := restarted.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if restartedProbeCalls != 0 {
+		t.Fatalf("restarted entry probed before two stable observations: %d calls", restartedProbeCalls)
+	}
+	if err := restarted.scanAt(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	got, err := restarted.ListRecordings(context.Background(), filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restartedProbeCalls != 1 || len(got) != 1 || got[0].Format != "h265" || !got[0].StartedAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("restarted replacement validation = %#v probes=%d, want metadata B after probe", got, restartedProbeCalls)
+	}
+}
+
 func TestRecordingStoreReloadsWithoutDuplicateAndIgnoresCrashTail(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
