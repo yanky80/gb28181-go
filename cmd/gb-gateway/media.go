@@ -40,12 +40,14 @@ type MediaHost struct {
 	registry *CameraRegistry
 	config   MediaHostConfig
 
-	mu          sync.Mutex
-	listener    net.Listener
-	connections map[string]*mediaConnection
-	active      map[*mediaConnection]struct{}
-	nextOrder   atomic.Uint64
-	closed      bool
+	mu           sync.Mutex
+	listener     net.Listener
+	connections  map[string]*mediaConnection
+	active       map[*mediaConnection]struct{}
+	nextOrder    atomic.Uint64
+	connectionWG sync.WaitGroup
+	closeDone    chan struct{}
+	closed       bool
 }
 
 // NewMediaHost creates a media.sock host. A zero timeout uses the gateway
@@ -62,6 +64,7 @@ func NewMediaHost(registry *CameraRegistry, config MediaHostConfig) *MediaHost {
 		config:      config,
 		connections: make(map[string]*mediaConnection),
 		active:      make(map[*mediaConnection]struct{}),
+		closeDone:   make(chan struct{}),
 	}
 }
 
@@ -124,7 +127,18 @@ func (s *MediaHost) Serve(ctx context.Context) error {
 			}
 			return err
 		}
-		go func() { _ = s.ServeConn(conn) }()
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		s.connectionWG.Add(1)
+		s.mu.Unlock()
+		go func() {
+			defer s.connectionWG.Done()
+			_ = s.ServeConn(conn)
+		}()
 	}
 }
 
@@ -173,7 +187,9 @@ func (s *MediaHost) ServeConn(conn net.Conn) error {
 func (s *MediaHost) Close() error {
 	s.mu.Lock()
 	if s.closed {
+		done := s.closeDone
 		s.mu.Unlock()
+		<-done
 		return nil
 	}
 	s.closed = true
@@ -195,6 +211,8 @@ func (s *MediaHost) Close() error {
 	for _, c := range connections {
 		c.close()
 	}
+	s.connectionWG.Wait()
+	close(s.closeDone)
 	return err
 }
 

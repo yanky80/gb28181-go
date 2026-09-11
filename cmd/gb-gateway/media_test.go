@@ -452,6 +452,41 @@ func TestMediaHostUses0660Socket(t *testing.T) {
 	}
 }
 
+func TestMediaHostServeClosesPeerAndWaitsForHandler(t *testing.T) {
+	r := newRegistry(t, CameraSpec{ID: "cam-a"})
+	path := filepath.Join(t.TempDir(), "media.sock")
+	s := NewMediaHost(r, MediaHostConfig{Path: path})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx) }()
+	if err := waitForPath(path); err != nil {
+		t.Fatal(err)
+	}
+	peer, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := peer.Read(one[:]); err == nil {
+		t.Fatal("media peer remained open after close")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve() did not return after close")
+	}
+}
+
 func TestMediaHostCloseStopsUnboundConnection(t *testing.T) {
 	r := newRegistry(t, CameraSpec{ID: "cam-a"})
 	s := NewMediaHost(r, MediaHostConfig{})
