@@ -1,6 +1,8 @@
 package platform
 
 import (
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -86,4 +88,71 @@ func TestFrameHubPassesIDRFlag(t *testing.T) {
 
 	require.Equal(t, true, <-got, "keyframe flag must reach the consumer")
 	require.Equal(t, false, <-got, "non-keyframe flag must reach the consumer")
+}
+
+func TestFrameHubCloseReleasesVideoAndAudioConsumers(t *testing.T) {
+	h := NewFrameHub()
+	video := make(chan struct{}, 1)
+	audio := make(chan struct{}, 1)
+	require.NoError(t, h.Subscribe("video", func(int64, [][]byte, bool) { video <- struct{}{} }))
+	require.NoError(t, h.SubscribeAudio("audio", func(int64, string, []byte) { audio <- struct{}{} }))
+	require.Equal(t, 2, h.ConsumerCount())
+
+	h.Broadcast(1, [][]byte{{1}}, false)
+	h.BroadcastAudio(1, "g711a", []byte{1})
+	select {
+	case <-video:
+	case <-time.After(time.Second):
+		t.Fatal("video consumer did not receive the frame")
+	}
+	select {
+	case <-audio:
+	case <-time.After(time.Second):
+		t.Fatal("audio consumer did not receive the frame")
+	}
+
+	h.Close()
+	h.Close()
+	require.Equal(t, 0, h.ConsumerCount())
+	require.Error(t, h.Subscribe("after-close", func(int64, [][]byte, bool) {}))
+	require.Error(t, h.SubscribeAudio("after-close", func(int64, string, []byte) {}))
+	h.Broadcast(2, [][]byte{{1}}, false)
+	h.BroadcastAudio(2, "g711a", []byte{1})
+	select {
+	case <-video:
+		t.Fatal("closed video consumer received a frame")
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case <-audio:
+		t.Fatal("closed audio consumer received a frame")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestFrameHubCloseConvergesWithConcurrentOperations(t *testing.T) {
+	h := NewFrameHub()
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("video-%d", i)
+			_ = h.Subscribe(id, func(int64, [][]byte, bool) {})
+			_ = h.SubscribeAudio("audio-"+id, func(int64, string, []byte) {})
+			for j := 0; j < 20; j++ {
+				h.Broadcast(int64(j), [][]byte{{1}}, false)
+				h.BroadcastAudio(int64(j), "g711a", []byte{1})
+			}
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		h.Close()
+		h.Close()
+	}()
+	wg.Wait()
+	require.Equal(t, 0, h.ConsumerCount())
+	h.Close()
 }
