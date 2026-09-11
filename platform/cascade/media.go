@@ -154,6 +154,21 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	if s.srv == nil {
 		return
 	}
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+		return
+	}
+	u := s.upperOf(req)
+	if u == nil {
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
+	if u.stale.Load() {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Registration Pending", "", nil)
+		return
+	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
@@ -170,7 +185,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	// Playback/download dialogs take the recordings-backed path (download =
 	// same pump without 1x pacing, #378).
 	if strings.EqualFold(sd.name, "Playback") || strings.EqualFold(sd.name, "Download") {
-		s.onPlaybackInvite(req, callID, channelID, sd)
+		s.onPlaybackInvite(req, callID, channelID, sd, u)
 		return
 	}
 
@@ -178,12 +193,22 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	// for a live playback restarts it when the requested window moved.
 	s.mu.Lock()
 	if ms, ok := s.sessions[callID]; ok {
+		if ms.upper != u {
+			s.mu.Unlock()
+			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+			return
+		}
 		sdp := ms.sdpBody
 		s.mu.Unlock()
 		_, _ = s.srv.RespondOnRequest(req, 200, "OK", sdp, nil)
 		return
 	}
 	if ps, ok := s.playbacks[callID]; ok {
+		if ps.upper != u {
+			s.mu.Unlock()
+			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+			return
+		}
 		sameWindow := sd.hasT && abs64(sd.t0-ps.start.Unix()) < 2 && abs64(sd.t1-ps.end.Unix()) < 2
 		if sameWindow {
 			sdp := ps.sdpBody
@@ -260,7 +285,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 
 	ms := &mediaSession{
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
-		upper: s.upperOf(req),
+		upper: u,
 		conn:  conn, dst: dst, ssrc: sd.ssrc,
 		mux:       psmux.New(),
 		withAudio: strings.Contains(string(req.Body()), "m=audio"),
@@ -506,18 +531,27 @@ func (ms *mediaSession) run(hub *platform.FrameHub) {
 // onBye tears a forward or playback dialog down when the upper platform
 // sends BYE.
 func (s *Service) onBye(req sip.Request, _ sip.ServerTransaction) {
+	u := s.upperOf(req)
+	if u == nil {
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
 	}
-	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
-
 	s.mu.Lock()
 	ms := s.sessions[callID]
-	delete(s.sessions, callID)
 	ps := s.playbacks[callID]
+	if (ms != nil && ms.upper != u) || (ps != nil && ps.upper != u) {
+		s.mu.Unlock()
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
+	delete(s.sessions, callID)
 	delete(s.playbacks, callID)
 	s.mu.Unlock()
+	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	if ms != nil {
 		ms.close()
 		slog.Info("gb28181-cascade: BYE — forward stopped", "channel", ms.channel)

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ghettovoice/gosip/sip"
@@ -23,6 +24,7 @@ type catalogSub struct {
 	fromUser string
 	toUser   string
 	expires  time.Time
+	sendMu   sync.Mutex
 }
 
 // notifyScanInterval is how often the camera set is diffed for changes.
@@ -32,6 +34,12 @@ var notifyScanInterval = 10 * time.Second
 // dialog for change-driven NOTIFYs. Non-catalog events get Expires 0 (upper
 // falls back to polling).
 func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.stopping.Load() || s.ctx == nil || s.ctx.Err() != nil {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+		return
+	}
 	event := ""
 	for _, h := range req.GetHeaders("Event") {
 		if e, ok := h.(*sip.Event); ok {
@@ -66,6 +74,10 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 	}
 
 	u := s.upperOf(req)
+	if u == nil {
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
@@ -74,19 +86,20 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 	expHdr := sip.Expires(uint32(expires))
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", []sip.Header{&expHdr})
 
-	s.mu.Lock()
-	s.subs[callID] = &catalogSub{
+	sub := &catalogSub{
 		upper:    u,
 		callID:   callID,
 		fromUser: fromUser,
 		toUser:   toUser,
 		expires:  time.Now().Add(time.Duration(expires) * time.Second),
 	}
+	s.mu.Lock()
+	s.subs[callID] = sub
 	s.mu.Unlock()
 	slog.Info("gb28181-cascade: catalog subscription active",
 		"upper", u.cfg.ServerAddr, "expires", expires)
 	// A fresh subscription immediately gets the current catalog state.
-	go s.sendCatalogNotify(s.subs[callID])
+	go s.sendCatalogNotify(sub)
 }
 
 // catalogNotifyLoop diffs the camera set and pushes NOTIFYs on change until
@@ -105,15 +118,21 @@ func (s *Service) catalogNotifyLoop() {
 		last = cur
 		s.mu.Lock()
 		subs := make([]*catalogSub, 0, len(s.subs))
+		expired := make([]*catalogSub, 0)
 		now := time.Now()
 		for k, sub := range s.subs {
 			if now.After(sub.expires) {
 				delete(s.subs, k)
+				expired = append(expired, sub)
 				continue
 			}
 			subs = append(subs, sub)
 		}
 		s.mu.Unlock()
+		for _, sub := range expired {
+			sub.sendMu.Lock()
+			sub.sendMu.Unlock()
+		}
 		for _, sub := range subs {
 			go s.sendCatalogNotify(sub)
 		}
@@ -153,6 +172,14 @@ type catalogNotifyBody struct {
 // form — receivers merge; deltas are optional in the standard).
 func (s *Service) sendCatalogNotify(sub *catalogSub) {
 	if s.srv == nil || sub == nil {
+		return
+	}
+	sub.sendMu.Lock()
+	defer sub.sendMu.Unlock()
+	s.mu.Lock()
+	active := s.subs[sub.callID] == sub
+	s.mu.Unlock()
+	if !active {
 		return
 	}
 	items, err := s.catalogItems()

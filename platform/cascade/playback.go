@@ -70,7 +70,7 @@ type pbCtrl struct {
 // a sendonly s= answer, and pump the media. Downloads skip the 1x pacing and
 // stream at file speed. 404 when the channel is unknown or the window holds
 // no recordings (the platform surfaces that as a fetch error).
-func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP) {
+func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP, u *upper) {
 	cameraID, ok := s.cameraOfChannel(channelID)
 	if !ok {
 		slog.Warn("gb28181-cascade: playback INVITE for unknown channel", "channel", channelID)
@@ -108,7 +108,6 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	if strings.EqualFold(sd.name, "Download") {
 		sdpName = "Download"
 	}
-	u := s.upperOf(req)
 	ps := &playbackSession{
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
 		upper: u, start: start, end: end, download: sdpName == "Download",
@@ -404,7 +403,11 @@ func (ps *playbackSession) stop() {
 // onInfo answers the upper platform's in-dialog INFO and routes MANSRTSP
 // playback controls to the channel's playback session.
 func (s *Service) onInfo(req sip.Request, _ sip.ServerTransaction) {
-	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
+	u := s.upperOf(req)
+	if u == nil {
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
@@ -412,6 +415,11 @@ func (s *Service) onInfo(req sip.Request, _ sip.ServerTransaction) {
 	s.mu.Lock()
 	ps := s.playbacks[callID]
 	s.mu.Unlock()
+	if ps != nil && ps.upper != u {
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
+	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	if ps == nil {
 		return // INFO on a live-forward dialog: nothing to control
 	}
