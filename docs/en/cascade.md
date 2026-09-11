@@ -55,6 +55,9 @@ yields `SegmentInfo` (codec + parameter sets + timestamped samples)
 per segment file; hosts with an fMP4 pipeline adapt their parser with
 a thin wrapper (field names already match).
 
+For recorded segments in the supported fragmented MP4 format,
+`platform/mp4.ParseSegment` can be passed directly to `SetSegmentParser`.
+
 ## What the upper platform sees
 
 - **Catalog** — your cameras as channels, with **stable first-seen

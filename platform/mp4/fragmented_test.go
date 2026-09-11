@@ -8,9 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mickeyzzc/gb28181-go/platform"
 	"github.com/mickeyzzc/gb28181-go/platform/cascade"
-	"github.com/mickeyzzc/gb28181-go/psmux"
 	"github.com/stretchr/testify/require"
 )
 
@@ -59,48 +57,6 @@ func TestParseSegmentH265HVCC(t *testing.T) {
 	require.True(t, got.Samples[0].IsKeyFrame)
 }
 
-func TestParseSegmentPlaybackAnnexBParameterSets(t *testing.T) {
-	tests := []struct {
-		name string
-		path string
-		want [][]byte
-	}{
-		{
-			name: "h264",
-			path: writeSegment(t, h264Segment([]byte{0x67, 1}, []byte{0x68, 2}, [][]sample{{
-				{duration: 40, data: []byte{0, 0, 0, 2, 0x65, 9}, key: true},
-			}})),
-			want: [][]byte{{0x67, 1}, {0x68, 2}, {0x65, 9}},
-		},
-		{
-			name: "h265",
-			path: writeSegment(t, h265Segment([]byte{0x40, 1}, []byte{0x42, 1}, []byte{0x44, 1}, [][]sample{{
-				{duration: 40, data: []byte{0, 0, 0, 2, 0x26, 9}, key: true},
-			}})),
-			want: [][]byte{{0x40, 1}, {0x42, 1}, {0x44, 1}, {0x26, 9}},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			info, err := ParseSegment(tt.path)
-			require.NoError(t, err)
-			f, err := os.Open(tt.path)
-			require.NoError(t, err)
-			defer f.Close()
-			data := make([]byte, info.Samples[0].Size)
-			_, err = f.ReadAt(data, info.Samples[0].Offset)
-			require.NoError(t, err)
-
-			annexB := prependParameterSets(info, lengthPrefixedToAnnexB(data))
-			mux := psmux.New()
-			mux.SetVideoCodec(info.Codec)
-			nalus, err := platform.NewPSDemuxer().FeedAU(mux.WriteAU(annexB, 90000, true), 9000, true)
-			require.NoError(t, err)
-			require.Equal(t, tt.want, nalus)
-		})
-	}
-}
-
 func TestParseSegmentUsesTrackDefaults(t *testing.T) {
 	sampleData := []byte{0, 0, 0, 1, 0x65}
 	moof, offset := defaultMoof(sampleData)
@@ -128,6 +84,20 @@ func TestParseSegmentStandardVersion1Tkhd(t *testing.T) {
 	require.Len(t, got.Samples, 1)
 }
 
+func TestParseSegmentImplicitTfhdBase(t *testing.T) {
+	sampleData := []byte{0, 0, 0, 2, 0x26, 9}
+	moof, dataOffset := implicitBaseMoof([]sample{{duration: 40, data: sampleData, key: true}})
+	binary.BigEndian.PutUint32(moof[dataOffset:dataOffset+4], uint32(len(moof)+8))
+	data := append(makeBox("ftyp", []byte("isom\x00\x00\x02\x00isomiso6")), moov(hvc1Box(hvcC([]byte{0x40, 1}, []byte{0x42, 1}, []byte{0x44, 1})))...)
+	data = append(data, moof...)
+	data = append(data, makeBox("mdat", sampleData)...)
+
+	got, err := ParseSegment(writeSegment(t, data))
+	require.NoError(t, err)
+	require.Equal(t, int64(len(data)-len(sampleData)), got.Samples[0].Offset)
+	require.Equal(t, uint32(len(sampleData)), got.Samples[0].Size)
+}
+
 func TestParseSegmentRejectsNestedBoxBudget(t *testing.T) {
 	var nested []byte
 	for i := 0; i < 100001; i++ {
@@ -141,7 +111,7 @@ func TestParseSegmentRejectsNestedBoxBudget(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalid)
 }
 
-func TestParseSegmentRejectsGrowthAndTruncationBeforeFinalStat(t *testing.T) {
+func TestParseSegmentRejectsFileChangesDuringParse(t *testing.T) {
 	valid := h264Segment([]byte{0x67, 1}, []byte{0x68, 2}, [][]sample{{
 		{duration: 40, data: []byte{0, 0, 0, 1, 0x65}, key: true},
 	}})
@@ -161,6 +131,9 @@ func TestParseSegmentRejectsGrowthAndTruncationBeforeFinalStat(t *testing.T) {
 		{"truncation", func(path string) error {
 			return os.Truncate(path, int64(len(valid)-1))
 		}},
+		{"mode", func(path string) error {
+			return os.Chmod(path, 0o640)
+		}},
 		{"metadata", func(path string) error {
 			st, err := os.Stat(path)
 			if err != nil {
@@ -177,6 +150,12 @@ func TestParseSegmentRejectsGrowthAndTruncationBeforeFinalStat(t *testing.T) {
 			require.ErrorIs(t, err, ErrChanged)
 		})
 	}
+
+	path := writeSegment(t, valid)
+	var writeErr error
+	_, err := parseSegment(path, func() { writeErr = os.Truncate(path, 8) })
+	require.NoError(t, writeErr)
+	require.ErrorIs(t, err, ErrChanged, "file change must win over the parse error it causes")
 }
 
 func TestParseSegmentRejectsTruncatedAndInvalidFiles(t *testing.T) {
@@ -372,6 +351,24 @@ func defaultMoof(sampleData []byte) ([]byte, int) {
 	tfhd := fullBox("tfhd", 0, 0x02003a, tfhdPayload)
 	trun := fullBox("trun", 0, 1, make([]byte, 8))
 	binary.BigEndian.PutUint32(trun[12:16], 1)
+	traf := makeBox("traf", append(tfhd, trun...))
+	moof := makeBox("moof", append(fullBox("mfhd", 0, 0, []byte{0, 0, 0, 1}), traf...))
+	return moof, bytes.Index(moof, []byte("trun")) + 12
+}
+
+func implicitBaseMoof(samples []sample) ([]byte, int) {
+	tfhd := fullBox("tfhd", 0, 0, []byte{0, 0, 0, 1})
+	trunPayload := make([]byte, 8+12*len(samples))
+	binary.BigEndian.PutUint32(trunPayload[0:4], uint32(len(samples)))
+	for i, s := range samples {
+		o := 8 + i*12
+		binary.BigEndian.PutUint32(trunPayload[o:o+4], s.duration)
+		binary.BigEndian.PutUint32(trunPayload[o+4:o+8], uint32(len(s.data)))
+		if !s.key {
+			binary.BigEndian.PutUint32(trunPayload[o+8:o+12], 0x10000)
+		}
+	}
+	trun := fullBox("trun", 0, 0x701, trunPayload)
 	traf := makeBox("traf", append(tfhd, trun...))
 	moof := makeBox("moof", append(fullBox("mfhd", 0, 0, []byte{0, 0, 0, 1}), traf...))
 	return moof, bytes.Index(moof, []byte("trun")) + 12

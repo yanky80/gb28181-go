@@ -1,4 +1,4 @@
-// Package mp4 parses the small ISO BMFF subset used by the cascade recorder:
+// Package mp4 parses recorded segment files in the small ISO BMFF subset:
 // one video track in a fragmented MP4 file, with avcC/hvcC metadata and trun
 // sample tables. It deliberately does not decode media payloads.
 package mp4
@@ -39,7 +39,7 @@ func ParseSegment(path string) (*cascade.SegmentInfo, error) {
 	return parseSegment(path, nil)
 }
 
-func parseSegment(path string, beforeFinalStat func()) (*cascade.SegmentInfo, error) {
+func parseSegment(path string, duringParse func()) (*cascade.SegmentInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("mp4: open %s: %w", path, err)
@@ -52,19 +52,17 @@ func parseSegment(path string, beforeFinalStat func()) (*cascade.SegmentInfo, er
 	if st.Size() < 8 {
 		return nil, fmt.Errorf("%w: file is too short", ErrTruncated)
 	}
-	info, err := (&parser{r: f, size: st.Size()}).parse()
-	if err != nil {
-		return nil, err
-	}
-	if beforeFinalStat != nil {
-		beforeFinalStat()
-	}
+	p := &parser{r: f, size: st.Size(), onReadBox: duringParse}
+	info, parseErr := p.parse()
 	end, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("mp4: final stat %s: %w", path, err)
 	}
 	if end.Size() != st.Size() || end.Mode() != st.Mode() || !end.ModTime().Equal(st.ModTime()) {
 		return nil, fmt.Errorf("%w: %s", ErrChanged, path)
+	}
+	if parseErr != nil {
+		return nil, parseErr
 	}
 	return info, nil
 }
@@ -74,6 +72,7 @@ type parser struct {
 	size      int64
 	boxCount  int
 	metaCount int
+	onReadBox func()
 }
 
 type box struct {
@@ -527,28 +526,33 @@ func readParameterSets(v []byte, off, count int) ([]byte, int, error) {
 }
 
 func (p *parser) parseMoof(moof box, track *trackInfo) ([]cascade.SegmentSample, error) {
-	var out []cascade.SegmentSample
+	var trafs []box
 	for off := moof.payload; off < moof.end; {
 		b, err := p.readBox(off, moof.end, false)
 		if err != nil {
 			return nil, err
 		}
 		if b.typ == "traf" {
-			part, err := p.parseTraf(b, moof, track)
-			if err != nil {
-				return nil, err
-			}
-			if len(out)+len(part) > maxSamples {
-				return nil, invalid("sample count exceeds limit")
-			}
-			out = append(out, part...)
+			trafs = append(trafs, b)
 		}
 		off = b.end
+	}
+
+	var out []cascade.SegmentSample
+	for _, b := range trafs {
+		part, err := p.parseTraf(b, moof, track, len(trafs) == 1)
+		if err != nil {
+			return nil, err
+		}
+		if len(out)+len(part) > maxSamples {
+			return nil, invalid("sample count exceeds limit")
+		}
+		out = append(out, part...)
 	}
 	return out, nil
 }
 
-func (p *parser) parseTraf(traf, moof box, track *trackInfo) ([]cascade.SegmentSample, error) {
+func (p *parser) parseTraf(traf, moof box, track *trackInfo, singleTraf bool) ([]cascade.SegmentSample, error) {
 	var tfhd, trun []box
 	for off := traf.payload; off < traf.end; {
 		b, err := p.readBox(off, traf.end, false)
@@ -621,7 +625,17 @@ func (p *parser) parseTraf(traf, moof box, track *trackInfo) ([]cascade.SegmentS
 		off += 4
 	}
 	if flags&0x000001 == 0 && flags&0x020000 == 0 {
-		return nil, invalid("tfhd has no data base")
+		if !singleTraf {
+			return nil, invalid("implicit tfhd base requires a single traf")
+		}
+		firstFlags, _, err := p.fullBox(trun[0])
+		if err != nil {
+			return nil, err
+		}
+		if firstFlags&1 == 0 {
+			return nil, invalid("implicit tfhd base requires first trun data offset")
+		}
+		base = moof.start
 	}
 
 	var out []cascade.SegmentSample
@@ -822,6 +836,11 @@ func (p *parser) readBox(off, limit int64, allowZero bool) (box, error) {
 	end := off + int64(size)
 	if end <= off {
 		return box{}, invalid("box offset overflows")
+	}
+	if p.onReadBox != nil {
+		hook := p.onReadBox
+		p.onReadBox = nil
+		hook()
 	}
 	return box{start: off, payload: off + header, end: end, typ: string(h[4:8])}, nil
 }
