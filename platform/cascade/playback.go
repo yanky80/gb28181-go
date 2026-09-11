@@ -71,6 +71,16 @@ type pbCtrl struct {
 // stream at file speed. 404 when the channel is unknown or the window holds
 // no recordings (the platform surfaces that as a fetch error).
 func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP, u *upper, generation uint64) {
+	s.mu.Lock()
+	live := s.sessions[callID]
+	current := s.playbacks[callID]
+	if (live != nil && live.upper != u) || (current != nil && current.upper != u) {
+		s.mu.Unlock()
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
+	s.mu.Unlock()
+
 	cameraID, ok := s.cameraOfChannel(channelID)
 	if !ok {
 		slog.Warn("gb28181-cascade: playback INVITE for unknown channel", "channel", channelID)
@@ -90,7 +100,28 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	if end.Sub(start) > pbMaxWindow {
 		end = start.Add(pbMaxWindow)
 	}
-	if recs, err := s.playbackRecordings(cameraID, start, end); err == nil && len(recs) == 0 {
+	if current != nil && abs64(sd.t0-current.start.Unix()) < 2 && abs64(sd.t1-current.end.Unix()) < 2 {
+		_, _ = s.srv.RespondOnRequest(req, 200, "OK", current.sdpBody, nil)
+		return
+	}
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	recs, queryErr := s.playbackRecordings(ctx, cameraID, start, end)
+	if queryErr != nil {
+		if ctx.Err() != nil {
+			_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+		} else {
+			_, _ = s.srv.RespondOnRequest(req, 500, "Recording Store Unavailable", "", nil)
+		}
+		return
+	}
+	if s.stopping.Load() || ctx.Err() != nil {
+		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
+		return
+	}
+	if len(recs) == 0 {
 		slog.Info("gb28181-cascade: playback INVITE for empty window",
 			"channel", channelID, "start", start, "end", end)
 		_, _ = s.srv.RespondOnRequest(req, 404, "No Records", "", nil)
@@ -127,10 +158,10 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		upper: u, start: start, end: end, download: sdpName == "Download",
 		conn: conn, ssrc: sd.ssrc,
 		generation: generation,
-		mux:  psmux.New(),
-		rtp:  rtp,
-		ctrl: make(chan pbCtrl, 8),
-		done: make(chan struct{}),
+		mux:        psmux.New(),
+		rtp:        rtp,
+		ctrl:       make(chan pbCtrl, 8),
+		done:       make(chan struct{}),
 	}
 	ps.sdpBody = fmt.Sprintf(
 		"v=0\r\no=- 0 0 IN IP4 %s\r\ns=%s\r\nc=IN IP4 %s\r\nt=%s %s\r\n"+
@@ -145,8 +176,18 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	}
 
 	s.mu.Lock()
+	old := s.playbacks[callID]
+	if old != nil && old.upper != u {
+		s.mu.Unlock()
+		_ = conn.Close()
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
 	s.playbacks[callID] = ps
 	s.mu.Unlock()
+	if old != nil {
+		old.stop()
+	}
 
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", ps.sdpBody, nil)
 	go ps.pump()
@@ -160,8 +201,8 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 // start is padded — ListRecordings filters on "started_at within window", so
 // a recording straddling the window start would otherwise be missed; the
 // sample-level wall-time trim in playOnce aligns playback to the exact edge.
-func (s *Service) playbackRecordings(cameraID string, start, end time.Time) ([]Recording, error) {
-	recs, err := s.db.ListRecordings(context.Background(), RecordingFilter{
+func (s *Service) playbackRecordings(ctx context.Context, cameraID string, start, end time.Time) ([]Recording, error) {
+	recs, err := s.db.ListRecordings(ctx, RecordingFilter{
 		CameraID:  cameraID,
 		StartTime: start.Add(-2 * time.Hour),
 		EndTime:   end,
@@ -213,7 +254,11 @@ func (ps *playbackSession) pump() {
 // playOnce streams the window once (skipping to seekNPT seconds past the
 // window start). Returns (windowDone, seekRequest, fatalErr).
 func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
-	recs, err := ps.svc.playbackRecordings(ps.camera, ps.start, ps.end)
+	ctx := ps.svc.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	recs, err := ps.svc.playbackRecordings(ctx, ps.camera, ps.start, ps.end)
 	if err != nil {
 		slog.Warn("gb28181-cascade: playback recordings query failed",
 			"camera", ps.camera, "error", err)
@@ -433,22 +478,13 @@ func (s *Service) onInfo(req sip.Request, _ sip.ServerTransaction) {
 	ms := s.sessions[callID]
 	ps := s.playbacks[callID]
 	s.mu.Unlock()
-	if ps != nil && ps.upper != u {
+	if (ms != nil && ms.upper != u) || (ps != nil && ps.upper != u) {
 		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 		return
 	}
-	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	if ps == nil {
-		if ms != nil && ms.upper != u {
-			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-			return
-		}
 		_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 		return // INFO on a live-forward dialog: nothing to control
-	}
-	if ps.upper != u {
-		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-		return
 	}
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 

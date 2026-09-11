@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,8 +53,13 @@ func TestH265PlaybackPumpUsesPublicSeams(t *testing.T) {
 	}
 	svc := cascade.New(cfg, blackBoxCameraSource{}, store)
 	svc.SetSegmentParser(ParseSegment)
+	registerStop := make(chan struct{})
+	go blackBoxServeRegister(upper, registerStop)
+	t.Cleanup(func() { close(registerStop) })
 	require.NoError(t, svc.Start(context.Background()))
 	t.Cleanup(func() { _ = svc.Stop() })
+	require.Eventually(t, svc.Online, time.Second, time.Millisecond,
+		"playback admission requires a completed registration")
 
 	invite, callID := blackBoxPlaybackInvite(t, channelID, upper.LocalAddr().(*net.UDPAddr).Port, rtp.LocalAddr().(*net.UDPAddr).Port, start, end)
 	serviceAddr, err := net.ResolveUDPAddr("udp", cfg.SIPListen)
@@ -67,6 +73,40 @@ func TestH265PlaybackPumpUsesPublicSeams(t *testing.T) {
 	nalus, err := platform.NewPSDemuxer().FeedAU(au, 9000, true)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{{0x40, 1}, {0x42, 1}, {0x44, 1}, {0x26, 9}}, nalus)
+}
+
+func blackBoxServeRegister(conn *net.UDPConn, stop <-chan struct{}) {
+	buf := make([]byte, 65535)
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		n, src, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		msg, err := sipparser.ParseMessage(buf[:n], log.NewDefaultLogrusLogger())
+		if err != nil {
+			continue
+		}
+		req, ok := msg.(sip.Request)
+		if !ok || req.Method() != sip.REGISTER {
+			continue
+		}
+		var response strings.Builder
+		response.WriteString("SIP/2.0 200 OK\r\n")
+		for _, name := range []string{"Via", "From", "To", "Call-ID", "CSeq", "Max-Forwards"} {
+			for _, header := range req.GetHeaders(name) {
+				response.WriteString(name + ": " + header.Value() + "\r\n")
+			}
+		}
+		response.WriteString("Content-Length: 0\r\n\r\n")
+		_, _ = conn.WriteToUDP([]byte(response.String()), src)
+		return
+	}
 }
 
 type blackBoxCameraSource struct{}

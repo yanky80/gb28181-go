@@ -261,13 +261,6 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		return
 	}
 
-	s.admissionMu.Lock()
-	defer s.admissionMu.Unlock()
-	if s.stopping.Load() {
-		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
-		return
-	}
-
 	// Playback/download dialogs take the recordings-backed path (download =
 	// same pump without 1x pacing, #378).
 	if strings.EqualFold(sd.name, "Playback") || strings.EqualFold(sd.name, "Download") {
@@ -418,8 +411,14 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", ms.sdpBody, nil)
 	go ms.run(hub)
+	mediaTarget := "<nil>"
+	if dst != nil {
+		mediaTarget = dst.String()
+	} else if conn != nil && conn.RemoteAddr() != nil {
+		mediaTarget = conn.RemoteAddr().String()
+	}
 	slog.Info("gb28181-cascade: INVITE accepted — forwarding",
-		"channel", channelID, "camera", cameraID, "to", dst.String(), "ssrc", sd.ssrc)
+		"channel", channelID, "camera", cameraID, "to", mediaTarget, "ssrc", sd.ssrc)
 }
 
 func abs64(v int64) int64 {

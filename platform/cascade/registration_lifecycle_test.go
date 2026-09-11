@@ -261,6 +261,7 @@ func TestDialogOwnershipIsolatedAcrossUppers(t *testing.T) {
 	}}
 	hub := platform.NewFrameHub()
 	svc, up := startLoopbackServiceWithConfig(t, cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, nil)
+	secondUp := newUpperSocketOn(t, up.sip.String(), "127.0.0.2")
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
 
@@ -270,23 +271,32 @@ func TestDialogOwnershipIsolatedAcrossUppers(t *testing.T) {
 	id, ok := invite.CallID()
 	require.True(t, ok)
 
-	foreign := up.requestDialog(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp", id)
+	foreign := secondUp.requestDialog(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp", id)
 	from, ok := foreign.From()
 	require.True(t, ok)
 	uri, ok := from.Address.(*sip.SipUri)
 	require.True(t, ok)
 	uri.SetUser(sip.String{Str: "34020000002000000003"})
-	res = up.roundTrip(foreign)
+	res = secondUp.roundTrip(foreign)
 	require.Equal(t, 403, int(res.StatusCode()))
 	require.Len(t, sessionIDs(svc), 1)
 
-	bye := up.requestDialog(sip.BYE, lbChannelOne, "", "", id)
+	info := secondUp.requestDialog(sip.INFO, lbChannelOne, "", "", id)
+	from, ok = info.From()
+	require.True(t, ok)
+	uri, ok = from.Address.(*sip.SipUri)
+	require.True(t, ok)
+	uri.SetUser(sip.String{Str: "34020000002000000003"})
+	res = secondUp.roundTrip(info)
+	require.Equal(t, 403, int(res.StatusCode()))
+
+	bye := secondUp.requestDialog(sip.BYE, lbChannelOne, "", "", id)
 	from, ok = bye.From()
 	require.True(t, ok)
 	uri, ok = from.Address.(*sip.SipUri)
 	require.True(t, ok)
 	uri.SetUser(sip.String{Str: "34020000002000000003"})
-	res = up.roundTrip(bye)
+	res = secondUp.roundTrip(bye)
 	require.Equal(t, 403, int(res.StatusCode()))
 	require.Len(t, sessionIDs(svc), 1)
 }
@@ -300,22 +310,163 @@ func TestSameChannelInvitesFromDifferentUppersCoexist(t *testing.T) {
 	}}
 	hub := platform.NewFrameHub()
 	svc, up := startLoopbackServiceWithConfig(t, cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, nil)
+	secondUp := newUpperSocketOn(t, up.sip.String(), "127.0.0.2")
 	_, err := svc.catalogItems()
 	require.NoError(t, err)
 	first := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
 	res := up.roundTrip(first)
 	require.Equal(t, 200, int(res.StatusCode()))
 
-	second := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	second := secondUp.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
 	from, ok := second.From()
 	require.True(t, ok)
 	uri, ok := from.Address.(*sip.SipUri)
 	require.True(t, ok)
 	uri.SetUser(sip.String{Str: "34020000002000000003"})
-	res = up.roundTrip(second)
+	res = secondUp.roundTrip(second)
 	require.Equal(t, 200, int(res.StatusCode()))
 	require.Eventually(t, func() bool { return len(sessionIDs(svc)) == 2 }, time.Second, time.Millisecond)
 	require.Equal(t, 2, hub.ConsumerCount(), "different uppers must retain both same-channel live leases")
+}
+
+func TestPlaybackInviteCannotTakeLiveDialogFromAnotherUpper(t *testing.T) {
+	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
+	cfg.Upstreams = []Upstream{{
+		ServerDomain: "34020000002000000003",
+		ServerAddr:   "127.0.0.2:5060",
+	}}
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackServiceWithConfig(t, cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, newCascadeTestDB(t))
+	secondUp := newUpperSocketOn(t, up.sip.String(), "127.0.0.2")
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	live := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	require.Equal(t, 200, int(up.roundTrip(live).StatusCode()))
+	callID, ok := live.CallID()
+	require.True(t, ok)
+
+	playback := secondUp.requestDialog(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp", callID)
+	from, ok := playback.From()
+	require.True(t, ok)
+	uri, ok := from.Address.(*sip.SipUri)
+	require.True(t, ok)
+	uri.SetUser(sip.String{Str: "34020000002000000003"})
+	res := secondUp.roundTrip(playback)
+	require.Equal(t, 403, int(res.StatusCode()))
+	require.Len(t, sessionIDs(svc), 1, "cross-upper playback must not replace the live dialog")
+	require.Empty(t, playbackIDs(svc))
+}
+
+func TestPlaybackDialogOwnershipAcrossUppers(t *testing.T) {
+	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
+	cfg.Upstreams = []Upstream{{
+		ServerDomain: "34020000002000000003",
+		ServerAddr:   "127.0.0.2:5060",
+	}}
+	hub := platform.NewFrameHub()
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackServiceWithConfig(t, cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	secondUp := newUpperSocketOn(t, up.sip.String(), "127.0.0.2")
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	createPacedPlaybackSegment(t, db, "cam-1", time.Now().UTC().Add(-10*time.Minute))
+
+	first := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp")
+	require.Equal(t, 200, int(up.roundTrip(first).StatusCode()))
+	require.Eventually(t, func() bool { return len(playbackIDs(svc)) == 1 }, time.Second, time.Millisecond)
+	callID, ok := first.CallID()
+	require.True(t, ok)
+	callKey := callID.String()
+	svc.mu.Lock()
+	original := svc.playbacks[callKey]
+	svc.mu.Unlock()
+	require.NotNil(t, original)
+
+	foreignPlayback := secondUp.requestDialog(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp", callID)
+	from, ok := foreignPlayback.From()
+	require.True(t, ok)
+	uri, ok := from.Address.(*sip.SipUri)
+	require.True(t, ok)
+	uri.SetUser(sip.String{Str: "34020000002000000003"})
+	res := secondUp.roundTrip(foreignPlayback)
+	require.Equal(t, 403, int(res.StatusCode()))
+	svc.mu.Lock()
+	got := svc.playbacks[callKey]
+	svc.mu.Unlock()
+	require.Same(t, original, got)
+
+	foreignInfo := secondUp.requestDialog(sip.INFO, lbChannelOne, "PAUSE\r\n", "application/MANSRTSP+rtsp", callID)
+	from, ok = foreignInfo.From()
+	require.True(t, ok)
+	uri, ok = from.Address.(*sip.SipUri)
+	require.True(t, ok)
+	uri.SetUser(sip.String{Str: "34020000002000000003"})
+	res = secondUp.roundTrip(foreignInfo)
+	require.Equal(t, 403, int(res.StatusCode()))
+	foreignBye := secondUp.requestDialog(sip.BYE, lbChannelOne, "", "", callID)
+	from, ok = foreignBye.From()
+	require.True(t, ok)
+	uri, ok = from.Address.(*sip.SipUri)
+	require.True(t, ok)
+	uri.SetUser(sip.String{Str: "34020000002000000003"})
+	res = secondUp.roundTrip(foreignBye)
+	require.Equal(t, 403, int(res.StatusCode()))
+	svc.mu.Lock()
+	got = svc.playbacks[callKey]
+	svc.mu.Unlock()
+	require.Same(t, original, got, "foreign BYE/INFO must not operate the playback")
+}
+
+type blockingPlaybackStore struct {
+	*fakeCascadeStore
+	entered chan struct{}
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingPlaybackStore) ListRecordings(ctx context.Context, _ RecordingFilter) ([]Recording, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	close(s.done)
+	return nil, ctx.Err()
+}
+
+func TestPlaybackStoreCancellationLetsStopReleaseAdmission(t *testing.T) {
+	store := &blockingPlaybackStore{
+		fakeCascadeStore: newFakeCascadeStore(),
+		entered:          make(chan struct{}),
+		done:             make(chan struct{}),
+	}
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, store)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	req := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp")
+	up.send(req)
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("playback handler did not reach the blocking Store")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- svc.Stop() }()
+	select {
+	case err := <-stopped:
+		require.NoError(t, err, "Stop must cancel a blocked playback query")
+	case <-time.After(time.Second):
+		t.Fatal("Stop remained blocked behind playback admission")
+	}
+	select {
+	case <-store.done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled Store query did not return")
+	}
+	require.Empty(t, playbackIDs(svc), "cancelled playback must not be admitted")
 }
 
 func TestUnknownMultiUpperSenderIsRejectedByEveryHandler(t *testing.T) {
@@ -349,6 +500,47 @@ func TestUnknownMultiUpperSenderIsRejectedByEveryHandler(t *testing.T) {
 	require.Equal(t, 403, int(res.StatusCode()))
 	res = up.roundTrip(unknown(up.request(sip.MESSAGE, testCfg().LocalDeviceID, "not-manscdp", "Application/MANSCDP+xml")))
 	require.Equal(t, 403, int(res.StatusCode()))
+	res = up.roundTrip(unknown(up.request(sip.OPTIONS, testCfg().LocalDeviceID, "", "")))
+	require.Equal(t, 403, int(res.StatusCode()))
+	nonCatalog := up.request(sip.SUBSCRIBE, testCfg().LocalDeviceID, "", "")
+	nonCatalog.AppendHeader(&sip.GenericHeader{HeaderName: "Event", Contents: "Alarm"})
+	res = up.roundTrip(unknown(nonCatalog))
+	require.Equal(t, 403, int(res.StatusCode()))
+}
+
+func TestSingleUpperEveryEntryPointRequiresIDAndSource(t *testing.T) {
+	svc, up := startLoopbackService(t, fakeSource{}, newCascadeTestDB(t))
+	badFrom := func(req sip.Request) sip.Request {
+		from, ok := req.From()
+		require.True(t, ok)
+		uri, ok := from.Address.(*sip.SipUri)
+		require.True(t, ok)
+		uri.SetUser(sip.String{Str: "wrong-upper"})
+		return req
+	}
+	requests := []sip.Request{
+		up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"),
+		up.request(sip.BYE, lbChannelOne, "", ""),
+		up.request(sip.INFO, lbChannelOne, "", ""),
+		up.request(sip.OPTIONS, testCfg().LocalDeviceID, "", ""),
+		up.request(sip.MESSAGE, testCfg().LocalDeviceID, "not-manscdp", "Application/MANSCDP+xml"),
+	}
+	nonCatalog := up.request(sip.SUBSCRIBE, testCfg().LocalDeviceID, "", "")
+	nonCatalog.AppendHeader(&sip.GenericHeader{HeaderName: "Event", Contents: "Alarm"})
+	requests = append(requests, nonCatalog)
+	for _, req := range requests {
+		res := up.roundTrip(badFrom(req))
+		require.Equal(t, 403, int(res.StatusCode()), req.Method())
+	}
+
+	wrongSource := newUpperSocketOn(t, up.sip.String(), "127.0.0.2")
+	res := wrongSource.roundTrip(wrongSource.request(sip.OPTIONS, testCfg().LocalDeviceID, "", ""))
+	require.Equal(t, 403, int(res.StatusCode()))
+	nonCatalog = wrongSource.request(sip.SUBSCRIBE, testCfg().LocalDeviceID, "", "")
+	nonCatalog.AppendHeader(&sip.GenericHeader{HeaderName: "Event", Contents: "Alarm"})
+	res = wrongSource.roundTrip(nonCatalog)
+	require.Equal(t, 403, int(res.StatusCode()))
+	require.Empty(t, sessionIDs(svc))
 }
 
 func TestInvalidatedSubscriptionSuppressesNotify(t *testing.T) {

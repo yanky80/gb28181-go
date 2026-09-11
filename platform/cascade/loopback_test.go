@@ -52,8 +52,12 @@ type upperSocket struct {
 }
 
 func newUpperSocket(t *testing.T, sipAddr string) *upperSocket {
+	return newUpperSocketOn(t, sipAddr, lbLocalHost)
+}
+
+func newUpperSocketOn(t *testing.T, sipAddr, bindHost string) *upperSocket {
 	t.Helper()
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(bindHost)})
 	require.NoError(t, err)
 	addr, err := net.ResolveUDPAddr("udp", sipAddr)
 	require.NoError(t, err)

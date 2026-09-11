@@ -137,18 +137,14 @@ type Service struct {
 	mu sync.Mutex
 	// ponytail: one global admission lock; split by upper only if INVITE
 	// throughput makes serialized admission measurable.
-	admissionMu sync.Mutex
-	stopping    atomic.Bool
-	stopOnce    sync.Once
-	stopErr     error
-	stopDone    chan struct{}
-	sessions    map[string]*mediaSession    // SIP Call-ID → active live forward
-	playbacks   map[string]*playbackSession // SIP Call-ID → active playback dialog
-	subs        map[string]*catalogSub      // catalog subscriptions (SUBSCRIBE → NOTIFY, #370)
-	ptzForward  PTZForwarder
-	tzMu        sync.RWMutex
-	gbLoc       *time.Location // GB naive-clock zone (nil → time.Local)
-	channelMu   sync.RWMutex
+	stopDone   chan struct{}
+	sessions   map[string]*mediaSession    // SIP Call-ID → active live forward
+	playbacks  map[string]*playbackSession // SIP Call-ID → active playback dialog
+	subs       map[string]*catalogSub      // catalog subscriptions (SUBSCRIBE → NOTIFY, #370)
+	ptzForward PTZForwarder
+	tzMu       sync.RWMutex
+	gbLoc      *time.Location // GB naive-clock zone (nil → time.Local)
+	channelMu  sync.RWMutex
 	// nil-Store channel bindings live for this Service's lifetime.
 	channelBindings   map[string]string // GB channel ID → camera ID
 	nextChannelSerial int
@@ -749,17 +745,7 @@ func (s *Service) onOptions(req sip.Request, _ sip.ServerTransaction) {
 }
 
 func (s *Service) upperForDeviceStatus(req sip.Request) *upper {
-	from, ok := req.From()
-	if !ok || from.Address == nil {
-		return nil
-	}
-	user := from.Address.User().String()
-	for _, u := range s.uppers {
-		if u.cfg.ServerDomain == user {
-			return u
-		}
-	}
-	return nil
+	return s.requireUpper(req)
 }
 
 // buildCoreRequest assembles a REGISTER/MESSAGE request toward the upper
@@ -980,15 +966,6 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 	if err != nil {
 		_, _ = s.srv.RespondOnRequest(req, 400, "Bad MANSCDP", "", nil)
 		return
-	}
-	if cmd == manscdp.CmdDeviceStatus {
-		statusUpper := s.upperForDeviceStatus(req)
-		if statusUpper == nil {
-			_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
-			return
-		}
-	} else {
-		u = s.requireUpper(req)
 	}
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	switch cmd {
