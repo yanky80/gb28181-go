@@ -287,6 +287,116 @@ func TestMediaHostReplacesSameCameraConnection(t *testing.T) {
 	}
 }
 
+func TestMediaHostSameEpochReplacementInvalidatesOldIDRTimeout(t *testing.T) {
+	r := onlineRegistry(t, edgeipc.CodecH265)
+	var failures atomic.Int32
+	s := NewMediaHost(r, MediaHostConfig{
+		IDRTimeout: time.Hour,
+		OnIDRTimeoutEpoch: func(string, uint64, error) {
+			failures.Add(1)
+		},
+	})
+	defer s.Close()
+	oldServer, oldPeer := net.Pipe()
+	oldDone := make(chan error, 1)
+	go func() { oldDone <- s.ServeConn(oldServer) }()
+	writeMedia(t, oldPeer, mediaFrame(edgeipc.CodecH265, 1, 9000, 0, h265PFrame()))
+	var old *mediaConnection
+	eventually(t, time.Second, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		old = s.connections["cam-a"]
+		return old != nil && old.isWaiting()
+	})
+	old.mu.Lock()
+	oldDeadline := old.deadline
+	old.mu.Unlock()
+
+	newServer, newPeer := net.Pipe()
+	newDone := make(chan error, 1)
+	go func() { newDone <- s.ServeConn(newServer) }()
+	writeMedia(t, newPeer, mediaFrame(edgeipc.CodecH265, 1, 9000, edgeipc.FlagIDR, h265IDR()))
+	eventually(t, time.Second, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.connections["cam-a"] != old
+	})
+
+	old.idrTimeout(oldDeadline)
+	if got := failures.Load(); got != 0 {
+		t.Fatalf("stale same-epoch timeout callbacks = %d, want 0", got)
+	}
+	if got := r.CameraStatus("cam-a"); got != "ON" {
+		t.Fatalf("same-epoch replacement status = %q, want ON", got)
+	}
+	oldPeer.Close()
+	newPeer.Close()
+	if err := <-oldDone; err == nil {
+		t.Fatal("replaced connection did not stop")
+	}
+	if err := <-newDone; err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("replacement connection error = %v", err)
+	}
+}
+
+func TestMediaHostNewEpochReplacementInvalidatesOldIDRTimeout(t *testing.T) {
+	r := onlineRegistry(t, edgeipc.CodecH265)
+	var failures atomic.Int32
+	s := NewMediaHost(r, MediaHostConfig{
+		IDRTimeout: time.Hour,
+		OnIDRTimeoutEpoch: func(string, uint64, error) {
+			failures.Add(1)
+		},
+	})
+	defer s.Close()
+	oldServer, oldPeer := net.Pipe()
+	oldDone := make(chan error, 1)
+	go func() { oldDone <- s.ServeConn(oldServer) }()
+	writeMedia(t, oldPeer, mediaFrame(edgeipc.CodecH265, 1, 9000, 0, h265PFrame()))
+	var old *mediaConnection
+	eventually(t, time.Second, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		old = s.connections["cam-a"]
+		return old != nil && old.isWaiting()
+	})
+	old.mu.Lock()
+	oldDeadline := old.deadline
+	old.mu.Unlock()
+	if err := r.HandleHello(hello("cam-a", 2, edgeipc.CodecH265)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.HandleHealth("cam-a", 2, health()); err != nil {
+		t.Fatal(err)
+	}
+
+	newServer, newPeer := net.Pipe()
+	newDone := make(chan error, 1)
+	go func() { newDone <- s.ServeConn(newServer) }()
+	writeMedia(t, newPeer, mediaFrame(edgeipc.CodecH265, 1, 9000, edgeipc.FlagIDR, h265IDR()))
+	eventually(t, time.Second, func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.connections["cam-a"] != old
+	})
+
+	old.idrTimeout(oldDeadline)
+	if got := failures.Load(); got != 0 {
+		t.Fatalf("stale new-epoch timeout callbacks = %d, want 0", got)
+	}
+	if got := r.CameraStatus("cam-a"); got != "ON" {
+		t.Fatalf("new-epoch replacement status = %q, want ON", got)
+	}
+	oldPeer.Close()
+	newPeer.Close()
+	if err := <-oldDone; err == nil {
+		t.Fatal("replaced connection did not stop")
+	}
+	if err := <-newDone; err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("replacement connection error = %v", err)
+	}
+}
+
 func TestMediaHostKeepsSlowCameraSeparate(t *testing.T) {
 	r := newRegistry(t, CameraSpec{ID: "cam-a"}, CameraSpec{ID: "cam-b"})
 	for _, cameraID := range []string{"cam-a", "cam-b"} {

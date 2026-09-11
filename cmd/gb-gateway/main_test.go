@@ -110,6 +110,81 @@ func TestGatewayIDRTimeoutDisconnectsTimedOutEpoch(t *testing.T) {
 	}
 }
 
+func TestGatewayStaleIDRTimeoutPreservesReplacementStream(t *testing.T) {
+	dir := t.TempDir()
+	cfg := defaultConfig()
+	cfg.GB.IDRTimeout = time.Minute
+	cfg.IPC.StatusDir = filepath.Join(dir, "status")
+	cfg.IPC.ControlSocket = filepath.Join(dir, "control.sock")
+	cfg.IPC.MediaSocket = filepath.Join(dir, "media.sock")
+	cfg.Cameras = []CameraConfig{{Index: 1, LocalCameraID: "front", Expose: true, Name: "Front", Codec: "h265", PTZMode: "none"}}
+	gateway, err := NewGateway(cfg, Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Stop()
+	if err := gateway.registry.HandleHello(hello("front", 1, edgeipc.CodecH265)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.registry.HandleHealth("front", 1, health()); err != nil {
+		t.Fatal(err)
+	}
+	oldServer, oldPeer := net.Pipe()
+	oldDone := make(chan error, 1)
+	go func() { oldDone <- gateway.media.ServeConn(oldServer) }()
+	writeMedia(t, oldPeer, edgeipc.MediaFrame{Codec: edgeipc.CodecH265, CameraID: "front", Sequence: 1, PTS90kHz: 9000, Payload: h265PFrame()})
+	var old *mediaConnection
+	eventually(t, time.Second, func() bool {
+		gateway.media.mu.Lock()
+		defer gateway.media.mu.Unlock()
+		old = gateway.media.connections["front"]
+		return old != nil && old.isWaiting()
+	})
+	old.mu.Lock()
+	oldDeadline := old.deadline
+	old.mu.Unlock()
+
+	if err := gateway.registry.HandleHello(hello("front", 2, edgeipc.CodecH265)); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.registry.HandleHealth("front", 2, health()); err != nil {
+		t.Fatal(err)
+	}
+	frames := make(chan struct{}, 1)
+	if err := gateway.registry.Hub("front").Subscribe("test", func(int64, [][]byte, bool) { frames <- struct{}{} }); err != nil {
+		t.Fatal(err)
+	}
+	newServer, newPeer := net.Pipe()
+	newDone := make(chan error, 1)
+	go func() { newDone <- gateway.media.ServeConn(newServer) }()
+	writeMedia(t, newPeer, edgeipc.MediaFrame{Codec: edgeipc.CodecH265, CameraID: "front", Flags: edgeipc.FlagIDR, Sequence: 1, PTS90kHz: 9000, Payload: h265IDR()})
+	eventually(t, time.Second, func() bool {
+		gateway.media.mu.Lock()
+		defer gateway.media.mu.Unlock()
+		return gateway.media.connections["front"] != old
+	})
+
+	old.idrTimeout(oldDeadline)
+	gateway.media.config.OnIDRTimeoutEpoch("front", 1, context.DeadlineExceeded)
+	if got := gateway.registry.CameraStatus("front"); got != "ON" {
+		t.Fatalf("stale Gateway timeout status = %q, want ON", got)
+	}
+	writeMedia(t, newPeer, edgeipc.MediaFrame{Codec: edgeipc.CodecH265, CameraID: "front", Sequence: 2, PTS90kHz: 12000, Payload: h265PFrame()})
+	select {
+	case <-frames:
+	case <-time.After(time.Second):
+		t.Fatal("replacement stream did not survive stale timeout")
+	}
+	oldPeer.Close()
+	newPeer.Close()
+	if err := <-oldDone; err == nil {
+		t.Fatal("replaced Gateway connection did not stop")
+	}
+	if err := <-newDone; err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("replacement Gateway connection error = %v", err)
+	}
+}
+
 func testCascadeChannel() cascade.CascadeChannel {
 	return cascade.CascadeChannel{CameraID: "front", GBChannelID: "34020000001320000001", Name: "Front"}
 }

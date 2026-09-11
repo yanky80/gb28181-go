@@ -166,17 +166,19 @@ func (r *CameraRegistry) HandleHealth(cameraID string, streamEpoch uint64, messa
 
 // HandleDisconnect marks only the matching epoch offline. A later epoch is
 // never affected by a delayed disconnect from an older connection.
-func (r *CameraRegistry) HandleDisconnect(cameraID string, streamEpoch uint64) {
+func (r *CameraRegistry) HandleDisconnect(cameraID string, streamEpoch uint64) bool {
 	if streamEpoch == 0 {
-		return
+		return false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := r.cameras[cameraID]
 	if state == nil || state.streamEpoch != streamEpoch {
-		return
+		return false
 	}
+	retired := state.online && !state.closed
 	closeStateLocked(state)
+	return retired
 }
 
 // Publish sends a frame only when it belongs to the current healthy epoch.

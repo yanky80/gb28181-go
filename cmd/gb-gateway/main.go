@@ -118,8 +118,9 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 		IDRTimeout: cfg.GB.IDRTimeout,
 		RequestIDR: control.RequestIDR,
 		OnIDRTimeoutEpoch: func(cameraID string, streamEpoch uint64, _ error) {
-			registry.HandleDisconnect(cameraID, streamEpoch)
-			cascadeService.NotifyCameraUnavailable(cameraID)
+			if registry.HandleDisconnect(cameraID, streamEpoch) {
+				cascadeService.NotifyCameraUnavailable(cameraID)
+			}
 		},
 	})
 
