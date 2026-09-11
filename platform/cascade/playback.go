@@ -34,14 +34,15 @@ const pbMaxWindow = 24 * time.Hour
 // playbackSession is one s=Playback / s=Download dialog: local recordings →
 // psmux → RTP/UDP toward the upper platform's receive address.
 type playbackSession struct {
-	svc      *Service
-	callID   string
-	channel  string // GB channel ID the upper platform INVITEd
-	camera   string // local camera ID
-	upper    *upper // owning upper platform (#370 dialog routing)
-	start    time.Time
-	end      time.Time
-	download bool // s=Download: send at file speed, no 1x pacing (#378)
+	svc        *Service
+	callID     string
+	channel    string // GB channel ID the upper platform INVITEd
+	camera     string // local camera ID
+	upper      *upper // owning upper platform (#370 dialog routing)
+	generation uint64
+	start      time.Time
+	end        time.Time
+	download   bool // s=Download: send at file speed, no 1x pacing (#378)
 
 	conn    *net.UDPConn
 	dst     *net.UDPAddr
@@ -70,7 +71,7 @@ type pbCtrl struct {
 // a sendonly s= answer, and pump the media. Downloads skip the 1x pacing and
 // stream at file speed. 404 when the channel is unknown or the window holds
 // no recordings (the platform surfaces that as a fetch error).
-func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP, u *upper) {
+func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd inviteSDP, u *upper, generation uint64) {
 	cameraID, ok := s.cameraOfChannel(channelID)
 	if !ok {
 		slog.Warn("gb28181-cascade: playback INVITE for unknown channel", "channel", channelID)
@@ -110,7 +111,7 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 	}
 	ps := &playbackSession{
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
-		upper: u, start: start, end: end, download: sdpName == "Download",
+		upper: u, generation: generation, start: start, end: end, download: sdpName == "Download",
 		conn: conn, dst: dst, ssrc: sd.ssrc,
 		mux:  psmux.New(),
 		rtp:  psmux.NewRTPPacketizer(conn, dst, sd.ssrc, uint16(time.Now().UnixNano()&0xFFFF)),
@@ -403,7 +404,7 @@ func (ps *playbackSession) stop() {
 // onInfo answers the upper platform's in-dialog INFO and routes MANSRTSP
 // playback controls to the channel's playback session.
 func (s *Service) onInfo(req sip.Request, _ sip.ServerTransaction) {
-	u := s.upperOf(req)
+	u := s.requireUpper(req)
 	if u == nil {
 		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 		return

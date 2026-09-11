@@ -202,6 +202,9 @@ func startLoopbackServiceWithConfig(t *testing.T, cfg Config, src CameraSource, 
 	svc := New(cfg, src, db)
 	svc.SetSegmentParser(fakeSegmentParser)
 	require.NoError(t, svc.Start(context.Background()))
+	for _, u := range svc.uppers {
+		svc.setOnline(u, true)
+	}
 	t.Cleanup(func() { _ = svc.Stop() })
 	return svc, up
 }

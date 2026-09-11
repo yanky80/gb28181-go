@@ -40,6 +40,22 @@ func TestStaleRegistrationCannotRestoreOnlineState(t *testing.T) {
 	require.False(t, upperOnline(svc, u))
 }
 
+func TestRegistrationGenerationBarrierPreservesStaleState(t *testing.T) {
+	svc := New(testCfg(), fakeSource{}, nil)
+	u := svc.uppers[0]
+	u.stale.Store(true)
+	generation := u.generation.Load()
+	svc.mu.Lock()
+	done := make(chan bool)
+	go func() { done <- svc.setOnlineForGeneration(u, true, generation) }()
+	u.generation.Add(1)
+	svc.mu.Unlock()
+
+	require.False(t, <-done)
+	require.True(t, u.stale.Load(), "an invalidated registration must remain stale")
+	require.False(t, upperOnline(svc, u))
+}
+
 func TestRegistrationAgeUsesInjectableClock(t *testing.T) {
 	svc := New(testCfg(), fakeSource{}, nil)
 	u := svc.uppers[0]
@@ -177,7 +193,7 @@ func TestNetworkChangeForcesFreshRegistration(t *testing.T) {
 
 func TestStartUsesCallerContextCancellation(t *testing.T) {
 	cfg := testCfg()
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, "0")
+	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
 	up := newUpperSocket(t, cfg.SIPListen)
 	cfg.ServerAddr = up.conn.LocalAddr().String()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -194,6 +210,17 @@ func TestStartUsesCallerContextCancellation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cancelled caller context must stop registration and notify loops")
 	}
+	select {
+	case <-svc.stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled caller context must finish service shutdown")
+	}
+	request := up.request(sip.OPTIONS, testCfg().LocalDeviceID, "", "")
+	up.send(request)
+	require.NoError(t, up.conn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
+	buf := make([]byte, 65535)
+	_, _, err := up.conn.ReadFromUDP(buf)
+	require.Error(t, err, "caller cancellation must close the SIP listener")
 	require.False(t, svc.Online())
 	require.NoError(t, svc.Stop())
 }
@@ -262,6 +289,66 @@ func TestDialogOwnershipIsolatedAcrossUppers(t *testing.T) {
 	res = up.roundTrip(bye)
 	require.Equal(t, 403, int(res.StatusCode()))
 	require.Len(t, sessionIDs(svc), 1)
+}
+
+func TestSameChannelInvitesFromDifferentUppersCoexist(t *testing.T) {
+	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
+	cfg.Upstreams = []Upstream{{
+		ServerDomain: "34020000002000000003",
+		ServerAddr:   "127.0.0.2:5060",
+	}}
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackServiceWithConfig(t, cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, nil)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+	first := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	res := up.roundTrip(first)
+	require.Equal(t, 200, int(res.StatusCode()))
+
+	second := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")
+	from, ok := second.From()
+	require.True(t, ok)
+	uri, ok := from.Address.(*sip.SipUri)
+	require.True(t, ok)
+	uri.SetUser(sip.String{Str: "34020000002000000003"})
+	res = up.roundTrip(second)
+	require.Equal(t, 200, int(res.StatusCode()))
+	require.Eventually(t, func() bool { return len(sessionIDs(svc)) == 2 }, time.Second, time.Millisecond)
+	require.Equal(t, 2, hub.ConsumerCount(), "different uppers must retain both same-channel live leases")
+}
+
+func TestUnknownMultiUpperSenderIsRejectedByEveryHandler(t *testing.T) {
+	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
+	cfg.Upstreams = []Upstream{{
+		ServerDomain: "34020000002000000003",
+		ServerAddr:   "127.0.0.2:5060",
+	}}
+	hub := platform.NewFrameHub()
+	svc, up := startLoopbackServiceWithConfig(t, cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, nil)
+	unknown := func(req sip.Request) sip.Request {
+		from, ok := req.From()
+		require.True(t, ok)
+		uri, ok := from.Address.(*sip.SipUri)
+		require.True(t, ok)
+		uri.SetUser(sip.String{Str: "unknown-upper"})
+		return req
+	}
+
+	res := up.roundTrip(unknown(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp")))
+	require.Equal(t, 403, int(res.StatusCode()))
+	require.Empty(t, sessionIDs(svc))
+	sub := up.request(sip.SUBSCRIBE, testCfg().LocalDeviceID, "", "", &sip.GenericHeader{HeaderName: "Event", Contents: "Catalog"})
+	res = up.roundTrip(unknown(sub))
+	require.Equal(t, 403, int(res.StatusCode()))
+	require.Empty(t, subCount(svc))
+	res = up.roundTrip(unknown(up.request(sip.INFO, lbChannelOne, "", "")))
+	require.Equal(t, 403, int(res.StatusCode()))
+	res = up.roundTrip(unknown(up.request(sip.BYE, lbChannelOne, "", "")))
+	require.Equal(t, 403, int(res.StatusCode()))
+	res = up.roundTrip(unknown(up.request(sip.MESSAGE, testCfg().LocalDeviceID, "not-manscdp", "Application/MANSCDP+xml")))
+	require.Equal(t, 403, int(res.StatusCode()))
 }
 
 func TestInvalidatedSubscriptionSuppressesNotify(t *testing.T) {

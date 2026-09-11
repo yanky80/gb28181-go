@@ -123,6 +123,7 @@ type Service struct {
 	stopping    atomic.Bool
 	stopOnce    sync.Once
 	stopErr     error
+	stopDone    chan struct{}
 	sessions    map[string]*mediaSession    // SIP Call-ID → active live forward
 	playbacks   map[string]*playbackSession // SIP Call-ID → active playback dialog
 	subs        map[string]*catalogSub      // catalog subscriptions (SUBSCRIBE → NOTIFY, #370)
@@ -197,6 +198,7 @@ func New(cfg Config, src CameraSource, db Store) *Service {
 		playbacks:       make(map[string]*playbackSession),
 		subs:            make(map[string]*catalogSub),
 		channelBindings: make(map[string]string),
+		stopDone:        make(chan struct{}),
 	}
 }
 
@@ -321,6 +323,10 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 	s.wg.Add(1)
 	go s.catalogNotifyLoop() //nolint:contextcheck // the loop reads Service.ctx directly (struct field)
+	go func() {
+		<-s.ctx.Done()
+		_ = s.Stop()
+	}()
 	slog.Info("gb28181-cascade: started",
 		"listen", listen, "uppers", len(s.uppers), "device", s.cfg.LocalDeviceID)
 	return nil
@@ -332,6 +338,7 @@ func (s *Service) Stop() error {
 }
 
 func (s *Service) stop() error {
+	defer close(s.stopDone)
 	s.stopping.Store(true)
 	if s.cancel != nil {
 		s.cancel()
@@ -416,7 +423,6 @@ func (s *Service) registerLoop(u *upper) {
 		if !s.setOnlineForGeneration(u, true, generation) {
 			continue
 		}
-		u.stale.Store(false)
 		retry.Reset()
 		// Keepalive cadence while registered.
 		hb := 60 * time.Second
@@ -465,6 +471,7 @@ func (s *Service) setOnlineForGeneration(u *upper, v bool, generation uint64) bo
 	u.online = v
 	if v {
 		u.regTS = s.now()
+		u.stale.Store(false)
 	} else if changed {
 		u.regTS = time.Time{}
 	}
@@ -516,10 +523,16 @@ func (s *Service) RegistrationSince() (time.Duration, bool) {
 // registration loop. A changed local address/NAT mapping makes old SIP and
 // media dialogs unusable even when the registration state was still online.
 func (s *Service) NotifyNetworkChange() {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
 	for _, u := range s.uppers {
+		s.mu.Lock()
 		u.generation.Add(1)
 		u.stale.Store(true)
-		s.setOnline(u, false)
+		u.online = false
+		u.regTS = time.Time{}
+		s.mu.Unlock()
+		s.closeUpperDialogsLocked(u)
 		if u.wake != nil {
 			select {
 			case u.wake <- struct{}{}:
@@ -532,7 +545,10 @@ func (s *Service) NotifyNetworkChange() {
 func (s *Service) closeUpperDialogs(u *upper) {
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
+	s.closeUpperDialogsLocked(u)
+}
 
+func (s *Service) closeUpperDialogsLocked(u *upper) {
 	s.mu.Lock()
 	var sessions []*mediaSession
 	for callID, ms := range s.sessions {
@@ -619,11 +635,9 @@ func upperAddr(u *upper) (*net.UDPAddr, error) {
 	return net.ResolveUDPAddr("udp", u.cfg.ServerAddr)
 }
 
-// upperOf resolves which upper platform an incoming request belongs to: the
-// From user of a platform's requests is its server ID (ServerDomain). Falls
-// back to the sole upper; unknown senders on a multi-upper deployment land
-// on the first (their dialogs still route by Call-ID).
-func (s *Service) upperOf(req sip.Request) *upper {
+// requireUpper authorizes an incoming request by the upper platform ID in its
+// From user. A sole upper retains the legacy sender-tolerant behavior.
+func (s *Service) requireUpper(req sip.Request) *upper {
 	if len(s.uppers) == 0 {
 		return nil
 	}
@@ -638,7 +652,13 @@ func (s *Service) upperOf(req sip.Request) *upper {
 			}
 		}
 	}
-	return s.uppers[0]
+	return nil
+}
+
+// upperOf is retained as the package-local resolution seam used by existing
+// cascade tests and callers.
+func (s *Service) upperOf(req sip.Request) *upper {
+	return s.requireUpper(req)
 }
 
 func (s *Service) upperForDeviceStatus(req sip.Request) *upper {
@@ -864,12 +884,16 @@ func (s *Service) sendKeepalive(u *upper) error {
 // ---- upper-platform requests (UAS side) ----
 
 func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
+	u := s.requireUpper(req)
+	if u == nil {
+		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
+		return
+	}
 	cmd, payload, err := manscdp.Decode([]byte(req.Body()))
 	if err != nil {
 		_, _ = s.srv.RespondOnRequest(req, 400, "Bad MANSCDP", "", nil)
 		return
 	}
-	var u *upper
 	if cmd == manscdp.CmdDeviceStatus {
 		u = s.upperForDeviceStatus(req)
 		if u == nil {
@@ -877,7 +901,7 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 			return
 		}
 	} else {
-		u = s.upperOf(req)
+		u = s.requireUpper(req)
 	}
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", nil)
 	switch cmd {

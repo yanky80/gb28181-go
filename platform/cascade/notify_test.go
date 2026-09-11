@@ -105,11 +105,9 @@ func TestUpperOfResolution(t *testing.T) {
 	svc := New(cfg, fakeSource{cams: []CameraInfo{{ID: "front", Name: "Front"}}}, newCascadeTestDB(t))
 	require.Len(t, svc.uppers, 2)
 
-	// Request routing keys on the From user (the upper's server ID): a
-	// request from the second upper's domain resolves to uppers[1]; an
-	// unknown sender falls back to the first.
+	// Request routing keys on the From user (the upper's server ID).
 	require.Equal(t, svc.uppers[1], svc.upperOf(newFromRequest(t, "34020000002000000002")))
-	require.Equal(t, svc.uppers[0], svc.upperOf(newFromRequest(t, "99999999999999999999")))
+	require.Nil(t, svc.upperOf(newFromRequest(t, "99999999999999999999")))
 
 	// Single-upper deployments short-circuit.
 	svc2 := New(testCfg(), fakeSource{}, newCascadeTestDB(t))

@@ -26,11 +26,12 @@ import (
 // Audio passthrough lands together with a hub-level law field (#364
 // follow-up).
 type mediaSession struct {
-	svc     *Service
-	callID  string
-	channel string // GB channel ID the upper platform INVITEd
-	camera  string // local camera ID
-	upper   *upper // owning upper platform (#370 dialog routing)
+	svc        *Service
+	callID     string
+	channel    string // GB channel ID the upper platform INVITEd
+	camera     string // local camera ID
+	upper      *upper // owning upper platform (#370 dialog routing)
+	generation uint64
 
 	conn net.Conn     // UDP socket or the dialed TCP media connection
 	dst  *net.UDPAddr // nil for TCP media
@@ -160,12 +161,16 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		_, _ = s.srv.RespondOnRequest(req, 503, "Service Unavailable", "", nil)
 		return
 	}
-	u := s.upperOf(req)
+	u := s.requireUpper(req)
 	if u == nil {
 		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 		return
 	}
-	if u.stale.Load() {
+	s.mu.Lock()
+	generation := u.generation.Load()
+	admitted := u.online && !u.stale.Load() && generation == u.generation.Load()
+	s.mu.Unlock()
+	if !admitted {
 		_, _ = s.srv.RespondOnRequest(req, 503, "Registration Pending", "", nil)
 		return
 	}
@@ -185,7 +190,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	// Playback/download dialogs take the recordings-backed path (download =
 	// same pump without 1x pacing, #378).
 	if strings.EqualFold(sd.name, "Playback") || strings.EqualFold(sd.name, "Download") {
-		s.onPlaybackInvite(req, callID, channelID, sd, u)
+		s.onPlaybackInvite(req, callID, channelID, sd, u, generation)
 		return
 	}
 
@@ -252,7 +257,7 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	// churn on the fnOS upper, 2026-08-19). One channel, one live forward.
 	s.mu.Lock()
 	for otherID, other := range s.sessions {
-		if otherID != callID && other.channel == channelID {
+		if otherID != callID && other.upper == u && other.channel == channelID {
 			delete(s.sessions, otherID)
 			go other.teardown("superseded by new-dialog re-INVITE")
 		}
@@ -285,8 +290,8 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 
 	ms := &mediaSession{
 		svc: s, callID: callID, channel: channelID, camera: cameraID,
-		upper: u,
-		conn:  conn, dst: dst, ssrc: sd.ssrc,
+		upper: u, generation: generation,
+		conn: conn, dst: dst, ssrc: sd.ssrc,
 		mux:       psmux.New(),
 		withAudio: strings.Contains(string(req.Body()), "m=audio"),
 	}
@@ -531,7 +536,7 @@ func (ms *mediaSession) run(hub *platform.FrameHub) {
 // onBye tears a forward or playback dialog down when the upper platform
 // sends BYE.
 func (s *Service) onBye(req sip.Request, _ sip.ServerTransaction) {
-	u := s.upperOf(req)
+	u := s.requireUpper(req)
 	if u == nil {
 		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 		return

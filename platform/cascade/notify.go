@@ -73,7 +73,7 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 		return
 	}
 
-	u := s.upperOf(req)
+	u := s.requireUpper(req)
 	if u == nil {
 		_, _ = s.srv.RespondOnRequest(req, 403, "Forbidden", "", nil)
 		return
