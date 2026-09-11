@@ -186,6 +186,37 @@ func TestLoopbackPlaybackNaturalEndSendsBYE(t *testing.T) {
 	require.Eventually(t, func() bool { return len(playbackIDs(svc)) == 0 }, time.Second, time.Millisecond)
 }
 
+func TestLoopbackPlaybackSkipsBrokenSegments(t *testing.T) {
+	db := newFakeCascadeStore()
+	svc, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front", Encoding: "h264"}}}, db)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	start := time.Now().Add(-time.Second)
+	badPath := filepath.Join(t.TempDir(), "deleted.mp4")
+	validPath, validSeg := writeRawSegment(t, t.TempDir(), []byte{0x67, 1}, []byte{0x68, 2}, [][]byte{{0x65, 1}}, 33, 1000)
+	segByPath[validPath] = validSeg
+	require.NoError(t, db.InsertRecording(context.Background(), &Recording{
+		ID: "deleted", CameraID: "cam-1", FilePath: badPath, Format: FormatH264,
+		StartedAt: start, EndedAt: start.Add(time.Second),
+	}))
+	require.NoError(t, db.InsertRecording(context.Background(), &Recording{
+		ID: "valid", CameraID: "cam-1", FilePath: validPath, Format: FormatH264,
+		StartedAt: start, EndedAt: start.Add(time.Second),
+	}))
+	svc.SetSegmentParser(func(path string) (*SegmentInfo, error) {
+		if path == badPath {
+			return nil, fmt.Errorf("segment is still being written")
+		}
+		return fakeSegmentParser(path)
+	})
+
+	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne,
+		issue14PlaybackSDPAt(t, start, start.Add(time.Second)), "application/sdp"))
+	require.Equal(t, 200, int(res.StatusCode()))
+	up.awaitServerRequest(sip.BYE, "")
+}
+
 func issue14PlaybackSDP(t *testing.T) string {
 	return issue14PlaybackSDPAt(t, time.Now().Add(-time.Minute), time.Now().Add(time.Minute))
 }

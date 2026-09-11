@@ -153,23 +153,38 @@ func (s *Service) onPlaybackInvite(req sip.Request, callID, channelID string, sd
 		reject(488, StatusVersionMismatch, "version_mismatch")
 		return
 	}
+	usable := 0
+	preflightStatus := 0
 	for _, rec := range recs {
 		if !recordingOverlaps(rec, start, end) {
 			continue
 		}
 		seg, err := s.parseSegment(rec.FilePath)
 		if err != nil {
-			reject(500, "Playback Unavailable", safeErrorCode(err))
-			return
+			if preflightStatus == 0 {
+				preflightStatus = 500
+			}
+			continue
 		}
 		if err := s.validatePlaybackSegment(cameraID, seg); err != nil {
-			reject(488, StatusVersionMismatch, safeErrorCode(err))
-			return
+			preflightStatus = 488
+			continue
 		}
 		if err := validatePlaybackFile(rec.FilePath, seg); err != nil {
-			reject(500, "Playback Unavailable", safeErrorCode(err))
-			return
+			if preflightStatus == 0 {
+				preflightStatus = 500
+			}
+			continue
 		}
+		usable++
+	}
+	if usable == 0 {
+		if preflightStatus == 488 {
+			reject(488, StatusVersionMismatch, "version_mismatch")
+		} else {
+			reject(500, "Playback Unavailable", "playback_unavailable")
+		}
+		return
 	}
 
 	var conn net.Conn
@@ -330,13 +345,19 @@ func (ps *playbackSession) playOnce(seekNPT float64) (bool, *float64, error) {
 		}
 		seg, err := ps.svc.parseSegment(rec.FilePath)
 		if err != nil {
-			return false, nil, fmt.Errorf("parse recording %q: %w", rec.FilePath, err)
+			slog.Debug("gb28181-cascade: skipping unreadable recording",
+				"path", rec.FilePath, "error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
+			continue
 		}
 		if err := ps.svc.validatePlaybackSegment(ps.camera, seg); err != nil {
-			return false, nil, err
+			slog.Debug("gb28181-cascade: skipping incompatible recording",
+				"path", rec.FilePath, "error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
+			continue
 		}
 		if err := validatePlaybackFile(rec.FilePath, seg); err != nil {
-			return false, nil, err
+			slog.Debug("gb28181-cascade: skipping unavailable recording",
+				"path", rec.FilePath, "error_code", safeErrorCode(err), "diagnostic", safeDiagnostic(err))
+			continue
 		}
 		f, err := os.Open(rec.FilePath)
 		if err != nil {
