@@ -16,6 +16,9 @@ import (
 
 const (
 	defaultHealthInterval = 5 * time.Second
+	defaultHelloTimeout   = 5 * time.Second
+	defaultWriteTimeout   = time.Second
+	defaultMaxConnections = 64
 	controlWriteQueueSize = 32
 )
 
@@ -32,19 +35,24 @@ type ControlServer struct {
 	grace    time.Duration
 
 	healthInterval time.Duration
+	helloTimeout   time.Duration
+	writeTimeout   time.Duration
+	maxConnections int
+	writeQueueSize int
 	nextRequestID  atomic.Uint64
 	nextConnection atomic.Uint64
 	helloMu        sync.Mutex
 
-	mu      sync.Mutex
-	ln      net.Listener
-	ctx     context.Context
-	cancel  context.CancelFunc
-	peers   map[string]*controlPeer
-	leases  map[string]*leaseState
-	wg      sync.WaitGroup
-	stop    sync.Once
-	stopErr error
+	mu          sync.Mutex
+	ln          net.Listener
+	ctx         context.Context
+	cancel      context.CancelFunc
+	peers       map[string]*controlPeer
+	leases      map[string]*leaseState
+	connections map[uint64]net.Conn
+	wg          sync.WaitGroup
+	stop        sync.Once
+	stopErr     error
 }
 
 type leaseState struct {
@@ -65,6 +73,7 @@ type controlPeer struct {
 	commands  chan controlCommand
 	done      chan struct{}
 	closeOnce sync.Once
+	queueMu   sync.Mutex
 }
 
 type controlCommand struct {
@@ -80,8 +89,11 @@ func NewControlServer(path string, registry *CameraRegistry, grace time.Duration
 	}
 	return &ControlServer{
 		path: path, registry: registry, grace: grace,
-		healthInterval: defaultHealthInterval,
+		healthInterval: defaultHealthInterval, helloTimeout: defaultHelloTimeout,
+		writeTimeout: defaultWriteTimeout, maxConnections: defaultMaxConnections,
+		writeQueueSize: controlWriteQueueSize,
 		peers:          make(map[string]*controlPeer), leases: make(map[string]*leaseState),
+		connections: make(map[uint64]net.Conn),
 	}
 }
 
@@ -161,12 +173,39 @@ func (s *ControlServer) acceptLoop() {
 			continue
 		}
 		sequence := s.nextConnection.Add(1)
+		if !s.trackConnection(sequence, conn) {
+			_ = conn.Close()
+			continue
+		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
 			s.handleConn(conn, sequence)
 		}()
 	}
+}
+
+func (s *ControlServer) trackConnection(sequence uint64, conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx != nil {
+		select {
+		case <-s.ctx.Done():
+			return false
+		default:
+		}
+	}
+	if s.maxConnections > 0 && len(s.connections) >= s.maxConnections {
+		return false
+	}
+	s.connections[sequence] = conn
+	return true
+}
+
+func (s *ControlServer) untrackConnection(sequence uint64) {
+	s.mu.Lock()
+	delete(s.connections, sequence)
+	s.mu.Unlock()
 }
 
 func (s *ControlServer) listener() net.Listener {
@@ -225,19 +264,26 @@ func (s *ControlServer) stopServer() error {
 		s.mu.Unlock()
 		return nil
 	}
-	peers := make([]*controlPeer, 0, len(s.peers))
-	for _, peer := range s.peers {
-		peers = append(peers, peer)
-	}
-	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	if ln != nil {
 		_ = ln.Close()
 	}
+	peers := make([]*controlPeer, 0, len(s.peers))
+	for _, peer := range s.peers {
+		peers = append(peers, peer)
+	}
+	connections := make([]net.Conn, 0, len(s.connections))
+	for _, conn := range s.connections {
+		connections = append(connections, conn)
+	}
+	s.mu.Unlock()
 	for _, peer := range peers {
 		peer.close()
+	}
+	for _, conn := range connections {
+		_ = conn.Close()
 	}
 	s.wg.Wait()
 	s.mu.Lock()
@@ -251,12 +297,17 @@ func (s *ControlServer) stopServer() error {
 }
 
 func (s *ControlServer) handleConn(conn net.Conn, sequence uint64) {
+	defer s.untrackConnection(sequence)
+	if timeout := s.helloTimeout; timeout > 0 {
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	}
 	reader := edgeipc.NewControlReader(conn)
 	hello, err := reader.Read()
 	if err != nil || hello.Type != edgeipc.MessageHello {
 		_ = conn.Close()
 		return
 	}
+	_ = conn.SetReadDeadline(time.Time{})
 	view, ok := s.registry.Camera(hello.CameraID)
 	if !ok || edgeipc.ValidateControlCodec(view.Codec, hello) != nil {
 		_ = conn.Close()
@@ -279,11 +330,15 @@ func (s *ControlServer) handleConn(conn net.Conn, sequence uint64) {
 		_ = conn.Close()
 		return
 	}
+	queueSize := s.writeQueueSize
+	if queueSize <= 0 {
+		queueSize = controlWriteQueueSize
+	}
 	peer := &controlPeer{
 		server: s, cameraID: hello.CameraID, epoch: hello.StreamEpoch,
-		sequence: sequence,
-		conn:     conn, commands: make(chan controlCommand, controlWriteQueueSize),
-		done: make(chan struct{}),
+		sequence: sequence, conn: conn,
+		commands: make(chan controlCommand, queueSize),
+		done:     make(chan struct{}),
 	}
 	s.registerPeer(peer)
 	s.helloMu.Unlock()
@@ -313,19 +368,23 @@ func (s *ControlServer) acceptsHello(cameraID string, sequence uint64) bool {
 }
 
 func (s *ControlServer) registerPeer(peer *controlPeer) {
+	var err error
 	s.mu.Lock()
 	state := s.leaseStateLocked(peer.cameraID)
 	old := s.peers[peer.cameraID]
 	s.peers[peer.cameraID] = peer
 	state.peer = peer
 	if state.count > 0 && state.desired {
-		s.enqueueStartLocked(state, peer)
+		err = s.enqueueStartLocked(state, peer)
 	} else if state.stopSent {
-		s.enqueueStopLocked(state, peer, 0)
+		err = s.enqueueStopLocked(state, peer, 0)
 	}
 	s.mu.Unlock()
 	if old != nil && old != peer {
 		old.close()
+	}
+	if err != nil {
+		peer.close()
 	}
 }
 
@@ -384,7 +443,17 @@ func (p *controlPeer) writeLoop() {
 			if !p.server.commandCurrent(p, command) {
 				continue
 			}
+			if timeout := p.server.writeTimeout; timeout > 0 {
+				if err := p.conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+					p.close()
+					return
+				}
+			}
 			if err := edgeipc.WriteControlMessage(p.conn, command.message); err != nil {
+				p.close()
+				return
+			}
+			if err := p.conn.SetWriteDeadline(time.Time{}); err != nil {
 				p.close()
 				return
 			}
@@ -408,6 +477,8 @@ func (s *ControlServer) commandCurrent(peer *controlPeer, command controlCommand
 }
 
 func (p *controlPeer) enqueue(command controlCommand) error {
+	p.queueMu.Lock()
+	defer p.queueMu.Unlock()
 	select {
 	case <-p.done:
 		return ErrControlUnavailable
@@ -416,6 +487,22 @@ func (p *controlPeer) enqueue(command controlCommand) error {
 	default:
 		return errors.New("gateway: control write queue full")
 	}
+}
+
+func (p *controlPeer) enqueuePair(first, second controlCommand) error {
+	p.queueMu.Lock()
+	defer p.queueMu.Unlock()
+	select {
+	case <-p.done:
+		return ErrControlUnavailable
+	default:
+	}
+	if cap(p.commands)-len(p.commands) < 2 {
+		return errors.New("gateway: control write queue full")
+	}
+	p.commands <- first
+	p.commands <- second
+	return nil
 }
 
 // AcquireMainHub starts the encoder on the first live lease and returns its
@@ -455,11 +542,14 @@ func (s *ControlServer) AcquireMainHub(ctx context.Context, cameraID string) (*p
 	}
 	if state.count == 0 {
 		if !gracePending {
+			generation, desired, stopSent := state.generation, state.desired, state.stopSent
 			state.generation++
 			state.desired = true
 			state.stopSent = false
 			if err := s.enqueueStartLocked(state, peer); err != nil {
+				state.generation, state.desired, state.stopSent = generation, desired, stopSent
 				s.mu.Unlock()
+				peer.close()
 				return nil, nil, err
 			}
 		}
@@ -490,17 +580,23 @@ func (s *ControlServer) release(cameraID string) {
 
 func (s *ControlServer) stopAfterGrace(cameraID string, generation uint64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	state := s.leases[cameraID]
 	if state == nil || state.count != 0 || state.generation != generation {
+		s.mu.Unlock()
 		return
 	}
 	state.stopTimer = nil
 	state.generation++
 	state.desired = false
 	state.stopSent = true
-	if state.peer != nil {
-		_ = s.enqueueStopLocked(state, state.peer, 0)
+	peer := state.peer
+	var err error
+	if peer != nil {
+		err = s.enqueueStopLocked(state, peer, 0)
+	}
+	s.mu.Unlock()
+	if err != nil {
+		peer.close()
 	}
 }
 
@@ -509,14 +605,11 @@ func (s *ControlServer) enqueueStartLocked(state *leaseState, peer *controlPeer)
 		Type: edgeipc.MessageStart, Version: edgeipc.ProtocolVersion,
 		CameraID: peer.cameraID, RequestID: s.nextRequestID.Add(1),
 	}}
-	if err := peer.enqueue(start); err != nil {
-		return err
-	}
 	idr := controlCommand{generation: state.generation, message: edgeipc.ControlMessage{
 		Type: edgeipc.MessageRequestIDR, Version: edgeipc.ProtocolVersion,
 		CameraID: peer.cameraID, RequestID: s.nextRequestID.Add(1),
 	}}
-	return peer.enqueue(idr)
+	return peer.enqueuePair(start, idr)
 }
 
 func (s *ControlServer) enqueueStopLocked(state *leaseState, peer *controlPeer, graceMS uint32) error {

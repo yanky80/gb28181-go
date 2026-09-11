@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -250,6 +251,234 @@ func TestControlServerDisconnectClosesRegistryHub(t *testing.T) {
 	for registry.CameraStatus("cam-a") != "OFF" || hub.ConsumerCount() != 0 {
 		if time.Now().After(deadline) {
 			t.Fatalf("disconnect did not converge: status=%s consumers=%d", registry.CameraStatus("cam-a"), hub.ConsumerCount())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestControlServerShutdownClosesSilentAndPartialHello(t *testing.T) {
+	registry := newRegistry(t, CameraSpec{ID: "cam-a"})
+	server := NewControlServer(filepath.Join(t.TempDir(), "control.sock"), registry, time.Second)
+	server.helloTimeout = time.Minute
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	silent := dialPeer(t, server.path)
+	partial := dialPeer(t, server.path)
+	if _, err := partial.Write([]byte(`{"type":"hello","version":1,"camera_id":"cam-a"`)); err != nil {
+		t.Fatal(err)
+	}
+	waitForConnections(t, server, 2)
+
+	done := make(chan error, 1)
+	go func() { done <- server.Stop() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not close incomplete handshake connections")
+	}
+	if err := server.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	for _, conn := range []net.Conn{silent, partial} {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		var one [1]byte
+		if _, err := conn.Read(one[:]); err == nil {
+			t.Fatal("shutdown left handshake connection open")
+		}
+	}
+}
+
+func TestControlServerContextCancellationClosesIncompleteHandshake(t *testing.T) {
+	registry := newRegistry(t, CameraSpec{ID: "cam-a"})
+	ctx, cancel := context.WithCancel(context.Background())
+	server := NewControlServer(filepath.Join(t.TempDir(), "control.sock"), registry, time.Second)
+	server.helloTimeout = time.Minute
+	if err := server.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	silent := dialPeer(t, server.path)
+	waitForConnections(t, server, 1)
+	cancel()
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.mu.Lock()
+		remaining := len(server.connections)
+		server.mu.Unlock()
+		if remaining == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("context cancellation left handshake connection tracked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := server.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	_ = silent.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := silent.Read(one[:]); err == nil {
+		t.Fatal("context cancellation left handshake connection open")
+	}
+}
+
+func TestControlServerHandshakeDeadlineAndConnectionLimit(t *testing.T) {
+	registry := newRegistry(t, CameraSpec{ID: "cam-a"})
+	server := NewControlServer(filepath.Join(t.TempDir(), "control.sock"), registry, time.Second)
+	server.helloTimeout = 20 * time.Millisecond
+	server.maxConnections = 1
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Stop() })
+
+	silent := dialPeer(t, server.path)
+	waitForConnections(t, server, 1)
+	limited := dialPeer(t, server.path)
+	_ = limited.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := limited.Read(one[:]); err == nil {
+		t.Fatal("connection limit did not reject the second handshake")
+	}
+	_ = silent.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := silent.Read(one[:]); err == nil {
+		t.Fatal("hello deadline did not close silent handshake")
+	}
+}
+
+func TestControlServerAcquirePairFailureRollsBackAndAllowsRetry(t *testing.T) {
+	registry := newRegistry(t, CameraSpec{ID: "cam-a"})
+	server := NewControlServer(filepath.Join(t.TempDir(), "control.sock"), registry, time.Second)
+	server.writeQueueSize = 1
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Stop() })
+
+	peer := dialPeer(t, server.path)
+	writePeerMessage(t, peer, hello("cam-a", 1, edgeipc.CodecH265))
+	writePeerMessage(t, peer, health())
+	waitForCamera(t, registry, 1)
+	if _, _, err := server.AcquireMainHub(context.Background(), "cam-a"); err == nil {
+		t.Fatal("AcquireMainHub accepted a queue with only one slot")
+	}
+	waitForPeer(t, server, "cam-a", false)
+	server.mu.Lock()
+	state := *server.leases["cam-a"]
+	server.mu.Unlock()
+	if state.count != 0 || state.desired || state.stopSent || state.stopTimer != nil {
+		t.Fatalf("failed acquire leaked lease state: %+v", state)
+	}
+	if registry.CameraStatus("cam-a") != "OFF" {
+		t.Fatal("failed pair must isolate the peer and turn the registry OFF")
+	}
+
+	server.writeQueueSize = controlWriteQueueSize
+	retryPeer := dialPeer(t, server.path)
+	writePeerMessage(t, retryPeer, hello("cam-a", 2, edgeipc.CodecH265))
+	writePeerMessage(t, retryPeer, health())
+	waitForCamera(t, registry, 2)
+	if _, release, err := server.AcquireMainHub(context.Background(), "cam-a"); err != nil {
+		t.Fatal(err)
+	} else {
+		defer release()
+	}
+	commands := readPeerMessages(t, retryPeer, 2)
+	if commands[0].Type != edgeipc.MessageStart || commands[1].Type != edgeipc.MessageRequestIDR {
+		t.Fatalf("retry commands = %+v", commands)
+	}
+}
+
+func TestControlServerSlowReaderTimesOutDespiteHealth(t *testing.T) {
+	registry := newRegistry(t, CameraSpec{ID: "cam-a"})
+	server := NewControlServer(filepath.Join(t.TempDir(), "control.sock"), registry, time.Second)
+	server.writeTimeout = 20 * time.Millisecond
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Stop() })
+
+	peer := dialPeer(t, server.path)
+	writePeerMessage(t, peer, hello("cam-a", 1, edgeipc.CodecH265))
+	writePeerMessage(t, peer, health())
+	waitForCamera(t, registry, 1)
+	if _, release, err := server.AcquireMainHub(context.Background(), "cam-a"); err != nil {
+		t.Fatal(err)
+	} else {
+		defer release()
+	}
+	_ = readPeerMessages(t, peer, 2)
+
+	server.mu.Lock()
+	controlPeer := server.peers["cam-a"]
+	generation := server.leases["cam-a"].generation
+	server.mu.Unlock()
+	large := strings.Repeat("x", 15000)
+	command := controlCommand{generation: generation, message: edgeipc.ControlMessage{
+		Type: edgeipc.MessageError, Version: edgeipc.ProtocolVersion,
+		Code: large, Retryable: true,
+	}}
+	for i := 0; i < cap(controlPeer.commands)+64; i++ {
+		select {
+		case controlPeer.commands <- command:
+		default:
+			break
+		}
+	}
+
+	stopHealth := make(chan struct{})
+	defer close(stopHealth)
+	go func() {
+		for {
+			select {
+			case <-stopHealth:
+				return
+			default:
+				_ = edgeipc.WriteControlMessage(peer, health())
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	waitForPeer(t, server, "cam-a", false)
+	if registry.CameraStatus("cam-a") != "OFF" {
+		t.Fatal("write timeout must isolate the peer and turn the registry OFF")
+	}
+}
+
+func waitForConnections(t *testing.T, server *ControlServer, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.mu.Lock()
+		got := len(server.connections)
+		server.mu.Unlock()
+		if got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("active connections = %d, want at least %d", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForPeer(t *testing.T, server *ControlServer, cameraID string, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		server.mu.Lock()
+		got := server.peers[cameraID] != nil
+		server.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("peer present = %v, want %v", got, want)
 		}
 		time.Sleep(time.Millisecond)
 	}

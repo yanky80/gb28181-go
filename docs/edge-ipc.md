@@ -69,6 +69,9 @@ checks that the configured codec is advertised by `hello` and equals `ready`;
 `NewMediaReaderForCodec` performs the same check before reading a media
 payload.
 
+A health timeout retires the current stream epoch; health from that epoch cannot
+revive it. The peer must reconnect and send `hello` with a new `stream_epoch`.
+
 Example default H.265 exchange:
 
 ```json
