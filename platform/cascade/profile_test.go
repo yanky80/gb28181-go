@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"log/slog"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -369,12 +367,7 @@ func TestH265PlaybackWithMatchingParsedCodecIsAccepted(t *testing.T) {
 	require.Eventually(t, func() bool { return svc.ForwardCount() == 0 }, time.Second, 10*time.Millisecond)
 }
 
-func TestPlaybackPumpPropagatesParseError(t *testing.T) {
-	var logs synchronizedBuffer
-	oldLogger := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() { slog.SetDefault(oldLogger) })
-
+func TestPlaybackPumpSkipsParseError(t *testing.T) {
 	hub := platform.NewFrameHub()
 	db := newCascadeTestDB(t)
 	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, hub}, db)
@@ -396,29 +389,10 @@ func TestPlaybackPumpPropagatesParseError(t *testing.T) {
 
 	res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Playback", true), "application/sdp"))
 	require.Equal(t, 200, int(res.StatusCode()))
-	require.Eventually(t, func() bool {
-		return strings.Contains(logs.String(), "reason=\"playback error:")
-	}, time.Second, 10*time.Millisecond)
+	up.awaitServerRequest(sip.BYE, "")
 }
 
 type recordingQueryErrorStore struct{ err error }
-
-type synchronizedBuffer struct {
-	mu sync.Mutex
-	bytes.Buffer
-}
-
-func (b *synchronizedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.Buffer.Write(p)
-}
-
-func (b *synchronizedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.Buffer.String()
-}
 
 func (recordingQueryErrorStore) UpsertCascadeChannel(context.Context, CascadeChannel) error {
 	return nil

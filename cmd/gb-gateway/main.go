@@ -109,6 +109,7 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 		HeartbeatInterval: cfg.GB.Heartbeat.String(),
 		RegisterExpires:   cfg.GB.RegisterExpires,
 	}, registry, store)
+	cascadeService.SetGBTimezone(time.FixedZone("Asia/Shanghai", 8*60*60))
 	cascadeService.SetMainStreamAcquirer(control)
 	if recordings != nil {
 		cascadeService.SetSegmentParser(mp4.ParseSegment)
