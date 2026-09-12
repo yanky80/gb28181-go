@@ -7,12 +7,7 @@ import (
 )
 
 func TestReleaseWorkflowPublishesGatewayArm64Metadata(t *testing.T) {
-	workflow, err := os.ReadFile(".github/workflows/release.yml")
-	if err != nil {
-		t.Fatalf("read release workflow: %v", err)
-	}
-
-	raw := string(workflow)
+	raw := readWorkflow(t, ".github/workflows/release.yml")
 	for _, contract := range []string{
 		`if [ "${GOOS}" = "linux" ] && [ "${GOARCH}" = "arm64" ]; then`,
 		`go build -trimpath -o "dist/gb-gateway" ./cmd/gb-gateway`,
@@ -26,4 +21,22 @@ func TestReleaseWorkflowPublishesGatewayArm64Metadata(t *testing.T) {
 			t.Errorf("release workflow is missing %q", contract)
 		}
 	}
+}
+
+func TestReleaseAndCIUseValidatedGoToolchain(t *testing.T) {
+	if got := strings.Count(readWorkflow(t, ".github/workflows/ci.yml"), "go-version: '1.26'"); got != 2 {
+		t.Fatalf("CI must pin both lint and test jobs to Go 1.26, found %d pins", got)
+	}
+	if got := strings.Count(readWorkflow(t, ".github/workflows/release.yml"), "go-version: '1.26'"); got != 1 {
+		t.Fatalf("release preflight must pin its test job to Go 1.26, found %d pins", got)
+	}
+}
+
+func readWorkflow(t *testing.T, path string) string {
+	t.Helper()
+	workflow, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(workflow)
 }
