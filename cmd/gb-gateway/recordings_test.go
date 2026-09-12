@@ -656,7 +656,7 @@ func TestRecordingStoreQueryIncludesOverlapSortsAndLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := store.scanAt(context.Background(), now); err != nil {
 			t.Fatal(err)
 		}
@@ -702,7 +702,7 @@ func TestRecordingStoreTombstoneAndCompactAreAtomic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := store.scanAt(context.Background(), now); err != nil {
 			t.Fatal(err)
 		}
@@ -768,7 +768,7 @@ func TestRecordingStoreConcurrentCleanupDoesNotAffectOtherResults(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := store.scanAt(context.Background(), now); err != nil {
 			t.Fatal(err)
 		}

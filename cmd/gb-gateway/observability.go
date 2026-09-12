@@ -25,8 +25,10 @@ const (
 	observabilityQueue = 256
 )
 
-var gatewaySecretRE = regexp.MustCompile(`(?i)(authorization|password|passwd|secret|token|credential|api[_-]?key)(\s*[:=]\s*|\s+)[^\s,;]+`)
-var gatewayURLRE = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s,;]+`)
+var (
+	gatewaySecretRE = regexp.MustCompile(`(?i)(authorization|password|passwd|secret|token|credential|api[_-]?key)(\s*[:=]\s*|\s+)[^\s,;]+`)
+	gatewayURLRE    = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*://[^\s,;]+`)
+)
 
 // GatewayChannelSnapshot is the immutable local view of one GB channel.
 type GatewayChannelSnapshot struct {
@@ -184,12 +186,15 @@ func (o *GatewayObservability) RegisterOK() { o.Record(metrics.GatewayEvent{Name
 func (o *GatewayObservability) RegisterFail() {
 	o.Record(metrics.GatewayEvent{Name: "register_failure"})
 }
+
 func (o *GatewayObservability) KeepaliveFail() {
 	o.Record(metrics.GatewayEvent{Name: "heartbeat_failure"})
 }
+
 func (o *GatewayObservability) InviteSessionStarted() {
 	o.Record(metrics.GatewayEvent{Name: "invite_started"})
 }
+
 func (o *GatewayObservability) InviteSessionStopped() {
 	o.Record(metrics.GatewayEvent{Name: "invite_stopped"})
 }
@@ -299,9 +304,9 @@ func newGatewayState(snapshot GatewaySnapshot) *gatewayState {
 }
 
 func (s *gatewayState) Store(snapshot GatewaySnapshot) {
-	copy := snapshot
-	copy.Channels = append([]GatewayChannelSnapshot(nil), snapshot.Channels...)
-	s.value.Store(&copy)
+	snapshotCopy := snapshot
+	snapshotCopy.Channels = append([]GatewayChannelSnapshot(nil), snapshot.Channels...)
+	s.value.Store(&snapshotCopy)
 }
 
 func (s *gatewayState) Load() GatewaySnapshot {
@@ -309,9 +314,9 @@ func (s *gatewayState) Load() GatewaySnapshot {
 	if snapshot == nil {
 		return GatewaySnapshot{}
 	}
-	copy := *snapshot
-	copy.Channels = append([]GatewayChannelSnapshot(nil), snapshot.Channels...)
-	return copy
+	snapshotCopy := *snapshot
+	snapshotCopy.Channels = append([]GatewayChannelSnapshot(nil), snapshot.Channels...)
+	return snapshotCopy
 }
 
 // WatchdogNotifier is intentionally tiny so tests and service managers can
@@ -423,7 +428,7 @@ func writeGatewaySnapshot(path string, snapshot GatewaySnapshot) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Chmod(tmpName, 0640); err != nil {
+	if err := os.Chmod(tmpName, 0o640); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, path); err != nil {

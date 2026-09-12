@@ -268,7 +268,7 @@ func decodeControlLine(line []byte) (ControlMessage, error) {
 	}
 	var message ControlMessage
 	if err := json.Unmarshal(line, &message); err != nil {
-		return ControlMessage{}, fmt.Errorf("%w: %v", ErrInvalidJSON, err)
+		return ControlMessage{}, fmt.Errorf("%w: %w", ErrInvalidJSON, err)
 	}
 	if err := ValidateControlMessage(message); err != nil {
 		return ControlMessage{}, err

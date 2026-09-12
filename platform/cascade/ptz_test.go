@@ -235,7 +235,7 @@ func TestPTZConcurrentCommandsSerializeAdapterAccess(t *testing.T) {
 	svc.SetPTZAdapter("front", adapter)
 
 	done := make(chan struct{})
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		go func() {
 			svc.forwardDeviceControl(manscdp.DeviceControl{
 				DeviceID: "34020000001320000001", PTZCmd: "A50F0108002000DD",
@@ -243,7 +243,7 @@ func TestPTZConcurrentCommandsSerializeAdapterAccess(t *testing.T) {
 			done <- struct{}{}
 		}()
 	}
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		<-done
 	}
 	svc.forwardDeviceControl(manscdp.DeviceControl{DeviceID: "34020000001320000001", PTZCmd: "A50F0100000000B5"})

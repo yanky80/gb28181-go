@@ -7,8 +7,6 @@ github.com/emmansun/gmsm v0.44.1/go.mod h1:p6RIUta0/KboFHrOxr1x8q+pd8RZtdaTO7XNp
 github.com/fsnotify/fsnotify v1.4.7/go.mod h1:jwhsz4b93w/PPRr/qN1Yymfu8t87LnFCMoQvtojpjFo=
 github.com/fsnotify/fsnotify v1.4.9 h1:hsms1Qyu0jgnwNXIxa+/V/PDsU6CfLf6CNO8H7IWoS4=
 github.com/fsnotify/fsnotify v1.4.9/go.mod h1:znqG4EE+3YCdAaPaxE2ZRY/06pZUdp0tY4IgpuI1SZQ=
-github.com/ghettovoice/gosip v0.0.0-20260603143348-d1f3b494c69a h1:k/7ZEbDy5yBYs723U66dtG7Z2IU1oNBd2y1lW6oYF40=
-github.com/ghettovoice/gosip v0.0.0-20260603143348-d1f3b494c69a/go.mod h1:Cb2Ioas/4d5T9XUMFKLxjMxjmZVBONNrICOyiDdS4Xw=
 github.com/gobwas/httphead v0.1.0 h1:exrUm0f4YX0L7EBwZHuCF4GDp8aJfVeBrlLQrs6NqWU=
 github.com/gobwas/httphead v0.1.0/go.mod h1:O/RXo79gxV8G+RqlR/otEwx4Q36zl9rqC5u12GKvMCM=
 github.com/gobwas/pool v0.2.1 h1:xfeeEhW7pwmX8nuLVlqbzVc7udMDrwetjEv+TZIz1og=
@@ -60,6 +58,8 @@ github.com/tevino/abool v0.0.0-20170917061928-9b9efcf221b5 h1:hNna6Fi0eP1f2sMBe/
 github.com/tevino/abool v0.0.0-20170917061928-9b9efcf221b5/go.mod h1:f1SCnEOt6sc3fOJfPQDRDzHOtSXuTtnz0ImG9kPRDV0=
 github.com/x-cray/logrus-prefixed-formatter v0.5.2 h1:00txxvfBM9muc0jiLIEAkAcIMJzfthRT6usrui8uGmg=
 github.com/x-cray/logrus-prefixed-formatter v0.5.2/go.mod h1:2duySbKsL6M18s5GU7VPsoEPHyzalCE06qoARUCeBBE=
+github.com/yanky80/gosip v0.0.0-20260912134017-7cabcef84d3b h1:aJ3e85t3oTitveKvF36Oa1zlHFzj+sUO99SaO6h3RdE=
+github.com/yanky80/gosip v0.0.0-20260912134017-7cabcef84d3b/go.mod h1:Cb2Ioas/4d5T9XUMFKLxjMxjmZVBONNrICOyiDdS4Xw=
 go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
 go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
 golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=

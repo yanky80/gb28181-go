@@ -28,9 +28,6 @@ const gbTimeLayout = "2006-01-02T15:04:05"
 // echoes the queried channel ID (platforms correlate on DeviceID+SN — some
 // echo the device ID, but the channel form is what our own platform keys on).
 func (s *Service) answerRecordInfo(ctx context.Context, u *upper, q manscdp.RecordInfoQuery) {
-	if ctx == nil {
-		ctx = s.storeContext()
-	}
 	if s.db == nil {
 		slog.Warn("gb28181-cascade: RecordInfo unavailable — no recording store", "channel", q.DeviceID)
 		s.sendEmptyRecordInfo(u, q)

@@ -117,7 +117,7 @@ func TestLoadConfigRejectsMixedCameraProfiles(t *testing.T) {
 func TestLoadCredentialsRequires0600AndDoesNotLeakSecret(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "credentials")
-	if err := os.WriteFile(path, []byte("sip.password=top-secret\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("sip.password=top-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	creds, err := LoadCredentials(path)
@@ -128,7 +128,7 @@ func TestLoadCredentialsRequires0600AndDoesNotLeakSecret(t *testing.T) {
 		t.Fatalf("credential = %q, %v", got, ok)
 	}
 
-	if err := os.Chmod(path, 0644); err != nil {
+	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadCredentials(path); err == nil || !strings.Contains(err.Error(), "0600") {
@@ -149,7 +149,7 @@ func TestCredentialsFormattingIsRedacted(t *testing.T) {
 func TestLoadCredentialsRejectsFIFOWithoutBlocking(t *testing.T) {
 	dir := t.TempDir()
 	fifo := filepath.Join(dir, "credentials.fifo")
-	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	link := filepath.Join(dir, "credentials-link")
@@ -180,13 +180,13 @@ func TestLoadCredentialsRejectsSpecialPermissionBits(t *testing.T) {
 		name string
 		mode os.FileMode
 	}{
-		{"setuid", 0600 | os.ModeSetuid},
-		{"setgid", 0600 | os.ModeSetgid},
-		{"sticky", 0600 | os.ModeSticky},
+		{"setuid", 0o600 | os.ModeSetuid},
+		{"setgid", 0o600 | os.ModeSetgid},
+		{"sticky", 0o600 | os.ModeSticky},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "credentials")
-			if err := os.WriteFile(path, []byte("sip.password=top-secret\n"), 0600); err != nil {
+			if err := os.WriteFile(path, []byte("sip.password=top-secret\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.Chmod(path, tc.mode); err != nil {
@@ -205,7 +205,7 @@ func TestLoadConfigReadsFreshFileAfterAtomicRename(t *testing.T) {
 	write := func(contents string) {
 		t.Helper()
 		tmp := filepath.Join(dir, "gateway.conf.tmp")
-		if err := os.WriteFile(tmp, []byte(contents), 0600); err != nil {
+		if err := os.WriteFile(tmp, []byte(contents), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Rename(tmp, path); err != nil {

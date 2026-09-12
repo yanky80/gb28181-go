@@ -72,7 +72,7 @@ func TestMediaHostWaitsForIDRThenPublishes(t *testing.T) {
 		t.Fatalf("IDR requests after recovery = %d, want 1", got)
 	}
 	peer.Close()
-	if err := <-done; err != nil && err != io.EOF {
+	if err := <-done; err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("ServeConn error = %v", err)
 	}
 }
@@ -421,8 +421,10 @@ func TestMediaHostKeepsSlowCameraSeparate(t *testing.T) {
 	bServer, bPeer := net.Pipe()
 	bDone := make(chan error, 1)
 	go func() { bDone <- s.ServeConn(bServer) }()
-	writeMedia(t, bPeer, edgeipc.MediaFrame{Codec: edgeipc.CodecH265, Flags: edgeipc.FlagIDR,
-		CameraID: "cam-b", PTS90kHz: 9000, Sequence: 1, Payload: h265IDR()})
+	writeMedia(t, bPeer, edgeipc.MediaFrame{
+		Codec: edgeipc.CodecH265, Flags: edgeipc.FlagIDR,
+		CameraID: "cam-b", PTS90kHz: 9000, Sequence: 1, Payload: h265IDR(),
+	})
 	deadline := time.Now().Add(time.Second)
 	for published.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -554,7 +556,7 @@ func TestMediaHostUses0660Socket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0660 {
+	if got := info.Mode().Perm(); got != 0o660 {
 		t.Fatalf("socket mode = %o, want 660", got)
 	}
 	if err := l.Close(); err != nil {
@@ -589,7 +591,7 @@ func TestMediaHostServeClosesPeerAndWaitsForHandler(t *testing.T) {
 	}
 	select {
 	case err := <-done:
-		if err != nil {
+		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Serve() error = %v", err)
 		}
 	case <-time.After(time.Second):

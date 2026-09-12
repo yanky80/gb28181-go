@@ -133,14 +133,14 @@ func TestFrameHubCloseReleasesVideoAndAudioConsumers(t *testing.T) {
 func TestFrameHubCloseConvergesWithConcurrentOperations(t *testing.T) {
 	h := NewFrameHub()
 	var wg sync.WaitGroup
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			id := fmt.Sprintf("video-%d", i)
 			_ = h.Subscribe(id, func(int64, [][]byte, bool) {})
 			_ = h.SubscribeAudio("audio-"+id, func(int64, string, []byte) {})
-			for j := 0; j < 20; j++ {
+			for j := range 20 {
 				h.Broadcast(int64(j), [][]byte{{1}}, false)
 				h.BroadcastAudio(int64(j), "g711a", []byte{1})
 			}

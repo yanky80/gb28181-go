@@ -111,7 +111,7 @@ func (s *MediaHost) Listen() (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(s.config.Path, 0660); err != nil {
+	if err := os.Chmod(s.config.Path, 0o660); err != nil {
 		_ = l.Close()
 		_ = os.Remove(s.config.Path)
 		return nil, fmt.Errorf("gateway: chmod media socket: %w", err)
@@ -134,7 +134,7 @@ func (s *MediaHost) Serve(ctx context.Context) error {
 		conn, err := l.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return ctx.Err()
 			}
 			return err
 		}

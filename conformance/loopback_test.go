@@ -40,6 +40,14 @@ func freeUDPPort(t *testing.T) int {
 	return c.LocalAddr().(*net.UDPAddr).Port
 }
 
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
 // loopback brings up one platform SIP server and one device pointing at it.
 type loopback struct {
 	platformSrv *sip.Server
@@ -279,7 +287,7 @@ func TestLoopback_SIPSRegisterCatalog(t *testing.T) {
 	certFile, keyFile := genSelfSignedCert(t, dir)
 
 	ctx := context.Background()
-	sipPort := freeUDPPort(t)
+	sipPort := freeTCPPort(t)
 	mediaBase := 23000 + 100*freeUDPPort(t)%400
 
 	cfg := sip.Config{
@@ -297,7 +305,6 @@ func TestLoopback_SIPSRegisterCatalog(t *testing.T) {
 	sm := platform.NewSessionManager(platform.NewPortManager(uint16(mediaBase), uint16(mediaBase+99)), cfg.ServerID)
 	psrv := sip.NewServer(cfg, dm, sm, nil)
 	require.NoError(t, psrv.Start(ctx))
-	t.Cleanup(func() { _ = psrv.Stop() })
 
 	fh := device.NewFrameHub()
 	dcfg := device.Config{
@@ -327,6 +334,10 @@ func TestLoopback_SIPSRegisterCatalog(t *testing.T) {
 			t.Error("device server did not exit after Stop")
 		}
 	})
+	// Stop gosip while the device still owns the TLS connection. If the peer
+	// closes first, gosip's connection-pool error handler can block after the
+	// server shutdown loop has stopped receiving pool errors.
+	t.Cleanup(func() { _ = psrv.Stop() })
 
 	lb := &loopback{platformSrv: psrv, devices: dm, sessions: sm, deviceSrv: dsrv, frames: fh}
 	dev := lb.onlineDevice(t)

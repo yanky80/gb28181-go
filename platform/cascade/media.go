@@ -74,6 +74,10 @@ type mediaSession struct {
 	started       atomic.Bool
 	stopped       atomic.Bool
 	codecVerified atomic.Bool
+	// ready closes once the forward has installed its hub subscription; a
+	// main-stream dialog answers the INVITE only after that, so the upper
+	// platform's first access unit cannot overtake the subscription.
+	ready chan struct{}
 	// psStarted latches on the first verified AU: that burst must carry the
 	// PSM so receivers latch the configured demuxer codec before subsequent
 	// VCL-only access units arrive.
@@ -228,7 +232,15 @@ func sdpToUnix(v int64) int64 {
 // onInvite handles the upper platform's INVITE for one aggregated channel:
 // 200 OK with our sendonly SDP, then forward the camera's stream (ACK from
 // the upper platform completes the dialog; gosip auto-matches it).
-func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
+func respondOnTransaction(tx sip.ServerTransaction, req sip.Request, status sip.StatusCode, reason, body string, headers []sip.Header) error {
+	response := sip.NewResponseFromRequest("", req, status, reason, body)
+	for _, header := range headers {
+		response.AppendHeader(header)
+	}
+	return tx.Respond(response)
+}
+
+func (s *Service) onInvite(req sip.Request, tx sip.ServerTransaction) {
 	if s.srv == nil {
 		return
 	}
@@ -244,7 +256,9 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	}
 	reject := func(status sip.StatusCode, reason, code string) {
 		s.observeInviteFailure(callID, channelID, code)
-		_, _ = s.srv.RespondOnRequest(req, status, reason, "", nil)
+		if err := respondOnTransaction(tx, req, status, reason, "", nil); err != nil {
+			slog.Warn("gb28181-cascade: INVITE response failed", "status", status, "error", err)
+		}
 	}
 
 	s.admissionMu.Lock()
@@ -307,7 +321,9 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	if ms, ok := s.sessions[callID]; ok {
 		sdp := ms.sdpBody
 		s.mu.Unlock()
-		_, _ = s.srv.RespondOnRequest(req, 200, "OK", sdp, nil)
+		if err := respondOnTransaction(tx, req, 200, "OK", sdp, nil); err != nil {
+			slog.Warn("gb28181-cascade: INVITE response failed", "status", 200, "error", err)
+		}
 		return
 	}
 	if ps, ok := s.playbacks[callID]; ok {
@@ -315,7 +331,9 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 		if sameWindow {
 			sdp := ps.sdpBody
 			s.mu.Unlock()
-			_, _ = s.srv.RespondOnRequest(req, 200, "OK", sdp, nil)
+			if err := respondOnTransaction(tx, req, 200, "OK", sdp, nil); err != nil {
+				slog.Warn("gb28181-cascade: INVITE response failed", "status", 200, "error", err)
+			}
 			return
 		}
 		delete(s.playbacks, callID)
@@ -436,8 +454,10 @@ func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
 	s.sessions[callID] = ms
 	s.mu.Unlock()
 
-	_, _ = s.srv.RespondOnRequest(req, 200, "OK", ms.sdpBody, nil)
-	go ms.run(hub)
+	ms.start(hub)
+	if err := respondOnTransaction(tx, req, 200, "OK", ms.sdpBody, nil); err != nil {
+		slog.Warn("gb28181-cascade: INVITE response failed", "status", 200, "error", err)
+	}
 	mediaTarget := "<nil>"
 	if dst != nil {
 		mediaTarget = dst.String()
@@ -490,8 +510,30 @@ func answerMediaPort(conn net.Conn, tcp bool) int {
 	return 0
 }
 
+// start launches the forward pump and, for a main-stream dialog, returns only
+// once the hub subscription is installed. The upper platform can publish its
+// first access unit the moment the INVITE is answered; a frame that reaches
+// the hub before this session subscribed is dropped, which leaves a dialog
+// that looks established but never carries media. Sub-stream dialogs stay
+// asynchronous because their acquisition may need a device INVITE of its own.
+func (ms *mediaSession) start(hub *platform.FrameHub) {
+	ms.ready = make(chan struct{})
+	go ms.run(hub)
+	if !ms.wantSub {
+		<-ms.ready
+	}
+}
+
 // run subscribes to the camera's hub and pumps frames until stopped.
 func (ms *mediaSession) run(hub *platform.FrameHub) {
+	ready, armed := ms.ready, true
+	notifyReady := func() {
+		if ready != nil && armed {
+			armed = false
+			close(ready)
+		}
+	}
+	defer notifyReady()
 	// Sub-stream tier (#512): swap the forwarded hub for the on-demand
 	// low-res pull. Bounded by the manager's ready timeout; failure (no sub
 	// config / pull not ready) degrades to main — quality negotiation never
@@ -596,6 +638,7 @@ func (ms *mediaSession) run(hub *platform.FrameHub) {
 	}
 	ms.subID = subID
 	ms.mu.Unlock()
+	notifyReady()
 
 	// Audio upstream (#370): when the upper INVITEd with an audio m-line,
 	// subscribe to the hub's audio and PS-mux frames alongside video. Only
