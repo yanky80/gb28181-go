@@ -50,9 +50,10 @@ const speculativeAckDelay = 2500 * time.Millisecond
 // threshold inside the GOP recycles healthy streams forever (observed: a
 // ~3min-GOP source recycled every ~80s, breaking every live view each cycle).
 const (
-	idrStaleAfter    = 10 * time.Minute
-	streamStaleAfter = 45 * time.Second
-	idrWatchInterval = 15 * time.Second
+	idrStaleAfter     = 10 * time.Minute
+	streamStaleAfter  = 45 * time.Second
+	idrWatchInterval  = 15 * time.Second
+	watchPollInterval = 100 * time.Millisecond
 )
 
 // CameraEnroller auto-creates a camera in the main cameras list when a GB28181
@@ -114,6 +115,7 @@ type CameraEnroller interface {
 type inviteDialog struct {
 	req  sip.Request
 	resp sip.Response
+	tx   sip.ClientTransaction
 }
 
 // Server implements the GB/T 28181 SIP platform (UAS) side. It owns the gosip
@@ -534,10 +536,51 @@ func (s *Server) SendMessage(deviceID string, body []byte) error {
 		return err
 	}
 
-	if _, err := srv.Request(req); err != nil {
+	tx, err := srv.Request(req)
+	if err != nil {
 		return fmt.Errorf("gb28181: send MESSAGE to %s: %w", deviceID, err)
 	}
+	cleanupClientTransaction(tx)
 	return nil
+}
+
+// cleanupClientTransaction closes fire-and-forget client transactions as soon
+// as their final response arrives. gosip otherwise keeps completed
+// non-INVITE transactions until Timer D, which makes repeated control traffic
+// accumulate goroutines for tens of seconds.
+func cleanupClientTransaction(tx sip.ClientTransaction) {
+	go func() {
+		responses := tx.Responses()
+		errs := tx.Errors()
+		for {
+			select {
+			case response, ok := <-responses:
+				if !ok {
+					return
+				}
+				if response.IsProvisional() {
+					continue
+				}
+				terminateClientTransaction(tx)
+				return
+			case _, ok := <-errs:
+				if !ok {
+					errs = nil
+					continue
+				}
+				terminateClientTransaction(tx)
+				return
+			case <-tx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func terminateClientTransaction(tx sip.ClientTransaction) {
+	if terminable, ok := tx.(interface{ Terminate() }); ok {
+		terminable.Terminate()
+	}
 }
 
 // buildRequest assembles a request with the headers GB28181 devices expect:
@@ -759,7 +802,7 @@ func (s *Server) inviteCore(deviceID string, ch *platform.Channel, netAddr, serv
 			slog.Warn("gb28181: send ACK failed", "channel", channelID, "error", err)
 		}
 		s.mu.Lock()
-		s.dialogs[channelID] = &inviteDialog{req: req, resp: resp}
+		s.dialogs[channelID] = &inviteDialog{req: req, resp: resp, tx: tx}
 		s.mu.Unlock()
 		// Seed the no-PSM audio fallback from the answer SDP: devices that
 		// mux audio into the PS stream without ever sending a Program Stream
@@ -801,7 +844,12 @@ func (s *Server) inviteCore(deviceID string, ch *platform.Channel, netAddr, serv
 // Each recycle re-INVITEs, which starts a fresh watchdog for the new session.
 func (s *Server) watchSession(deviceID, channelID string) {
 	for {
-		time.Sleep(idrWatchInterval)
+		for waited := time.Duration(0); waited < idrWatchInterval; waited += watchPollInterval {
+			time.Sleep(watchPollInterval)
+			if s.sessionMgr.GetReceiver(channelID) == nil {
+				return
+			}
+		}
 		rcv := s.sessionMgr.GetReceiver(channelID)
 		if rcv == nil {
 			return // session replaced or gone
@@ -950,10 +998,12 @@ func (s *Server) sendDialogReset(deviceID, channelID, deviceAddr string) {
 	if err != nil {
 		return
 	}
-	if _, err := srv.Request(bye); err != nil {
+	tx, err := srv.Request(bye)
+	if err != nil {
 		slog.Debug("gb28181: dialog-reset BYE send failed", "channel", channelID, "error", err)
 		return
 	}
+	cleanupClientTransaction(tx)
 	slog.Info("gb28181: dialog-reset BYE sent (486 recovery)", "channel", channelID, "device", deviceID)
 }
 
@@ -985,6 +1035,7 @@ func (s *Server) sendByeForChannel(channelID string) error {
 	if srv == nil || dialog == nil {
 		return nil
 	}
+	defer terminateClientTransaction(dialog.tx)
 	s.metrics.InviteSessionStopped()
 
 	fromHdr, hasFrom := dialog.resp.From()
@@ -1024,9 +1075,11 @@ func (s *Server) sendByeForChannel(channelID string) error {
 	if err != nil {
 		return fmt.Errorf("gb28181: build BYE request: %w", err)
 	}
-	if _, err := srv.Request(byeReq); err != nil {
+	tx, err := srv.Request(byeReq)
+	if err != nil {
 		return fmt.Errorf("gb28181: send BYE for %s: %w", channelID, err)
 	}
+	cleanupClientTransaction(tx)
 	slog.Info("gb28181: BYE sent", "channel", channelID)
 	return nil
 }
@@ -1294,7 +1347,7 @@ func (s *Server) handleRegister(req sip.Request, tx sip.ServerTransaction) {
 	// 200 OK first — the device must see its REGISTER accepted before any
 	// follow-up request (catalog query, INVITE) arrives.
 	exp := sip.Expires(expires)
-	okHeaders := []sip.Header{&exp}
+	okHeaders := []sip.Header{&exp, &sip.GenericHeader{HeaderName: "X-GB-Ver", Contents: s.cfg.EffectiveProtocolVersion()}}
 	if securityInfo != "" {
 		okHeaders = append(okHeaders, &sip.GenericHeader{HeaderName: "SecurityInfo", Contents: securityInfo})
 	}
@@ -1392,7 +1445,11 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 
 	switch ct {
 	case manscdp.CmdKeepalive:
-		p := payload.(manscdp.Keepalive)
+		p, ok := payload.(manscdp.Keepalive)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid Keepalive payload", nil)
+			return
+		}
 		// A keepalive must come from the device it vouches for — otherwise a
 		// spoofed MESSAGE keeps a dead device "online" forever.
 		if fromUser != "" && fromUser != p.DeviceID {
@@ -1439,17 +1496,26 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 		}
 		p, ok := payload.(manscdp.Catalog)
 		if !ok {
-			break
+			s.respond(req, tx, statusBadRequest, "Invalid Catalog payload", nil)
+			return
 		}
 		slog.Info("gb28181: catalog received", "device", p.DeviceID, "channels", len(p.Item))
 		s.mergeCatalogChannels(p.DeviceID, p.Item)
 	case manscdp.CmdRecordInfo:
-		p := payload.(manscdp.RecordInfo)
+		p, ok := payload.(manscdp.RecordInfo)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid RecordInfo payload", nil)
+			return
+		}
 		slog.Info("gb28181: record info received", "device", p.DeviceID,
 			"sn", p.SN, "sum_num", p.SumNum, "items", len(p.RecordList))
 		s.feedRecordQuery(p.DeviceID, p)
 	case manscdp.CmdDeviceInfo:
-		p := payload.(manscdp.DeviceInfo)
+		p, ok := payload.(manscdp.DeviceInfo)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid DeviceInfo payload", nil)
+			return
+		}
 		slog.Info("gb28181: device info received", "device", p.DeviceID, "name", p.DeviceName, "manufacturer", p.Manufacturer, "model", p.Model)
 		if d, ok := s.deviceMgr.Device(p.DeviceID); ok {
 			d.Mu.Lock()
@@ -1487,7 +1553,11 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 			}
 		}
 	case manscdp.CmdDeviceStatus:
-		p := payload.(manscdp.DeviceStatus)
+		p, ok := payload.(manscdp.DeviceStatus)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid DeviceStatus payload", nil)
+			return
+		}
 		slog.Info("gb28181: device status received", "device", p.DeviceID, "status", p.Status, "time", p.Time)
 		if p.Status != "" && p.Status != "OK" && p.Status != "ON" {
 			slog.Warn("gb28181: device reports abnormal status", "device", p.DeviceID, "status", p.Status)
@@ -1495,9 +1565,18 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 	case manscdp.CmdAlarm:
 		// Some firmwares deliver alarms as MESSAGE instead of NOTIFY —
 		// route both into the same pipeline.
-		s.handleAlarm(payload.(manscdp.Alarm))
+		p, ok := payload.(manscdp.Alarm)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid Alarm payload", nil)
+			return
+		}
+		s.handleAlarm(p)
 	case manscdp.CmdUploadSnapShotFinished:
-		p := payload.(manscdp.UploadSnapShotFinished)
+		p, ok := payload.(manscdp.UploadSnapShotFinished)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid UploadSnapShotFinished payload", nil)
+			return
+		}
 		slog.Info("gb28181: snapshot finished notify", "device", p.DeviceID,
 			"session", p.SessionID, "files", len(p.SnapShotList))
 		if bus := s.eventBusSnapshot(); bus != nil {
@@ -1513,7 +1592,11 @@ func (s *Server) handleMessage(req sip.Request, tx sip.ServerTransaction) {
 		// Device clock query (GB/T 28181-2016 § 9.6): answer with the
 		// platform wall clock so device-side timestamps (and RecordInfo
 		// ranges) stay aligned. The query may arrive with a Query root.
-		p := payload.(manscdp.TimeSyncQuery)
+		p, ok := payload.(manscdp.TimeSyncQuery)
+		if !ok {
+			s.respond(req, tx, statusBadRequest, "Invalid TimeSync payload", nil)
+			return
+		}
 		slog.Info("gb28181: time sync query", "device", p.DeviceID, "sn", p.SN)
 		go func(devID string, sn int) {
 			body, err := manscdp.Encode(manscdp.TimeSyncResponse{

@@ -304,6 +304,35 @@ func TestServer_Register_Flow(t *testing.T) {
 	}
 }
 
+func TestServer_Register_ProtocolVersionHeader(t *testing.T) {
+	for _, tt := range []struct {
+		name, configured, want string
+	}{
+		{name: "default", want: "3.0"},
+		{name: "configured-2.0", configured: "2.0", want: "2.0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.ProtocolVersion = tt.configured
+			startTestServer(t, cfg)
+			client := newSIPClient(t, cfg.SIPListen)
+
+			req := buildRequest(t, sip.REGISTER, testDeviceID, testServerID, cfg.SIPListen, client.localPort(), "")
+			res := client.roundTrip(req)
+			auth := digestAuth(t, getChallenge(t, res), req, cfg.Password)
+			req2 := buildRequest(t, sip.REGISTER, testDeviceID, testServerID, cfg.SIPListen, client.localPort(), "", auth)
+			res2 := client.roundTrip(req2)
+			if res2.StatusCode() != 200 {
+				t.Fatalf("authed REGISTER status = %d, want 200", res2.StatusCode())
+			}
+			headers := res2.GetHeaders("X-GB-Ver")
+			if len(headers) != 1 || headers[0].Value() != tt.want {
+				t.Fatalf("X-GB-Ver = %v, want %s", headers, tt.want)
+			}
+		})
+	}
+}
+
 func TestServer_Register_UnallowedDevice(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.AllowedDeviceIDs = []string{"34020000001320000002"}

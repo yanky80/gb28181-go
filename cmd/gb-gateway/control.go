@@ -42,6 +42,7 @@ type ControlServer struct {
 	writeQueueSize int
 	queued         atomic.Int64 // aggregate pending commands across all peers
 	metrics        metrics.Hooks
+	onDisconnect   func(cameraID string, streamEpoch uint64)
 	nextRequestID  atomic.Uint64
 	nextConnection atomic.Uint64
 	helloMu        sync.Mutex
@@ -107,6 +108,12 @@ func (s *ControlServer) SetMetricsHooks(h metrics.Hooks) {
 		h = metrics.NoopHooks{}
 	}
 	s.metrics = h
+}
+
+// SetDisconnectHandler notifies the media owner when a live control epoch
+// disappears, so cross-module dialogs can be torn down immediately.
+func (s *ControlServer) SetDisconnectHandler(handler func(cameraID string, streamEpoch uint64)) {
+	s.onDisconnect = handler
 }
 
 func (s *ControlServer) observe(event metrics.GatewayEvent) {
@@ -442,6 +449,7 @@ func (s *ControlServer) handlePeerMessage(peer *controlPeer, message edgeipc.Con
 }
 
 func (s *ControlServer) peerGone(peer *controlPeer) {
+	var retired bool
 	s.mu.Lock()
 	if s.peers[peer.cameraID] == peer {
 		delete(s.peers, peer.cameraID)
@@ -449,9 +457,12 @@ func (s *ControlServer) peerGone(peer *controlPeer) {
 		if state.peer == peer {
 			state.peer = nil
 		}
-		s.registry.HandleDisconnect(peer.cameraID, peer.epoch)
+		retired = s.registry.HandleDisconnect(peer.cameraID, peer.epoch)
 	}
 	s.mu.Unlock()
+	if retired && s.onDisconnect != nil {
+		s.onDisconnect(peer.cameraID, peer.epoch)
+	}
 }
 
 func (p *controlPeer) close() {

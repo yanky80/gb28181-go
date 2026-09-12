@@ -28,6 +28,9 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("sip.Config.MediaTransport %q must be tcp-passive, udp, or tcp-active", c.MediaTransport)
 	}
+	if c.ProtocolVersion != "" && c.ProtocolVersion != "2.0" && c.ProtocolVersion != "3.0" {
+		return fmt.Errorf("sip.Config.ProtocolVersion %q must be 2.0 or 3.0", c.ProtocolVersion)
+	}
 	switch c.TCPFraming {
 	case "", "rfc4571", "0x24", "auto":
 	default:

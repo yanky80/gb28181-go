@@ -173,7 +173,7 @@ func TestNetworkChangeForcesFreshRegistration(t *testing.T) {
 	cfg.HeartbeatInterval = "10s"
 	cfg.RegisterRetryBase = "20ms"
 	cfg.RegisterRetryMax = "100ms"
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	cfg.SIPListen = freeSIPListenAddress(t)
 
 	up := newUpperSocket(t, cfg.SIPListen)
 	cfg.ServerAddr = up.conn.LocalAddr().String()
@@ -198,7 +198,7 @@ func TestNetworkChangeForcesFreshRegistration(t *testing.T) {
 
 func TestStartUsesCallerContextCancellation(t *testing.T) {
 	cfg := testCfg()
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	cfg.SIPListen = freeSIPListenAddress(t)
 	up := newUpperSocket(t, cfg.SIPListen)
 	cfg.ServerAddr = up.conn.LocalAddr().String()
 	ctx, cancel := context.WithCancel(context.Background())

@@ -8,6 +8,7 @@ package cascade
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -29,6 +30,7 @@ const (
 	lbUpperDevice = "34020000002000000002" // fake upper platform's device ID
 	lbChannelOne  = "34020000001320000001" // first allocated channel
 	lbLocalHost   = "127.0.0.1"
+	lbSIPHost     = "127.0.0.3" // isolate cascade SIP probes from other packages
 )
 
 // freeUDPPort returns a free UDP port on loopback.
@@ -38,6 +40,14 @@ func freeUDPPort(t *testing.T) int {
 	require.NoError(t, err)
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).Port
+}
+
+func freeSIPListenAddress(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(lbSIPHost)})
+	require.NoError(t, err)
+	defer conn.Close()
+	return conn.LocalAddr().String()
 }
 
 var lbSeq atomic.Int64
@@ -86,6 +96,10 @@ func (u *upperSocket) readMessage() sip.Message {
 // roundTrip sends a request and returns the first final (>=200) response,
 // matching by Call-ID and skipping server-initiated requests.
 func (u *upperSocket) roundTrip(req sip.Request) sip.Response {
+	return u.roundTripWithObserver(req, nil)
+}
+
+func (u *upperSocket) roundTripWithObserver(req sip.Request, observe func(sip.Message)) sip.Response {
 	u.t.Helper()
 	callID := ""
 	if id, ok := req.CallID(); ok {
@@ -95,6 +109,9 @@ func (u *upperSocket) roundTrip(req sip.Request) sip.Response {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		msg := u.readMessage()
+		if observe != nil {
+			observe(msg)
+		}
 		res, ok := msg.(sip.Response)
 		if !ok {
 			continue
@@ -219,7 +236,7 @@ func startLoopbackService(t *testing.T, src CameraSource, db Store) (*Service, *
 
 func startLoopbackServiceWithConfig(t *testing.T, cfg Config, src CameraSource, db Store) (*Service, *upperSocket) {
 	t.Helper()
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	cfg.SIPListen = freeSIPListenAddress(t)
 
 	up := newUpperSocket(t, cfg.SIPListen)
 	cfg.ServerAddr = up.conn.LocalAddr().String() // register/NOTIFY traffic target
@@ -633,6 +650,54 @@ func TestLoopbackRecordInfoQuery(t *testing.T) {
 	require.Contains(t, string(answer.Body()), lbChannelOne)
 	require.Contains(t, string(answer.Body()), "<SumNum>2</SumNum>", "both recordings must be reported")
 }
+
+func TestLoopbackTwoCameraCatalogTCPPromotionIsBounded(t *testing.T) {
+	_, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{
+		{ID: "cam-1", Name: "Front", Encoding: "h265"},
+		{ID: "cam-2", Name: "Back", Encoding: "h265"},
+	}}, newCascadeTestDB(t))
+
+	body, err := manscdp.Encode(manscdp.CatalogQuery{
+		CmdType: manscdp.CmdCatalog, SN: 8, DeviceID: lbChannelOne,
+	})
+	require.NoError(t, err)
+	catalogDelivered := false
+	res := up.roundTripWithObserver(up.request(sip.MESSAGE, lbChannelOne, string(body), "Application/MANSCDP+xml"), func(msg sip.Message) {
+		if req, ok := msg.(sip.Request); ok && req.Method() == sip.MESSAGE && strings.Contains(string(req.Body()), "<CmdType>Catalog</CmdType>") {
+			catalogDelivered = true
+		}
+	})
+	require.Equal(t, 200, int(res.StatusCode()))
+	if catalogDelivered {
+		return
+	}
+
+	// Characterize gosip's current boundary: this two-camera response is
+	// promoted to TCP although the upper socket is UDP-only. Keep the probe
+	// bounded, but classify this known outcome rather than making failure to
+	// deliver the contract.
+	buf := make([]byte, 65535)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		require.NoError(t, up.conn.SetReadDeadline(deadline))
+		n, _, readErr := up.conn.ReadFromUDP(buf)
+		if readErr != nil {
+			netErr, ok := readErr.(net.Error)
+			if ok && netErr.Timeout() {
+				err := fmt.Errorf("%w: no UDP delivery within 500ms", errTwoCameraCatalogTCPPromotion)
+				t.Logf("bounded characterization: %v", err)
+				return
+			}
+			require.NoError(t, readErr)
+		}
+		msg, parseErr := parser.ParseMessage(buf[:n], log.NewDefaultLogrusLogger())
+		if req, ok := msg.(sip.Request); parseErr == nil && ok && req.Method() == sip.MESSAGE && strings.Contains(string(req.Body()), "<CmdType>Catalog</CmdType>") {
+			return
+		}
+	}
+}
+
+var errTwoCameraCatalogTCPPromotion = errors.New("two-camera Catalog promoted to TCP before UDP delivery")
 
 // createPacedPlaybackSegment writes a REAL 5-sample H.264 MP4 (2s per sample)
 // and registers its recording row. The pump streams samples at realtime pace

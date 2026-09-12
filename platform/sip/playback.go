@@ -313,7 +313,7 @@ func (s *Server) sendPlaybackInvite(deviceID, channelID, netAddr string, sdp []b
 			slog.Warn("gb28181: playback ACK send failed", "channel", channelID, "error", err)
 		}
 		s.mu.Lock()
-		s.pbDialogs[channelID] = &inviteDialog{req: req, resp: resp}
+		s.pbDialogs[channelID] = &inviteDialog{req: req, resp: resp, tx: tx}
 		s.mu.Unlock()
 	}
 	return nil
@@ -504,9 +504,11 @@ func (s *Server) sendInDialogInfo(srv gosip.Server, dialog *inviteDialog, body s
 	if err != nil {
 		return fmt.Errorf("gb28181: build INFO: %w", err)
 	}
-	if _, err := srv.Request(req); err != nil {
+	tx, err := srv.Request(req)
+	if err != nil {
 		return fmt.Errorf("gb28181: send INFO: %w", err)
 	}
+	cleanupClientTransaction(tx)
 	return nil
 }
 
@@ -521,6 +523,7 @@ func (s *Server) sendByeForPlayback(channelID string) error {
 	if srv == nil || dialog == nil {
 		return nil
 	}
+	defer terminateClientTransaction(dialog.tx)
 
 	fromHdr, hasFrom := dialog.resp.From()
 	toHdr, hasTo := dialog.resp.To()
@@ -558,9 +561,11 @@ func (s *Server) sendByeForPlayback(channelID string) error {
 	if err != nil {
 		return fmt.Errorf("gb28181: build playback BYE: %w", err)
 	}
-	if _, err := srv.Request(byeReq); err != nil {
+	tx, err := srv.Request(byeReq)
+	if err != nil {
 		return fmt.Errorf("gb28181: send playback BYE for %s: %w", channelID, err)
 	}
+	cleanupClientTransaction(tx)
 	slog.Info("gb28181: playback BYE sent", "channel", channelID)
 	return nil
 }

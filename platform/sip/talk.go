@@ -161,6 +161,7 @@ func (s *Server) StartTalk(cameraID, deviceID, channelID string) error {
 		conn.Close()
 		return fmt.Errorf("gb28181: send talk ACK: %w", err)
 	}
+	terminateClientTransaction(tx)
 
 	callID := ""
 	if cid, ok := resp.CallID(); ok {
@@ -341,9 +342,11 @@ func (s *Server) sendByeForTalk(inviteReq sip.Request, inviteResp sip.Response) 
 	if err != nil {
 		return fmt.Errorf("gb28181: build talk BYE: %w", err)
 	}
-	if _, err := srv.Request(byeReq); err != nil {
+	tx, err := srv.Request(byeReq)
+	if err != nil {
 		return fmt.Errorf("gb28181: send talk BYE: %w", err)
 	}
+	cleanupClientTransaction(tx)
 	return nil
 }
 

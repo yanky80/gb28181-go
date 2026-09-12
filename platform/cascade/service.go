@@ -1233,8 +1233,15 @@ func (s *Service) onMessage(req sip.Request, _ sip.ServerTransaction) {
 			s.answerCatalog(u, q.SN)
 		}
 	case manscdp.CmdDeviceInfo:
-		if d, ok := payload.(manscdp.DeviceInfo); ok && d.SN > 0 {
-			s.answerDeviceInfo(u, d.SN)
+		switch q := payload.(type) {
+		case manscdp.DeviceInfoQuery:
+			if q.SN > 0 {
+				s.answerDeviceInfo(u, q.SN)
+			}
+		case manscdp.DeviceInfo: // tolerate legacy response-shaped probes
+			if q.SN > 0 {
+				s.answerDeviceInfo(u, q.SN)
+			}
 		}
 	case manscdp.CmdDeviceStatus:
 		if q, ok := payload.(manscdp.DeviceStatusQuery); ok && q.SN > 0 {

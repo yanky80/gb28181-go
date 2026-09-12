@@ -24,6 +24,10 @@ type Config struct {
 	// Password is the SIP digest-auth secret that registered devices must use.
 	Password string `yaml:"password"`
 
+	// ProtocolVersion is the X-GB-Ver marker returned to registering devices.
+	// Empty defaults to the current 2022 marker, 3.0.
+	ProtocolVersion string `yaml:"protocol_version,omitempty"`
+
 	// RegisterFailureLimit is the number of REGISTER authentication
 	// failures (digest or GB35114) from one source host before a temporary
 	// lockout; unset = 5, negative disables the limiter (issue #38).
@@ -172,6 +176,14 @@ func (c Config) EffectiveUserAgent() string {
 		return c.UserAgent
 	}
 	return DefaultUserAgent
+}
+
+// EffectiveProtocolVersion resolves the REGISTER response marker.
+func (c Config) EffectiveProtocolVersion() string {
+	if c.ProtocolVersion == "" {
+		return "3.0"
+	}
+	return c.ProtocolVersion
 }
 
 // InviteTimeout resolves the INVITE answer timeout (default 32s).

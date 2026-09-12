@@ -56,6 +56,7 @@ func TestSoakInviteCycles(t *testing.T) {
 	lb.channelOf(t)
 
 	before := fdCount(t)
+	beforeGoroutines := runtime.NumGoroutine()
 
 	for i := range cycles {
 		require.NoError(t, lb.platformSrv.InviteChannel(lbDeviceID, lbChannelID),
@@ -82,7 +83,10 @@ func TestSoakInviteCycles(t *testing.T) {
 	runtime.GC()
 
 	after := fdCount(t)
-	t.Logf("soak: %d cycles, fds %d → %d", cycles, before, after)
+	afterGoroutines := runtime.NumGoroutine()
+	t.Logf("soak: %d cycles, fds %d → %d, goroutines %d → %d", cycles, before, after, beforeGoroutines, afterGoroutines)
 	require.LessOrEqual(t, after, before+8,
 		"descriptors grew by %d across %d INVITE/BYE cycles — a session/media socket leaks", after-before, cycles)
+	require.LessOrEqual(t, afterGoroutines, beforeGoroutines+8,
+		"goroutines grew by %d across %d INVITE/BYE cycles — a session goroutine leaks", afterGoroutines-beforeGoroutines, cycles)
 }

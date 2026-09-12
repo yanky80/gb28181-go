@@ -7,7 +7,6 @@ package cascade
 import (
 	"context"
 	"net"
-	"strconv"
 	"testing"
 	"time"
 
@@ -23,7 +22,7 @@ func startLoopbackServiceFastHB(t *testing.T) (*Service, *upperSocket) {
 	t.Helper()
 
 	cfg := testCfg()
-	cfg.SIPListen = net.JoinHostPort(lbLocalHost, strconv.Itoa(freeUDPPort(t)))
+	cfg.SIPListen = freeSIPListenAddress(t)
 	cfg.HeartbeatInterval = "200ms"
 
 	up := newUpperSocket(t, cfg.SIPListen)

@@ -38,6 +38,24 @@ func readServerRequest(t *testing.T, c *sipClient, method sip.RequestMethod) sip
 	return nil
 }
 
+func TestServer_Notify_RoleMismatchReturns400(t *testing.T) {
+	cfg := testConfig(t)
+	startTestServer(t, cfg)
+	client := newSIPClient(t, cfg.SIPListen)
+
+	body, err := manscdp.Encode(manscdp.CatalogQuery{
+		CmdType: manscdp.CmdCatalog, SN: 9, DeviceID: testDeviceID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := buildRequest(t, sip.NOTIFY, testDeviceID, testServerID, cfg.SIPListen, client.localPort(), string(body))
+	res := client.roundTrip(req)
+	if res.StatusCode() != 400 {
+		t.Fatalf("role-mismatched NOTIFY status = %d, want 400", res.StatusCode())
+	}
+}
+
 // TestServer_Message_TimeSync_Query verifies the platform answers a device
 // clock query with a MANSCDP TimeSync Response carrying its wall clock.
 func TestServer_Message_TimeSync_Query(t *testing.T) {
