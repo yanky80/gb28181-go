@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"path/filepath"
 	"strings"
@@ -135,8 +136,11 @@ func TestControlServerRejectsFirstNonHello(t *testing.T) {
 	var one [1]byte
 	if _, err := conn.Read(one[:]); err == nil {
 		t.Fatal("invalid first message connection remained usable")
-	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		t.Fatal("invalid first message connection remained open")
+	} else {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatal("invalid first message connection remained open")
+		}
 	}
 }
 
@@ -423,11 +427,12 @@ func TestControlServerSlowReaderTimesOutDespiteHealth(t *testing.T) {
 		Type: edgeipc.MessageError, Version: edgeipc.ProtocolVersion,
 		Code: large, Retryable: true,
 	}}
-	for i := 0; i < cap(controlPeer.commands)+64; i++ {
+drain:
+	for range cap(controlPeer.commands) + 64 {
 		select {
 		case controlPeer.commands <- command:
 		default:
-			break
+			break drain
 		}
 	}
 

@@ -514,7 +514,7 @@ func TestCatalogStoreCancellationLetsStopReleaseNotify(t *testing.T) {
 	svc.mu.Lock()
 	svc.subs[sub.callID] = sub
 	svc.mu.Unlock()
-	go svc.sendCatalogNotify(sub)
+	go svc.sendCatalogNotify(svc.ctx, sub)
 	select {
 	case <-store.entered:
 	case <-time.After(time.Second):
@@ -551,7 +551,7 @@ func TestCatalogStoreCancellationLetsNetworkChangeReleaseNotify(t *testing.T) {
 	svc.mu.Lock()
 	svc.subs[sub.callID] = sub
 	svc.mu.Unlock()
-	go svc.sendCatalogNotify(sub)
+	go svc.sendCatalogNotify(svc.ctx, sub)
 	select {
 	case <-store.entered:
 	case <-time.After(time.Second):
@@ -1045,7 +1045,7 @@ func TestInvalidatedSubscriptionSuppressesNotify(t *testing.T) {
 	delete(svc.subs, sub.callID)
 	svc.mu.Unlock()
 
-	svc.sendCatalogNotify(sub)
+	svc.sendCatalogNotify(svc.ctx, sub)
 	require.NoError(t, up.conn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
 	buf := make([]byte, 65535)
 	_, _, err := up.conn.ReadFromUDP(buf)
@@ -1069,7 +1069,7 @@ func TestSubscriptionInvalidationSerializesWithNotify(t *testing.T) {
 	sub.sendMu.Lock()
 	done := make(chan struct{})
 	go func() {
-		svc.sendCatalogNotify(sub)
+		svc.sendCatalogNotify(svc.ctx, sub)
 		close(done)
 	}()
 	select {

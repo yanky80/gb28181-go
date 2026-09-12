@@ -57,7 +57,7 @@ func TestGatewayObservabilityDropsForSlowConsumer(t *testing.T) {
 	}
 
 	start := time.Now()
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		obs.Record(metrics.GatewayEvent{Name: "access_unit", Value: int64(i)})
 	}
 	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
@@ -72,11 +72,11 @@ func TestGatewayStateSnapshotNeverTears(t *testing.T) {
 	state := newGatewayState(GatewaySnapshot{ProtocolVersion: "2022", Codec: "h265"})
 	const updates = 1000
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			for n := 0; n < updates; n++ {
+			for n := range updates {
 				state.Store(GatewaySnapshot{
 					ProtocolVersion: "2022",
 					Codec:           "h265",
@@ -122,12 +122,21 @@ func TestGatewayMetricsSemanticEvents(t *testing.T) {
 	obs := NewGatewayObservability(32, nil)
 	defer obs.Close()
 	for _, event := range []metrics.GatewayEvent{
-		{Name: "register_attempt"}, {Name: "register_ok"}, {Name: "register_failure"},
-		{Name: "heartbeat_attempt"}, {Name: "heartbeat_ok"}, {Name: "heartbeat_failure"},
-		{Name: "catalog_success"}, {Name: "catalog_failure"},
-		{Name: "invite_started"}, {Name: "invite_stopped"}, {Name: "invite_failure"},
-		{Name: "rtp_send", Value: 17}, {Name: "frame_drop", Value: 3},
-		{Name: "playback_success"}, {Name: "playback_failure"},
+		{Name: "register_attempt"},
+		{Name: "register_ok"},
+		{Name: "register_failure"},
+		{Name: "heartbeat_attempt"},
+		{Name: "heartbeat_ok"},
+		{Name: "heartbeat_failure"},
+		{Name: "catalog_success"},
+		{Name: "catalog_failure"},
+		{Name: "invite_started"},
+		{Name: "invite_stopped"},
+		{Name: "invite_failure"},
+		{Name: "rtp_send", Value: 17},
+		{Name: "frame_drop", Value: 3},
+		{Name: "playback_success"},
+		{Name: "playback_failure"},
 	} {
 		obs.Record(event)
 	}
@@ -168,7 +177,7 @@ func TestWriteGatewaySnapshotReplacesFileAtomically(t *testing.T) {
 	if got.ProtocolVersion != snapshot.ProtocolVersion || got.Codec != snapshot.Codec {
 		t.Fatalf("snapshot = %+v, want %+v", got, snapshot)
 	}
-	if mode := func() os.FileMode { info, _ := os.Stat(path); return info.Mode().Perm() }(); mode != 0640 {
+	if mode := func() os.FileMode { info, _ := os.Stat(path); return info.Mode().Perm() }(); mode != 0o640 {
 		t.Fatalf("snapshot mode = %o, want 640", mode)
 	}
 }
@@ -194,7 +203,7 @@ func TestGatewayWatchdogNotifierIsSerialized(t *testing.T) {
 	watchdog := newGatewayWatchdog(notifier, time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		wg.Add(1)
 		go func() { defer wg.Done(); watchdog.Run(ctx) }()
 	}

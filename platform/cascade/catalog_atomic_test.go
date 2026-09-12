@@ -84,7 +84,7 @@ func TestCatalogItemsUsesAtomicAllocatorForConcurrentRequests(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, requests)
 	itemsCh := make(chan []manscdp.Item, requests)
-	for i := 0; i < requests; i++ {
+	for range requests {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

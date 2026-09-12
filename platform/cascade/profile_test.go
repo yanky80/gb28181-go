@@ -397,9 +397,11 @@ type recordingQueryErrorStore struct{ err error }
 func (recordingQueryErrorStore) UpsertCascadeChannel(context.Context, CascadeChannel) error {
 	return nil
 }
+
 func (recordingQueryErrorStore) ListCascadeChannels(context.Context) ([]CascadeChannel, error) {
 	return []CascadeChannel{{CameraID: "cam-1", GBChannelID: lbChannelOne}}, nil
 }
+
 func (s recordingQueryErrorStore) ListRecordings(context.Context, RecordingFilter) ([]Recording, error) {
 	return nil, s.err
 }

@@ -27,8 +27,22 @@ type catalogSub struct {
 	toUser   string
 	expires  time.Time
 	sendMu   sync.Mutex
+	closed   bool
 	ctx      context.Context
 	cancel   context.CancelFunc
+	done     <-chan struct{}
+}
+
+func (sub *catalogSub) close() {
+	if sub == nil {
+		return
+	}
+	if sub.cancel != nil {
+		sub.cancel()
+	}
+	sub.sendMu.Lock()
+	sub.closed = true
+	sub.sendMu.Unlock()
 }
 
 // notifyScanInterval is how often the camera set is diffed for changes.
@@ -93,11 +107,7 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 	old := s.subs[callID]
 	s.mu.Unlock()
 	if old != nil {
-		if old.cancel != nil {
-			old.cancel()
-		}
-		old.sendMu.Lock()
-		old.sendMu.Unlock()
+		old.close()
 	}
 	expHdr := sip.Expires(uint32(expires))
 	_, _ = s.srv.RespondOnRequest(req, 200, "OK", "", []sip.Header{&expHdr})
@@ -110,22 +120,23 @@ func (s *Service) onSubscribe(req sip.Request, _ sip.ServerTransaction) {
 		expires:  time.Now().Add(time.Duration(expires) * time.Second),
 	}
 	sub.ctx, sub.cancel = context.WithCancel(s.storeContext())
+	sub.done = sub.ctx.Done()
 	s.mu.Lock()
 	s.subs[callID] = sub
 	s.mu.Unlock()
 	slog.Info("gb28181-cascade: catalog subscription active",
 		"upper", u.cfg.ServerAddr, "expires", expires)
 	// A fresh subscription immediately gets the current catalog state.
-	go s.sendCatalogNotify(sub)
+	go s.sendCatalogNotify(s.storeContext(), sub)
 }
 
 // catalogNotifyLoop diffs the camera set and pushes NOTIFYs on change until
 // the service stops.
-func (s *Service) catalogNotifyLoop() {
+func (s *Service) catalogNotifyLoop(ctx context.Context) {
 	defer s.wg.Done()
 	last := s.cameraFingerprint()
 	for {
-		if !sleepCtx(s.ctx, notifyScanInterval) {
+		if !sleepCtx(ctx, notifyScanInterval) {
 			return
 		}
 		cur := s.cameraFingerprint()
@@ -148,14 +159,14 @@ func (s *Service) catalogNotifyLoop() {
 		}
 		s.mu.Unlock()
 		for _, sub := range expired {
-			if sub.cancel != nil {
-				sub.cancel()
-			}
-			sub.sendMu.Lock()
-			sub.sendMu.Unlock()
+			sub.close()
 		}
 		for _, sub := range subs {
-			go s.sendCatalogNotify(sub)
+			notifyCtx, cancel := context.WithCancel(ctx)
+			go func() {
+				defer cancel()
+				s.sendCatalogNotify(notifyCtx, sub)
+			}()
 		}
 	}
 }
@@ -236,23 +247,37 @@ type catalogNotifyBody struct {
 
 // sendCatalogNotify pushes the full catalog to one subscription (full-list
 // form — receivers merge; deltas are optional in the standard).
-func (s *Service) sendCatalogNotify(sub *catalogSub) {
+func (s *Service) sendCatalogNotify(ctx context.Context, sub *catalogSub) {
 	if s.srv == nil || sub == nil {
 		return
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := sub.done
+	if done == nil && sub.ctx != nil {
+		done = sub.ctx.Done()
+	}
+	if done != nil {
+		go func() {
+			select {
+			case <-done:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
 	sub.sendMu.Lock()
 	defer sub.sendMu.Unlock()
+	if sub.closed {
+		return
+	}
 	s.mu.Lock()
 	active := s.subs[sub.callID] == sub
 	s.mu.Unlock()
 	if !active {
 		return
 	}
-	ctx := sub.ctx
-	if ctx == nil {
-		ctx = s.storeContext()
-	}
-	items, err := s.catalogItems(ctx)
+	items, err := s.catalogItemsContext(ctx)
 	if err != nil {
 		s.observe(metrics.GatewayEvent{Name: "catalog_failure", ErrorCode: safeErrorCode(err)}, nil)
 		slog.Warn("gb28181-cascade: catalog build for NOTIFY failed",

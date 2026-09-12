@@ -52,17 +52,17 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(cfg.IPC.StatusDir, 0750); err != nil {
+	if err := os.MkdirAll(cfg.IPC.StatusDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create gateway status directory: %w", err)
 	}
 	for _, socket := range []string{cfg.IPC.ControlSocket, cfg.IPC.MediaSocket} {
-		if err := os.MkdirAll(filepath.Dir(socket), 0750); err != nil {
+		if err := os.MkdirAll(filepath.Dir(socket), 0o750); err != nil {
 			return nil, fmt.Errorf("create socket directory: %w", err)
 		}
 	}
 
 	storePath := filepath.Join(cfg.IPC.StatusDir, "channels.json")
-	if err := os.MkdirAll(filepath.Dir(storePath), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(storePath), 0o750); err != nil {
 		return nil, fmt.Errorf("create channel store directory: %w", err)
 	}
 	channels, err := NewChannelStore(storePath)
@@ -74,10 +74,10 @@ func NewGateway(cfg Config, credentials Credentials) (*Gateway, error) {
 	if cfg.GB.RecordPlayback {
 		indexPath := filepath.Join(cfg.IPC.StatusDir, "recordings.jsonl")
 		root := filepath.Join(cfg.IPC.StatusDir, "recordings")
-		if err := os.MkdirAll(filepath.Dir(indexPath), 0750); err != nil {
+		if err := os.MkdirAll(filepath.Dir(indexPath), 0o750); err != nil {
 			return nil, fmt.Errorf("create recording index directory: %w", err)
 		}
-		if err := os.MkdirAll(root, 0750); err != nil {
+		if err := os.MkdirAll(root, 0o750); err != nil {
 			return nil, fmt.Errorf("create recording root: %w", err)
 		}
 		recordings, err = NewRecordingStore(indexPath, root)
@@ -373,8 +373,10 @@ func (s *gatewayStore) AllocateCascadeChannel(ctx context.Context, cameraID, pre
 	return s.channels.AllocateCascadeChannel(ctx, cameraID, prefix, name)
 }
 
-var _ cascade.Store = (*gatewayStore)(nil)
-var _ cascade.CascadeChannelAllocator = (*gatewayStore)(nil)
+var (
+	_ cascade.Store                   = (*gatewayStore)(nil)
+	_ cascade.CascadeChannelAllocator = (*gatewayStore)(nil)
+)
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {

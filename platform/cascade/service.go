@@ -115,6 +115,7 @@ type Service struct {
 
 	ctx         context.Context
 	cancel      context.CancelFunc
+	catalogStop context.CancelFunc
 	wg          sync.WaitGroup
 	storeMu     sync.RWMutex
 	storeCtx    context.Context
@@ -451,7 +452,7 @@ func (s *Service) Start(ctx context.Context) error {
 		return fmt.Errorf("gb28181-cascade: %w", err)
 	}
 	if ctx == nil {
-		ctx = context.Background()
+		return errors.New("gb28181-cascade: nil start context")
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.storeMu.Lock()
@@ -496,8 +497,10 @@ func (s *Service) Start(ctx context.Context) error {
 		s.wg.Add(1)
 		go s.registerLoop(u)
 	}
+	catalogCtx, catalogStop := context.WithCancel(ctx)
+	s.catalogStop = catalogStop
 	s.wg.Add(1)
-	go s.catalogNotifyLoop() //nolint:contextcheck // the loop reads Service.ctx directly (struct field)
+	go s.catalogNotifyLoop(catalogCtx)
 	go func() {
 		<-s.ctx.Done()
 		_ = s.Stop()
@@ -514,15 +517,18 @@ func (s *Service) Stop() error {
 
 func (s *Service) stop() error {
 	defer close(s.stopDone)
-	s.stopping.Store(true)
 	s.cancelStoreContext()
 	if s.cancel != nil {
 		s.cancel()
 	}
+	if s.catalogStop != nil {
+		s.catalogStop()
+	}
 	s.stopAllPTZ()
 	// Stop must not race an INVITE that is acquiring a stream or creating a
-	// dialog. New INVITEs reject before entering this critical section.
+	// dialog. Once existing admission finishes, new INVITEs reject.
 	s.admissionMu.Lock()
+	s.stopping.Store(true)
 	s.admissionMu.Unlock()
 	s.wg.Wait()
 
@@ -555,11 +561,7 @@ func (s *Service) stop() error {
 		ps.stop()
 	}
 	for _, sub := range subs {
-		if sub.cancel != nil {
-			sub.cancel()
-		}
-		sub.sendMu.Lock()
-		sub.sendMu.Unlock()
+		sub.close()
 	}
 	if s.srv != nil {
 		for _, u := range s.uppers {
@@ -817,11 +819,7 @@ func (s *Service) closeUpperDialogsLocked(u *upper) {
 		ps.stop()
 	}
 	for _, sub := range subs {
-		if sub.cancel != nil {
-			sub.cancel()
-		}
-		sub.sendMu.Lock()
-		sub.sendMu.Unlock()
+		sub.close()
 	}
 }
 

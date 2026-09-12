@@ -79,10 +79,10 @@ func TestGatewayUsesPersistedRecordingIndexAndRealParserPath(t *testing.T) {
 	statusDir := filepath.Join(dir, "status")
 	relativePath := filepath.Join("front", "20260911", "segment.mp4")
 	path := filepath.Join(statusDir, "recordings", relativePath)
-	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("not an mp4"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("not an mp4"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	started := time.Date(2026, 9, 11, 10, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
@@ -92,10 +92,13 @@ func TestGatewayUsesPersistedRecordingIndexAndRealParserPath(t *testing.T) {
 		Size: 10, StartedAt: started, EndedAt: started.Add(time.Second),
 		Timescale: 1000, Frames: 1, Keyframes: []recordingKeyframe{{TimeMS: 0, Offset: 0, Size: 10}},
 	})
-	if err := os.MkdirAll(statusDir, 0750); err != nil {
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(statusDir, "recordings.jsonl"), append(event, '\n'), 0600); err != nil {
+	if err := os.MkdirAll(statusDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(statusDir, "recordings.jsonl"), append(event, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

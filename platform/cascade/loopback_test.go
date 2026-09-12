@@ -682,8 +682,8 @@ func TestLoopbackTwoCameraCatalogTCPPromotionIsBounded(t *testing.T) {
 		require.NoError(t, up.conn.SetReadDeadline(deadline))
 		n, _, readErr := up.conn.ReadFromUDP(buf)
 		if readErr != nil {
-			netErr, ok := readErr.(net.Error)
-			if ok && netErr.Timeout() {
+			var netErr net.Error
+			if errors.As(readErr, &netErr) && netErr.Timeout() {
 				err := fmt.Errorf("%w: no UDP delivery within 500ms", errTwoCameraCatalogTCPPromotion)
 				t.Logf("bounded characterization: %v", err)
 				return

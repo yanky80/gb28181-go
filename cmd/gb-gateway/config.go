@@ -310,9 +310,9 @@ func withFieldError(key string, err error) error {
 	return fmt.Errorf("invalid %s", key)
 }
 
-func parseMilliseconds(value string, min, max int64) (time.Duration, error) {
+func parseMilliseconds(value string, lower, upper int64) (time.Duration, error) {
 	ms, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || ms < min || ms > max {
+	if err != nil || ms < lower || ms > upper {
 		return 0, errors.New("out of range")
 	}
 	return time.Duration(ms) * time.Millisecond, nil
@@ -512,7 +512,7 @@ func LoadCredentials(path string) (Credentials, error) {
 	if !info.Mode().IsRegular() {
 		return Credentials{}, fmt.Errorf("credentials file is not regular")
 	}
-	if info.Mode().Perm() != 0600 || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
+	if info.Mode().Perm() != 0o600 || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
 		return Credentials{}, fmt.Errorf("credentials file must have 0600 permissions")
 	}
 	values := make(map[string]string)

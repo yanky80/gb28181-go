@@ -109,6 +109,7 @@ func TestRegisterRetryBacksOffExponentially(t *testing.T) {
 
 	hub := platform.NewFrameHub()
 	svc := New(cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, newCascadeTestDB(t))
+	svc.SetRegisterRetryRandomSource(func(int64) int64 { return 0 })
 	require.NoError(t, svc.Start(context.Background()))
 	t.Cleanup(func() { _ = svc.Stop() })
 
@@ -125,8 +126,8 @@ func TestRegisterRetryBacksOffExponentially(t *testing.T) {
 	gap1, gap2 := gaps[0], gaps[1]
 	require.GreaterOrEqual(t, gap1, 50*time.Millisecond,
 		"first retry wait must honor the 60ms base (gap1=%v)", gap1)
-	require.Greater(t, gap2, 2*gap1-30*time.Millisecond,
-		"second retry wait must double the first (gap1=%v gap2=%v)", gap1, gap2)
+	require.GreaterOrEqual(t, gap2, 105*time.Millisecond,
+		"second retry wait must honor the doubled 120ms backoff (gap1=%v gap2=%v)", gap1, gap2)
 }
 
 func TestRegisterRetryBackoffResetsAfterSuccess(t *testing.T) {
