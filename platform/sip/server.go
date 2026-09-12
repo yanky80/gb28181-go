@@ -1803,6 +1803,7 @@ func (s *Server) handleOptions(req sip.Request, tx sip.ServerTransaction) {
 // handleInvite delegates to the session manager hook, or rejects with 486
 // when no hook is installed (media sessions not yet wired).
 func (s *Server) handleInvite(req sip.Request, tx sip.ServerTransaction) {
+	DrainAcks(tx)
 	deviceID, channelID := s.requestIDs(req)
 	s.mu.Lock()
 	hook := s.onInvite
@@ -2077,6 +2078,30 @@ func (s *Server) requestExpires(req sip.Request) int {
 		}
 	}
 	return -1
+}
+
+// DrainAcks consumes a server transaction's ACK channel until the transaction
+// ends. gosip delivers a dialog-confirming ACK by sending on that unbuffered
+// channel (transaction/server_tx.go act_confirm); with no reader the send stays
+// parked on the channel and races the close that Terminate performs when the
+// transaction layer is canceled, which the race detector reports as a shutdown
+// race. Draining keeps the ACK delivery off that close path.
+func DrainAcks(tx sip.ServerTransaction) {
+	if tx == nil {
+		return
+	}
+	go func() {
+		for {
+			select {
+			case _, ok := <-tx.Acks():
+				if !ok {
+					return
+				}
+			case <-tx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // respond sends a response for the given request. Safe to call after Stop —

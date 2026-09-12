@@ -15,6 +15,7 @@ import (
 	"github.com/ghettovoice/gosip/sip"
 	"github.com/mickeyzzc/gb28181-go/metrics"
 	"github.com/mickeyzzc/gb28181-go/platform"
+	mbsip "github.com/mickeyzzc/gb28181-go/platform/sip"
 	"github.com/mickeyzzc/gb28181-go/psmux"
 )
 
@@ -228,10 +229,11 @@ func sdpToUnix(v int64) int64 {
 // onInvite handles the upper platform's INVITE for one aggregated channel:
 // 200 OK with our sendonly SDP, then forward the camera's stream (ACK from
 // the upper platform completes the dialog; gosip auto-matches it).
-func (s *Service) onInvite(req sip.Request, _ sip.ServerTransaction) {
+func (s *Service) onInvite(req sip.Request, tx sip.ServerTransaction) {
 	if s.srv == nil {
 		return
 	}
+	mbsip.DrainAcks(tx)
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()

@@ -410,14 +410,13 @@ func (p *parser) parseStsd(stsd box) (*trackInfo, error) {
 	}
 	off := 8
 	var first *trackInfo
-	for i := uint32(0); i < count; i++ {
+	for range count {
 		entry, err := readMemoryBox(v, off, true)
 		if err != nil {
 			return nil, err
 		}
 		typ := entry.typ
-		codec := ""
-		configType := ""
+		var codec, configType string
 		switch typ {
 		case "avc1", "avc3":
 			codec, configType = "h264", "avcC"
@@ -523,7 +522,7 @@ func parseAVCC(v []byte, info *trackInfo) error {
 		}
 		extCount := int(v[off+3])
 		off += 4
-		for i := 0; i < extCount; i++ {
+		for range extCount {
 			if len(v)-off < 2 {
 				return truncated("short avcC extension length")
 			}
@@ -552,14 +551,14 @@ func parseHVCC(v []byte, info *trackInfo) error {
 		return invalid("hvcC has no parameter arrays")
 	}
 	off := 23
-	for i := 0; i < arrays; i++ {
+	for range arrays {
 		if len(v)-off < 3 {
 			return truncated("short hvcC array")
 		}
 		typ := v[off] & 0x3f
 		count := int(binary.BigEndian.Uint16(v[off+1:]))
 		off += 3
-		for j := 0; j < count; j++ {
+		for range count {
 			if len(v)-off < 2 {
 				return truncated("short hvcC NAL length")
 			}
@@ -597,7 +596,7 @@ func parseHVCC(v []byte, info *trackInfo) error {
 
 func readParameterSets(v []byte, off, count int) ([]byte, int, error) {
 	var first []byte
-	for i := 0; i < count; i++ {
+	for range count {
 		if len(v)-off < 2 {
 			return nil, off, truncated("short parameter-set length")
 		}
@@ -711,7 +710,6 @@ func (p *parser) parseTraf(traf, moof box, track *trackInfo, singleTraf bool) ([
 			return nil, truncated("short tfhd flags")
 		}
 		defaultFlags = binary.BigEndian.Uint32(data[off:])
-		off += 4
 	}
 	if flags&0x000001 == 0 && flags&0x020000 == 0 {
 		if !singleTraf {
@@ -804,7 +802,7 @@ func parseRunSamples(data []byte, flags uint32, count uint32, base, dataOffset i
 		return nil, invalid("sample offset overflows")
 	}
 	out := make([]cascade.SegmentSample, 0, count)
-	for i := uint32(0); i < count; i++ {
+	for i := range count {
 		var dur, size, sampleFlags uint32 = defaultDur, defaultSize, defaultFlags
 		if flags&0x100 != 0 {
 			dur = binary.BigEndian.Uint32(data)
@@ -853,8 +851,8 @@ func (p *parser) fullBox(b box) (uint32, []byte, error) {
 	return binary.BigEndian.Uint32(v), v[4:], nil
 }
 
-func (p *parser) readSmall(b box, max int) ([]byte, error) {
-	if b.end-b.payload > int64(max) {
+func (p *parser) readSmall(b box, limit int) ([]byte, error) {
+	if b.end-b.payload > int64(limit) {
 		return nil, invalid("box payload is too large")
 	}
 	v := make([]byte, b.end-b.payload)

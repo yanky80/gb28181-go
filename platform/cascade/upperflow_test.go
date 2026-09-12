@@ -176,7 +176,7 @@ func TestLoopbackDeviceStatusQueryAnswer(t *testing.T) {
 func TestSetGBTimezoneConcurrent(t *testing.T) {
 	svc := New(testCfg(), fakeSource{}, nil)
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -185,7 +185,7 @@ func TestSetGBTimezoneConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
+			for range 100 {
 				_ = svc.gbTZ()
 			}
 		}()

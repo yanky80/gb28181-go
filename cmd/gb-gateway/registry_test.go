@@ -219,10 +219,10 @@ func TestCameraRegistryRejectsUnknownAndPreservesDefaultCodec(t *testing.T) {
 	if r.CameraStatus("missing") != "OFF" {
 		t.Fatal("unknown camera must be OFF")
 	}
-	if err := r.HandleHello(hello("missing", 1, edgeipc.CodecH265)); err != ErrUnknownCamera {
+	if err := r.HandleHello(hello("missing", 1, edgeipc.CodecH265)); !errors.Is(err, ErrUnknownCamera) {
 		t.Fatalf("unknown hello error = %v, want %v", err, ErrUnknownCamera)
 	}
-	if err := r.HandleHello(hello("cam-a", 1, edgeipc.CodecH264)); err != edgeipc.ErrCodecMismatch {
+	if err := r.HandleHello(hello("cam-a", 1, edgeipc.CodecH264)); !errors.Is(err, edgeipc.ErrCodecMismatch) {
 		t.Fatalf("default codec error = %v, want %v", err, edgeipc.ErrCodecMismatch)
 	}
 }
@@ -239,7 +239,7 @@ func TestCameraRegistryPreservesExplicitCodecAndRejectsInvalidCodec(t *testing.T
 	if err := r.HandleHello(hello("cam-h264", 1, edgeipc.CodecH264)); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.HandleHello(hello("cam-h264", 1, edgeipc.Codec(99))); err != edgeipc.ErrUnsupportedCodec {
+	if err := r.HandleHello(hello("cam-h264", 1, edgeipc.Codec(99))); !errors.Is(err, edgeipc.ErrUnsupportedCodec) {
 		t.Fatalf("invalid hello codec error = %v, want %v", err, edgeipc.ErrUnsupportedCodec)
 	}
 	if _, err := NewCameraRegistry(CameraSpec{ID: "invalid", Codec: edgeipc.Codec(99)}); !errors.Is(err, ErrInvalidCodec) {

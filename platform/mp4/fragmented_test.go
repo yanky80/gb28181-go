@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mickeyzzc/gb28181-go/platform/cascade"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,6 +37,13 @@ func TestParseSegmentH264MultipleFragments(t *testing.T) {
 	require.False(t, got.Samples[1].IsKeyFrame)
 	require.Equal(t, int64(got.Samples[0].Offset)+int64(got.Samples[0].Size), got.Samples[1].Offset)
 	require.Greater(t, got.Samples[2].Offset, got.Samples[1].Offset+int64(got.Samples[1].Size))
+}
+
+func TestParseAVCCHighProfileExtension(t *testing.T) {
+	config := []byte{1, 0x64, 0, 0x1f, 0xff, 0xe1, 0, 2, 0x67, 1, 1, 0, 2, 0x68, 2, 0xfd, 0xf8, 0xf8, 0}
+
+	var info trackInfo
+	require.NoError(t, parseAVCC(config, &info))
 }
 
 func TestParseSegmentH265HVCC(t *testing.T) {
@@ -331,7 +337,7 @@ func TestParseSegmentImplicitTfhdBase(t *testing.T) {
 
 func TestParseSegmentRejectsNestedBoxBudget(t *testing.T) {
 	var nested []byte
-	for i := 0; i < 100001; i++ {
+	for range 100001 {
 		nested = append(nested, makeBox("free", nil)...)
 	}
 	base := moov(avc1Box(avcC([]byte{0x67, 1}, []byte{0x68, 2})))
@@ -441,33 +447,6 @@ func parseError(t *testing.T, data []byte) error {
 	path := writeSegment(t, data)
 	_, err := ParseSegment(path)
 	return err
-}
-
-func prependParameterSets(info *cascade.SegmentInfo, annexB []byte) []byte {
-	var out []byte
-	sets := [][]byte{info.SPS, info.PPS}
-	if info.Codec == "h265" {
-		sets = [][]byte{info.VPS, info.SPS, info.PPS}
-	}
-	for _, set := range sets {
-		out = append(out, 0, 0, 0, 1)
-		out = append(out, set...)
-	}
-	return append(out, annexB...)
-}
-
-func lengthPrefixedToAnnexB(data []byte) []byte {
-	var out []byte
-	for len(data) >= 4 {
-		n := int(binary.BigEndian.Uint32(data))
-		if n > len(data)-4 {
-			return nil
-		}
-		out = append(out, 0, 0, 0, 1)
-		out = append(out, data[4:4+n]...)
-		data = data[4+n:]
-	}
-	return out
 }
 
 func h264Segment(sps, pps []byte, fragments [][]sample) []byte {

@@ -397,9 +397,11 @@ type recordingQueryErrorStore struct{ err error }
 func (recordingQueryErrorStore) UpsertCascadeChannel(context.Context, CascadeChannel) error {
 	return nil
 }
+
 func (recordingQueryErrorStore) ListCascadeChannels(context.Context) ([]CascadeChannel, error) {
 	return []CascadeChannel{{CameraID: "cam-1", GBChannelID: lbChannelOne}}, nil
 }
+
 func (s recordingQueryErrorStore) ListRecordings(context.Context, RecordingFilter) ([]Recording, error) {
 	return nil, s.err
 }
@@ -589,7 +591,10 @@ func serveProfileRegistration(t *testing.T, up *upperSocket, version string, rec
 				continue
 			}
 			if len(wire) > 0 {
-				wire[0] <- string(buf[:n])
+				select {
+				case wire[0] <- string(buf[:n]):
+				default:
+				}
 			}
 			msg, err := parseSIPBytes(buf[:n])
 			if err != nil {
@@ -602,7 +607,10 @@ func serveProfileRegistration(t *testing.T, up *upperSocket, version string, rec
 			if received != nil {
 				values := req.GetHeaders("X-GB-Ver")
 				if len(values) > 0 {
-					received <- values[0].Value()
+					select {
+					case received <- values[0].Value():
+					default:
+					}
 				}
 			}
 			if len(req.GetHeaders("Authorization")) == 0 {

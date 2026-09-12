@@ -144,7 +144,7 @@ func (s *ControlServer) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("gateway: listen control socket: %w", err)
 	}
-	if err := os.Chmod(s.path, 0600); err != nil {
+	if err := os.Chmod(s.path, 0o600); err != nil {
 		_ = ln.Close()
 		_ = os.Remove(s.path)
 		return fmt.Errorf("gateway: secure control socket: %w", err)
@@ -499,7 +499,7 @@ func (p *controlPeer) writeLoop() {
 		case <-p.done:
 			p.queueMu.Lock()
 			pending := len(p.commands)
-			for i := 0; i < pending; i++ {
+			for range pending {
 				select {
 				case <-p.commands:
 				default:

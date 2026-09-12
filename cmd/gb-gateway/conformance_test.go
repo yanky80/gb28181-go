@@ -433,6 +433,12 @@ func (s *gatewayScenario) waitForFrontChannel() *platform.Channel {
 	s.t.Helper()
 	var front *platform.Channel
 	require.Eventually(s.t, func() bool {
+		// The catalog can be synced while the cascade registration is still
+		// pending, and an INVITE in that window is answered 503 Registration
+		// Pending.
+		if !s.gateway.cascade.Online() {
+			return false
+		}
 		for _, channel := range s.upperDM.Channels(conformanceGatewayID) {
 			if channel.Name == "Front" {
 				front = channel
@@ -497,6 +503,7 @@ func newGatewayScenario(t *testing.T, version, codec, mediaTransport, upperVersi
 		ProtocolVersion:  upperVersion,
 		SubscribeCatalog: &noCatalogSubscription,
 	}, upperDM, upperSM, nil)
+	upper.SetGBTimezone(time.FixedZone("Asia/Shanghai", 8*60*60))
 	require.NoError(t, upper.Start(context.Background()))
 	t.Cleanup(func() { require.NoError(t, upper.Stop()) })
 

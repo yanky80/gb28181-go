@@ -7,9 +7,10 @@ package cascade
 // Harness ported from internal/gb28181/sip/server_test.go. See #566.
 
 import (
+	"bufio"
 	"context"
-	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -651,11 +652,43 @@ func TestLoopbackRecordInfoQuery(t *testing.T) {
 	require.Contains(t, string(answer.Body()), "<SumNum>2</SumNum>", "both recordings must be reported")
 }
 
-func TestLoopbackTwoCameraCatalogTCPPromotionIsBounded(t *testing.T) {
+func TestLoopbackTwoCameraCatalogPromotesToTCP(t *testing.T) {
 	_, up := startLoopbackService(t, fakeSource{cams: []CameraInfo{
 		{ID: "cam-1", Name: "Front", Encoding: "h265"},
 		{ID: "cam-2", Name: "Back", Encoding: "h265"},
 	}}, newCascadeTestDB(t))
+	tcp, err := net.Listen("tcp", up.conn.LocalAddr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tcp.Close() })
+	// gosip's sip.Request.Transport promotes an oversized UDP request to TCP;
+	// the upper must therefore accept TCP when the two-camera Catalog crosses
+	// its MTU threshold.
+	tcpDone := make(chan error, 1)
+	go func() {
+		conn, err := tcp.Accept()
+		if err != nil {
+			tcpDone <- err
+			return
+		}
+		defer conn.Close()
+		message, err := readStreamMessage(bufio.NewReader(conn))
+		if err != nil {
+			tcpDone <- err
+			return
+		}
+		msg, err := parser.ParseMessage(message, log.NewDefaultLogrusLogger())
+		if err != nil {
+			tcpDone <- err
+			return
+		}
+		req, ok := msg.(sip.Request)
+		if !ok || req.Method() != sip.MESSAGE || !strings.Contains(string(req.Body()), "<CmdType>Catalog</CmdType>") {
+			tcpDone <- fmt.Errorf("unexpected TCP SIP message: %s", msg.Short())
+			return
+		}
+		_, err = conn.Write([]byte(sip.NewResponseFromRequest("", req, 200, "OK", "").String()))
+		tcpDone <- err
+	}()
 
 	body, err := manscdp.Encode(manscdp.CatalogQuery{
 		CmdType: manscdp.CmdCatalog, SN: 8, DeviceID: lbChannelOne,
@@ -669,35 +702,42 @@ func TestLoopbackTwoCameraCatalogTCPPromotionIsBounded(t *testing.T) {
 	})
 	require.Equal(t, 200, int(res.StatusCode()))
 	if catalogDelivered {
-		return
+		t.Fatal("catalog unexpectedly fit in the UDP transport")
 	}
-
-	// Characterize gosip's current boundary: this two-camera response is
-	// promoted to TCP although the upper socket is UDP-only. Keep the probe
-	// bounded, but classify this known outcome rather than making failure to
-	// deliver the contract.
-	buf := make([]byte, 65535)
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for {
-		require.NoError(t, up.conn.SetReadDeadline(deadline))
-		n, _, readErr := up.conn.ReadFromUDP(buf)
-		if readErr != nil {
-			netErr, ok := readErr.(net.Error)
-			if ok && netErr.Timeout() {
-				err := fmt.Errorf("%w: no UDP delivery within 500ms", errTwoCameraCatalogTCPPromotion)
-				t.Logf("bounded characterization: %v", err)
-				return
-			}
-			require.NoError(t, readErr)
-		}
-		msg, parseErr := parser.ParseMessage(buf[:n], log.NewDefaultLogrusLogger())
-		if req, ok := msg.(sip.Request); parseErr == nil && ok && req.Method() == sip.MESSAGE && strings.Contains(string(req.Body()), "<CmdType>Catalog</CmdType>") {
-			return
-		}
+	select {
+	case err := <-tcpDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("catalog was not promoted to TCP within 1s")
 	}
 }
 
-var errTwoCameraCatalogTCPPromotion = errors.New("two-camera Catalog promoted to TCP before UDP delivery")
+func readStreamMessage(r *bufio.Reader) ([]byte, error) {
+	var message []byte
+	contentLength := 0
+	for {
+		line, err := r.ReadBytes('\n')
+		if err != nil {
+			return nil, err
+		}
+		message = append(message, line...)
+		if strings.HasPrefix(strings.ToLower(string(line)), "content-length:") {
+			value := strings.TrimSpace(string(line[len("content-length:"):]))
+			contentLength, err = strconv.Atoi(value)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if string(line) == "\r\n" {
+			break
+		}
+	}
+	body := make([]byte, contentLength)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, err
+	}
+	return append(message, body...), nil
+}
 
 // createPacedPlaybackSegment writes a REAL 5-sample H.264 MP4 (2s per sample)
 // and registers its recording row. The pump streams samples at realtime pace

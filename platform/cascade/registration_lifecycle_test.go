@@ -230,6 +230,37 @@ func TestStartUsesCallerContextCancellation(t *testing.T) {
 	require.NoError(t, svc.Stop())
 }
 
+func TestStartAcceptsNilContext(t *testing.T) {
+	cfg := testCfg()
+	cfg.SIPListen = freeSIPListenAddress(t)
+	svc := New(cfg, fakeSource{}, nil)
+	var ctx context.Context
+	require.NoError(t, svc.Start(ctx))
+	require.NoError(t, svc.Stop())
+}
+
+func TestClosedSubscriptionSuppressesNotify(t *testing.T) {
+	cfg := testCfg()
+	cfg.SIPListen = net.JoinHostPort(lbLocalHost, "0")
+	up := newUpperSocket(t, cfg.SIPListen)
+	cfg.ServerAddr = up.conn.LocalAddr().String()
+	svc := New(cfg, fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, newFakeCascadeStore())
+	require.NoError(t, svc.Start(context.Background()))
+	t.Cleanup(func() { _ = svc.Stop() })
+
+	sub := &catalogSub{upper: svc.uppers[0], callID: "closed-catalog"}
+	svc.mu.Lock()
+	svc.subs[sub.callID] = sub
+	svc.mu.Unlock()
+	sub.close()
+	svc.sendCatalogNotify(svc.ctx, sub)
+
+	require.NoError(t, up.conn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
+	buf := make([]byte, 65535)
+	_, _, err := up.conn.ReadFromUDP(buf)
+	require.Error(t, err, "a closed subscription must not receive a NOTIFY")
+}
+
 func TestInviteRejectsWhenStopHasStarted(t *testing.T) {
 	svc, up := startLoopbackService(t, fakeSource{}, nil)
 	svc.stopping.Store(true)
@@ -514,7 +545,7 @@ func TestCatalogStoreCancellationLetsStopReleaseNotify(t *testing.T) {
 	svc.mu.Lock()
 	svc.subs[sub.callID] = sub
 	svc.mu.Unlock()
-	go svc.sendCatalogNotify(sub)
+	go svc.sendCatalogNotify(svc.ctx, sub)
 	select {
 	case <-store.entered:
 	case <-time.After(time.Second):
@@ -551,7 +582,7 @@ func TestCatalogStoreCancellationLetsNetworkChangeReleaseNotify(t *testing.T) {
 	svc.mu.Lock()
 	svc.subs[sub.callID] = sub
 	svc.mu.Unlock()
-	go svc.sendCatalogNotify(sub)
+	go svc.sendCatalogNotify(svc.ctx, sub)
 	select {
 	case <-store.entered:
 	case <-time.After(time.Second):
@@ -984,10 +1015,15 @@ func TestSubscribeOwnershipAndReplacementLifecycle(t *testing.T) {
 	firstID, ok := first.CallID()
 	require.True(t, ok)
 	require.Equal(t, 200, int(up.roundTrip(first).StatusCode()))
-	svc.mu.Lock()
-	old := svc.subs[firstID.String()]
-	svc.mu.Unlock()
-	require.NotNil(t, old)
+	// onSubscribe answers 200 before it records the subscription, so the store
+	// is not observable the instant the response arrives.
+	var old *catalogSub
+	require.Eventually(t, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		old = svc.subs[firstID.String()]
+		return old != nil
+	}, time.Second, 5*time.Millisecond, "SUBSCRIBE must be recorded after its 200 OK")
 
 	foreignReq := foreign.requestDialog(sip.SUBSCRIBE, testCfg().LocalDeviceID, "", "", firstID, event)
 	from, ok := foreignReq.From()
@@ -1045,7 +1081,7 @@ func TestInvalidatedSubscriptionSuppressesNotify(t *testing.T) {
 	delete(svc.subs, sub.callID)
 	svc.mu.Unlock()
 
-	svc.sendCatalogNotify(sub)
+	svc.sendCatalogNotify(svc.ctx, sub)
 	require.NoError(t, up.conn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
 	buf := make([]byte, 65535)
 	_, _, err := up.conn.ReadFromUDP(buf)
@@ -1069,7 +1105,7 @@ func TestSubscriptionInvalidationSerializesWithNotify(t *testing.T) {
 	sub.sendMu.Lock()
 	done := make(chan struct{})
 	go func() {
-		svc.sendCatalogNotify(sub)
+		svc.sendCatalogNotify(svc.ctx, sub)
 		close(done)
 	}()
 	select {

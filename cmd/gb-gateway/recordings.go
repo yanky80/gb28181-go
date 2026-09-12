@@ -459,7 +459,7 @@ func (s *RecordingStore) load() error {
 					}
 					return nil // crash left a partial final event
 				}
-				return fmt.Errorf("%w: %v", ErrRecordingIndexCorrupt, decodeErr)
+				return fmt.Errorf("%w: %w", ErrRecordingIndexCorrupt, decodeErr)
 			}
 			if err := s.applyEvent(event); err != nil {
 				return err
@@ -612,7 +612,7 @@ func probeRecording(ctx context.Context, path string) (recordingProbeResult, err
 	cmd := exec.CommandContext(ctx, "ffprobe", args...)
 	data, err := cmd.Output()
 	if err != nil {
-		return recordingProbeResult{}, fmt.Errorf("%w: %v", ErrRecordingProbe, err)
+		return recordingProbeResult{}, fmt.Errorf("%w: %w", ErrRecordingProbe, err)
 	}
 	return parseRecordingProbeOutput(data)
 }
@@ -620,7 +620,7 @@ func probeRecording(ctx context.Context, path string) (recordingProbeResult, err
 func parseRecordingProbeOutput(data []byte) (recordingProbeResult, error) {
 	var output ffprobeOutput
 	if err := json.Unmarshal(data, &output); err != nil {
-		return recordingProbeResult{}, fmt.Errorf("%w: invalid JSON: %v", ErrRecordingProbe, err)
+		return recordingProbeResult{}, fmt.Errorf("%w: invalid JSON: %w", ErrRecordingProbe, err)
 	}
 	if len(output.Streams) == 0 {
 		return recordingProbeResult{}, fmt.Errorf("%w: no video stream", ErrRecordingProbe)

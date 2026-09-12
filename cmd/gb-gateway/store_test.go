@@ -46,7 +46,7 @@ func TestChannelStorePersistsCascadeChannelAcrossRestart(t *testing.T) {
 func TestChannelStoreReadsPreviousVersionAndMigratesOnWrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "channels.json")
 	legacy := `{"version":1,"channels":[{"camera_id":"front","gb_channel_id":"34020000001320000001","name":"Front"}]}`
-	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -77,7 +77,7 @@ func TestChannelStoreReadsPreviousVersionAndMigratesOnWrite(t *testing.T) {
 func TestChannelStoreRejectsUnknownVersionWithoutOverwriting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "channels.json")
 	data := []byte(`{"version":99,"channels":[]}`)
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, err := NewChannelStore(path)
@@ -97,10 +97,10 @@ func TestChannelStoreIgnoresTemporaryFileFromInterruptedWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "channels.json")
 	valid := `{"version":2,"channels":[{"camera_id":"front","gb_channel_id":"34020000001320000001"}]}`
-	if err := os.WriteFile(path, []byte(valid), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(valid), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".channels.json.tmp-crashed"), []byte(`{"version":2,"channels":[]}`), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".channels.json.tmp-crashed"), []byte(`{"version":2,"channels":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -134,7 +134,7 @@ func TestChannelStoreRejectsCorruptRows(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "channels.json")
-			if err := os.WriteFile(path, []byte(tt.body), 0600); err != nil {
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			_, err := NewChannelStore(path)
@@ -182,7 +182,7 @@ func TestChannelStoreConcurrentUpsertsHaveUniqueGBChannelMappings(t *testing.T) 
 	const count = 32
 	var wg sync.WaitGroup
 	errs := make(chan error, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -224,7 +224,7 @@ func TestChannelStoreAllocatesUniqueGBChannelsConcurrently(t *testing.T) {
 	var wg sync.WaitGroup
 	results := make(chan cascade.CascadeChannel, count)
 	errs := make(chan error, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

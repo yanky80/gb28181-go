@@ -86,12 +86,11 @@ func TestLoopbackInviteTCPMediaForward(t *testing.T) {
 		t.Fatal("cascade never dialed the TCP media address")
 	}
 	defer conn.Close()
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
-
 	mux := psmux.New()
 	mux.SetVideoCodec("h264")
 	buf := make([]byte, 65535)
 	require.Eventually(t, func() bool {
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Second)))
 		hub.Broadcast(90000, [][]byte{{0x67, 0x64, 0x00, 0x1F}, {0x65, 0x01}}, true)
 		n, err := conn.Read(buf)
 		return err == nil && n > 0

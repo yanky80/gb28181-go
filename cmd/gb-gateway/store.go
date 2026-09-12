@@ -83,14 +83,14 @@ func (s *ChannelStore) load() error {
 	var file channelStoreFile
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(&file); err != nil {
-		return fmt.Errorf("%w: decode: %v", ErrChannelStoreCorrupt, err)
+		return fmt.Errorf("%w: decode: %w", ErrChannelStoreCorrupt, err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
 			return fmt.Errorf("%w: trailing JSON", ErrChannelStoreCorrupt)
 		}
-		return fmt.Errorf("%w: trailing data: %v", ErrChannelStoreCorrupt, err)
+		return fmt.Errorf("%w: trailing data: %w", ErrChannelStoreCorrupt, err)
 	}
 	if file.Version != channelStorePreviousVersion && file.Version != channelStoreVersion {
 		return fmt.Errorf("%w: %d", ErrChannelStoreVersion, file.Version)
@@ -112,7 +112,7 @@ func validateChannelRows(rows []channelStoreChannel) (map[string]cascade.Cascade
 	gbIDs := make(map[string]string, len(rows))
 	for _, row := range rows {
 		if err := validateChannelMapping(row.CameraID, row.GBChannelID); err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrChannelStoreCorrupt, err)
+			return nil, fmt.Errorf("%w: %w", ErrChannelStoreCorrupt, err)
 		}
 		if _, exists := channels[row.CameraID]; exists {
 			return nil, fmt.Errorf("%w: duplicate camera_id %q", ErrChannelStoreCorrupt, row.CameraID)
