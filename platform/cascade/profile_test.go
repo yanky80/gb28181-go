@@ -591,7 +591,10 @@ func serveProfileRegistration(t *testing.T, up *upperSocket, version string, rec
 				continue
 			}
 			if len(wire) > 0 {
-				wire[0] <- string(buf[:n])
+				select {
+				case wire[0] <- string(buf[:n]):
+				default:
+				}
 			}
 			msg, err := parseSIPBytes(buf[:n])
 			if err != nil {
@@ -604,7 +607,10 @@ func serveProfileRegistration(t *testing.T, up *upperSocket, version string, rec
 			if received != nil {
 				values := req.GetHeaders("X-GB-Ver")
 				if len(values) > 0 {
-					received <- values[0].Value()
+					select {
+					case received <- values[0].Value():
+					default:
+					}
 				}
 			}
 			if len(req.GetHeaders("Authorization")) == 0 {
@@ -617,7 +623,6 @@ func serveProfileRegistration(t *testing.T, up *upperSocket, version string, rec
 				extra = "X-GB-Ver: " + version
 			}
 			_, _ = up.conn.WriteToUDP(challengeResponse(t, req, 200, "OK", extra), src)
-			return
 		}
 	}()
 }
