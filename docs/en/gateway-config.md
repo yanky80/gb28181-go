@@ -81,6 +81,21 @@ is:
 go test ./cmd/gb-gateway -run TestGatewayStartsSocketsBeforeCascadeAndStopsCleanly -count=1
 ```
 
+## Release compatibility
+
+The gateway release metadata records Edge IPC schema v1 and configuration
+schema v1. A C++ Adapter may be upgraded or rolled back independently as long
+as it speaks Edge IPC v1; the gateway and Adapter repositories do not require
+lockstep releases. Within this v1 compatibility window, additive JSON control
+fields are ignored and the frozen media framing and required fields remain
+stable. A breaking IPC or configuration change requires a schema bump and a
+compatibility plan before it is released.
+
+The linux/arm64 release attachment contains `gb-gateway` and
+`gb-gateway-release-metadata.txt`; the latter records the binary SHA-256,
+source commit, and both schema versions. The release-level `SHA256SUMS` file
+also hashes every uploaded attachment.
+
 ## Gateway status consumer contract
 
 `gateway-status.json` is replaced atomically with mode `0640`. Consumers may
