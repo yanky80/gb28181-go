@@ -1059,10 +1059,15 @@ func TestSubscribeOwnershipAndReplacementLifecycle(t *testing.T) {
 	released = true
 	res := up.awaitResponse(firstID.String(), 2)
 	require.Equal(t, 200, int(res.StatusCode()))
-	svc.mu.Lock()
-	got = svc.subs[firstID.String()]
-	svc.mu.Unlock()
-	require.NotSame(t, old, got)
+	// onSubscribe sends the 200 OK before it installs the replacement, so the
+	// store is not observable the instant the response arrives.
+	var swapped *catalogSub
+	require.Eventually(t, func() bool {
+		svc.mu.Lock()
+		defer svc.mu.Unlock()
+		swapped = svc.subs[firstID.String()]
+		return swapped != nil && swapped != old
+	}, time.Second, 5*time.Millisecond, "replacement SUBSCRIBE must replace the old subscription")
 }
 
 func TestInvalidatedSubscriptionSuppressesNotify(t *testing.T) {

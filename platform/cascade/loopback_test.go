@@ -295,6 +295,24 @@ func TestServiceNameAndNoUpperStart(t *testing.T) {
 	require.Error(t, bare.Start(context.Background()), "Start without uppers must fail")
 }
 
+// TestLoopbackInviteSubscribesBeforeAnswering pins the INVITE ordering: the
+// forward attaches to the camera hub before the upper platform can observe the
+// 200 OK. Answering first lets the first access unit land in a hub with no
+// consumer yet — it is dropped and the dialog looks established while carrying
+// no media (TestGatewayConformanceH265TCPActive failed on CI exactly that way,
+// with the gateway asking for another IDR that never got one).
+func TestLoopbackInviteSubscribesBeforeAnswering(t *testing.T) {
+	hub := platform.NewFrameHub()
+	db := newCascadeTestDB(t)
+	svc, up := startLoopbackService(t, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, db)
+	_, err := svc.catalogItems()
+	require.NoError(t, err)
+
+	invite := up.request(sip.INVITE, lbChannelOne, playSDP(t, "Live", false), "application/sdp")
+	require.Equal(t, 200, int(up.roundTrip(invite).StatusCode()))
+	require.Equal(t, 1, hub.ConsumerCount(), "the 200 OK must not precede the hub subscription")
+}
+
 func TestLoopbackInviteLiveForwardAndBye(t *testing.T) {
 	hub := platform.NewFrameHub()
 	db := newCascadeTestDB(t)

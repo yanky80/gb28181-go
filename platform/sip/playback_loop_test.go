@@ -75,9 +75,49 @@ func (c *sipClient) respondRaw(req sip.Request, code int, reason, body, contentT
 	}
 	b.WriteString(fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body)))
 	b.WriteString(body)
-	if _, err := c.conn.WriteToUDP([]byte(b.String()), c.addr); err != nil {
+	raw := b.String()
+	c.rememberResponse(req, raw)
+	if _, err := c.conn.WriteToUDP([]byte(raw), c.addr); err != nil {
 		c.t.Fatalf("respondRaw: write: %v", err)
 	}
+}
+
+// answeredKey identifies a server-initiated request this client has already
+// answered. A UDP retransmission repeats the Call-ID and CSeq of the original.
+func answeredKey(req sip.Request) string {
+	callID, ok := req.CallID()
+	if !ok {
+		return ""
+	}
+	cseq, ok := req.CSeq()
+	if !ok {
+		return ""
+	}
+	return callID.String() + "\t" + cseq.String()
+}
+
+func (c *sipClient) rememberResponse(req sip.Request, raw string) {
+	key := answeredKey(req)
+	if key == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.answered == nil {
+		c.answered = make(map[string]string)
+	}
+	c.answered[key] = raw
+}
+
+func (c *sipClient) answeredResponse(req sip.Request) (string, bool) {
+	key := answeredKey(req)
+	if key == "" {
+		return "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	raw, ok := c.answered[key]
+	return raw, ok
 }
 
 // answerRetransmits answers every retransmission of a server-initiated
@@ -91,7 +131,17 @@ func (c *sipClient) answerRetransmits(method sip.RequestMethod, answer func(sip.
 	for time.Now().Before(deadline) {
 		req := c.nextRequest(150 * time.Millisecond)
 		if req != nil && req.Method() == method {
-			answer(req)
+			if raw, ok := c.answeredResponse(req); ok {
+				// A retransmission of a request this client already answered
+				// (typically the preceding step's command): replay the recorded
+				// response instead of re-entering answer, whose assertions
+				// describe only the current step's command.
+				if _, err := c.conn.WriteToUDP([]byte(raw), c.addr); err != nil {
+					c.t.Fatalf("answerRetransmits: replay: %v", err)
+				}
+			} else {
+				answer(req)
+			}
 		}
 		select {
 		case err := <-done:
@@ -105,6 +155,49 @@ func (c *sipClient) answerRetransmits(method sip.RequestMethod, answer func(sip.
 	default:
 		return fmt.Errorf("answerRetransmits: %s not completed within %s", method, timeout)
 	}
+}
+
+// TestAnswerRetransmitsReplaysAnsweredRequest pins the retransmission rule:
+// once a command has been answered, a UDP retransmission of it replays the
+// recorded response instead of re-entering the step's answer func — otherwise
+// the next step's assertions are handed the previous command's PLAY.
+func TestAnswerRetransmitsReplaysAnsweredRequest(t *testing.T) {
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+	client := newSIPClient(t, peer.LocalAddr().String())
+
+	req := buildRequest(t, sip.INFO, testDeviceID, testServerID, peer.LocalAddr().String(), client.localPort(),
+		"PLAY MANSRTSP/1.0\r\nRange: npt=0.000-\r\n")
+	raw := []byte(req.String())
+	clientAddr := client.conn.LocalAddr().(*net.UDPAddr)
+
+	calls := 0
+	done := make(chan error)
+	result := make(chan error, 1)
+	go func() {
+		result <- client.answerRetransmits(sip.INFO, func(info sip.Request) {
+			calls++
+			client.respondRaw(info, 200, "OK", "", "")
+		}, done, 5*time.Second)
+	}()
+
+	exchange := func() {
+		t.Helper()
+		_, err := peer.WriteToUDP(raw, clientAddr)
+		require.NoError(t, err)
+		buf := make([]byte, 2048)
+		require.NoError(t, peer.SetReadDeadline(time.Now().Add(3*time.Second)))
+		n, _, err := peer.ReadFromUDP(buf)
+		require.NoError(t, err)
+		require.Contains(t, string(buf[:n]), "SIP/2.0 200 OK")
+	}
+
+	exchange()
+	exchange()
+	close(done)
+	require.NoError(t, <-result)
+	require.Equal(t, 1, calls, "retransmission must be replayed, not re-asserted")
 }
 
 // sendMessage sends a server-directed MESSAGE (device → platform) and awaits

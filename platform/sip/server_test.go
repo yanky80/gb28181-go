@@ -72,6 +72,9 @@ type sipClient struct {
 	t    *testing.T
 	conn *net.UDPConn
 	addr *net.UDPAddr
+
+	mu       sync.Mutex
+	answered map[string]string
 }
 
 func newSIPClient(t *testing.T, serverAddr string) *sipClient {
