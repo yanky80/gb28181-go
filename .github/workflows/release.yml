@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: '1.26'
       - name: Vet
         run: go vet ./...
       - name: Test
@@ -75,6 +75,18 @@ jobs:
           for cmd in device-register platform-uas psmux-rtp; do
             go build -trimpath -o "dist/${cmd}${ext}" "./examples/${cmd}"
           done
+          if [ "${GOOS}" = "linux" ] && [ "${GOARCH}" = "arm64" ]; then
+            go build -trimpath -o "dist/gb-gateway" ./cmd/gb-gateway
+            gateway_sha256="$(sha256sum dist/gb-gateway | awk '{print $1}')"
+            source_commit=$(git rev-parse HEAD)
+            cat > dist/gb-gateway-release-metadata.txt <<EOF
+          artifact=gb-gateway
+          sha256=${gateway_sha256}
+          source_commit=${source_commit}
+          ipc_schema_version=1
+          config_schema_version=1
+          EOF
+          fi
           if [ "${GOOS}" = "windows" ]; then
             (cd dist && zip -q "../${archive}" ./*)
           else
