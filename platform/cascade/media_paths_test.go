@@ -18,6 +18,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type recordingServerTransaction struct {
+	response sip.Response
+}
+
+func (tx *recordingServerTransaction) Origin() sip.Request            { return nil }
+func (tx *recordingServerTransaction) Key() sip.TransactionKey        { return "test" }
+func (tx *recordingServerTransaction) String() string                 { return "recording transaction" }
+func (tx *recordingServerTransaction) Errors() <-chan error           { return nil }
+func (tx *recordingServerTransaction) Done() <-chan bool              { return nil }
+func (tx *recordingServerTransaction) Acks() <-chan sip.Request       { return nil }
+func (tx *recordingServerTransaction) Cancels() <-chan sip.Request    { return nil }
+func (tx *recordingServerTransaction) Respond(res sip.Response) error { tx.response = res; return nil }
+
+func TestRespondOnTransactionUsesProvidedTransaction(t *testing.T) {
+	msg, err := parseSIPRaw([]byte("INVITE sip:front@example.com SIP/2.0\r\n" +
+		"Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-test\r\n" +
+		"From: <sip:upper@example.com>;tag=from\r\n" +
+		"To: <sip:front@example.com>\r\n" +
+		"Call-ID: call-test\r\n" +
+		"CSeq: 1 INVITE\r\n" +
+		"Content-Length: 0\r\n\r\n"))
+	require.NoError(t, err)
+	req, ok := msg.(sip.Request)
+	require.True(t, ok)
+
+	tx := &recordingServerTransaction{}
+	require.NoError(t, respondOnTransaction(tx, req, 200, "OK", "answer", nil))
+	require.NotNil(t, tx.response)
+	require.Equal(t, sip.StatusCode(200), tx.response.StatusCode())
+	require.Equal(t, "answer", string(tx.response.Body()))
+}
+
 // tcpPlaySDP builds a TCP-passive live-forward offer pointing media at
 // tcpPort (we dial per a=setup:passive).
 func tcpPlaySDP(t *testing.T, tcpPort int) string {

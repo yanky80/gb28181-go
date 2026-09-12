@@ -15,7 +15,6 @@ import (
 	"github.com/ghettovoice/gosip/sip"
 	"github.com/mickeyzzc/gb28181-go/metrics"
 	"github.com/mickeyzzc/gb28181-go/platform"
-	mbsip "github.com/mickeyzzc/gb28181-go/platform/sip"
 	"github.com/mickeyzzc/gb28181-go/psmux"
 )
 
@@ -229,11 +228,18 @@ func sdpToUnix(v int64) int64 {
 // onInvite handles the upper platform's INVITE for one aggregated channel:
 // 200 OK with our sendonly SDP, then forward the camera's stream (ACK from
 // the upper platform completes the dialog; gosip auto-matches it).
+func respondOnTransaction(tx sip.ServerTransaction, req sip.Request, status sip.StatusCode, reason, body string, headers []sip.Header) error {
+	response := sip.NewResponseFromRequest("", req, status, reason, body)
+	for _, header := range headers {
+		response.AppendHeader(header)
+	}
+	return tx.Respond(response)
+}
+
 func (s *Service) onInvite(req sip.Request, tx sip.ServerTransaction) {
 	if s.srv == nil {
 		return
 	}
-	mbsip.DrainAcks(tx)
 	callID := ""
 	if h, ok := req.CallID(); ok {
 		callID = h.String()
@@ -246,7 +252,9 @@ func (s *Service) onInvite(req sip.Request, tx sip.ServerTransaction) {
 	}
 	reject := func(status sip.StatusCode, reason, code string) {
 		s.observeInviteFailure(callID, channelID, code)
-		_, _ = s.srv.RespondOnRequest(req, status, reason, "", nil)
+		if err := respondOnTransaction(tx, req, status, reason, "", nil); err != nil {
+			slog.Warn("gb28181-cascade: INVITE response failed", "status", status, "error", err)
+		}
 	}
 
 	s.admissionMu.Lock()
@@ -309,7 +317,9 @@ func (s *Service) onInvite(req sip.Request, tx sip.ServerTransaction) {
 	if ms, ok := s.sessions[callID]; ok {
 		sdp := ms.sdpBody
 		s.mu.Unlock()
-		_, _ = s.srv.RespondOnRequest(req, 200, "OK", sdp, nil)
+		if err := respondOnTransaction(tx, req, 200, "OK", sdp, nil); err != nil {
+			slog.Warn("gb28181-cascade: INVITE response failed", "status", 200, "error", err)
+		}
 		return
 	}
 	if ps, ok := s.playbacks[callID]; ok {
@@ -317,7 +327,9 @@ func (s *Service) onInvite(req sip.Request, tx sip.ServerTransaction) {
 		if sameWindow {
 			sdp := ps.sdpBody
 			s.mu.Unlock()
-			_, _ = s.srv.RespondOnRequest(req, 200, "OK", sdp, nil)
+			if err := respondOnTransaction(tx, req, 200, "OK", sdp, nil); err != nil {
+				slog.Warn("gb28181-cascade: INVITE response failed", "status", 200, "error", err)
+			}
 			return
 		}
 		delete(s.playbacks, callID)
@@ -438,7 +450,9 @@ func (s *Service) onInvite(req sip.Request, tx sip.ServerTransaction) {
 	s.sessions[callID] = ms
 	s.mu.Unlock()
 
-	_, _ = s.srv.RespondOnRequest(req, 200, "OK", ms.sdpBody, nil)
+	if err := respondOnTransaction(tx, req, 200, "OK", ms.sdpBody, nil); err != nil {
+		slog.Warn("gb28181-cascade: INVITE response failed", "status", 200, "error", err)
+	}
 	go ms.run(hub)
 	mediaTarget := "<nil>"
 	if dst != nil {

@@ -28,3 +28,9 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
 )
+
+// gosip's client transaction layer calls tx.Init() (which sends the request)
+// before transactions.put(), so a response that arrives first is dropped and
+// the transaction waits out Timer B (32s). The fork registers before Init and
+// also guards the connection-pool error send on shutdown.
+replace github.com/ghettovoice/gosip => github.com/yanky80/gosip v0.0.0-20260912134017-7cabcef84d3b

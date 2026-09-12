@@ -90,8 +90,8 @@ func TestRegisterProtocolVersionHeaderAndResponse(t *testing.T) {
 			stop := make(chan struct{})
 			go serveProfileRegistration(t, up, tt.marker, received, stop)
 			t.Cleanup(func() {
-				close(stop)
 				_ = svc.Stop()
+				close(stop)
 			})
 			require.NoError(t, svc.Start(context.Background()))
 
@@ -120,8 +120,8 @@ func TestRegisterWireCarriesProfileOnInitialAndDigestRetry(t *testing.T) {
 			go serveProfileRegistration(t, up, tt.marker, nil, stop, wire)
 			svc := New(cfg, fakeSource{}, nil)
 			t.Cleanup(func() {
-				close(stop)
 				_ = svc.Stop()
+				close(stop)
 			})
 			require.NoError(t, svc.Start(context.Background()))
 			require.Eventually(t, func() bool { return svc.Online() }, 5*time.Second, 20*time.Millisecond)
@@ -147,8 +147,8 @@ func TestDynamicH265CameraUsesSavedPerUpperVersion(t *testing.T) {
 			go serveProfileRegistration(t, up, responseVersion, nil, stop)
 			svc := New(cfg, src, nil)
 			t.Cleanup(func() {
-				close(stop)
 				_ = svc.Stop()
+				close(stop)
 			})
 			require.NoError(t, svc.Start(context.Background()))
 			require.Eventually(t, func() bool { return svc.Online() }, 5*time.Second, 20*time.Millisecond)
@@ -473,8 +473,8 @@ func TestH265VersionMismatchBlocksInvite(t *testing.T) {
 			stop := make(chan struct{})
 			go serveProfileRegistration(t, up, responseVersion, nil, stop)
 			t.Cleanup(func() {
-				close(stop)
 				_ = svc.Stop()
+				close(stop)
 			})
 			require.NoError(t, svc.Start(context.Background()))
 			require.Eventually(t, func() bool { return svc.Status() == StatusVersionMismatch }, 5*time.Second, 20*time.Millisecond)
@@ -505,8 +505,8 @@ func TestH265InviteSDPPSMAndParameterSets(t *testing.T) {
 	stop := make(chan struct{})
 	go serveProfileRegistration(t, up, "3.0", nil, stop)
 	t.Cleanup(func() {
-		close(stop)
 		_ = svc.Stop()
+		close(stop)
 	})
 	require.NoError(t, svc.Start(context.Background()))
 	require.Eventually(t, func() bool { return svc.Online() }, 5*time.Second, 20*time.Millisecond)
@@ -556,8 +556,8 @@ func TestH265PlaybackRejectsMismatchedParsedCodec(t *testing.T) {
 	svc.SetSegmentParser(fakeSegmentParser)
 	stop := make(chan struct{})
 	t.Cleanup(func() {
-		close(stop)
 		_ = svc.Stop()
+		close(stop)
 	})
 	require.NoError(t, svc.Start(context.Background()))
 	svc.setOnline(svc.uppers[0], true)
