@@ -304,7 +304,8 @@ func TestGatewayConformanceRecoveryEpochGapAndDuplicateDialog(t *testing.T) {
 		return ok && view.Online && view.StreamEpoch == 2
 	}, 5*time.Second, 20*time.Millisecond, "new epoch must replace stale peer")
 
-	require.NoError(t, s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID))
+	invite := make(chan error, 1)
+	go func() { invite <- s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID) }()
 	hub := awaitUpperHub(t, s.upperSM, frontChannel.ID)
 	got := make(chan struct{}, 1)
 	require.NoError(t, hub.Subscribe("conformance-recovery", func(_ int64, _ [][]byte, _ bool) { got <- struct{}{} }))
@@ -320,6 +321,7 @@ func TestGatewayConformanceRecoveryEpochGapAndDuplicateDialog(t *testing.T) {
 		Codec: edgeipc.CodecH265, Flags: edgeipc.FlagIDR, CameraID: "front",
 		Sequence: 3, PTS90kHz: 27000, Payload: h265IDR(),
 	})
+	require.NoError(t, <-invite)
 	select {
 	case <-got:
 	case <-time.After(5 * time.Second):
