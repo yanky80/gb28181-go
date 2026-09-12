@@ -110,12 +110,13 @@ func TestRegisterRetryBacksOffExponentially(t *testing.T) {
 	hub := platform.NewFrameHub()
 	svc := New(cfg, hubSource{fakeSource{cams: []CameraInfo{{ID: "cam-1", Name: "Front"}}}, hub}, newCascadeTestDB(t))
 	svc.SetRegisterRetryRandomSource(func(int64) int64 { return 0 })
+	// Receive the first REGISTER before starting the service; otherwise a
+	// scheduler-delayed fake upper makes the initial request time out.
+	reg := startRejectingRegistrar(t, up, 2)
 	require.NoError(t, svc.Start(context.Background()))
 	t.Cleanup(func() { _ = svc.Stop() })
 
 	// Fail the first two attempts; the third registers.
-	reg := startRejectingRegistrar(t, up, 2)
-
 	require.Eventually(t, func() bool { return svc.Online() }, 10*time.Second, 50*time.Millisecond,
 		"the third attempt must register")
 
