@@ -1,0 +1,8 @@
+[mcp_servers.chrome-devtools]
+enabled = false
+
+[mcp_servers.oracle]
+enabled = false
+
+[mcp_servers.code-review-graph]
+enabled = false
