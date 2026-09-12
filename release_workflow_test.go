@@ -24,8 +24,9 @@ func TestReleaseWorkflowPublishesGatewayArm64Metadata(t *testing.T) {
 }
 
 func TestReleaseAndCIUseValidatedGoToolchain(t *testing.T) {
-	if got := strings.Count(readWorkflow(t, ".github/workflows/ci.yml"), "go-version: '1.26'"); got != 2 {
-		t.Fatalf("CI must pin both lint and test jobs to Go 1.26, found %d pins", got)
+	ci := readWorkflow(t, ".github/workflows/ci.yml")
+	if !strings.Contains(ci, "go-version: '1.26.5'") || !strings.Contains(ci, "go-version: ['1.26.5', '1.27.x']") {
+		t.Fatal("CI must lint on Go 1.26.5 and test both validated Go versions")
 	}
 	if got := strings.Count(readWorkflow(t, ".github/workflows/release.yml"), "go-version: '1.26'"); got != 1 {
 		t.Fatalf("release preflight must pin its test job to Go 1.26, found %d pins", got)
