@@ -497,6 +497,7 @@ func newGatewayScenario(t *testing.T, version, codec, mediaTransport, upperVersi
 		ProtocolVersion:  upperVersion,
 		SubscribeCatalog: &noCatalogSubscription,
 	}, upperDM, upperSM, nil)
+	upper.SetGBTimezone(time.FixedZone("Asia/Shanghai", 8*60*60))
 	require.NoError(t, upper.Start(context.Background()))
 	t.Cleanup(func() { require.NoError(t, upper.Stop()) })
 
