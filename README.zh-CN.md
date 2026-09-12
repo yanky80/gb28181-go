@@ -107,6 +107,7 @@ sipCfg.RegisterAuthenticator = plat35114 // platform/sip.Config；Digest 路径�
 | [PS 封装与 RTP](docs/zh/psmux.md) | `psmux.Muxer`、RTP 打包器（UDP/TCP）、封装器选型、`nalutil` |
 | [平台端（UAS）](docs/zh/platform.md) | `platform/sip` 服务器：配置、`DeviceStore`、`EventBus`、会话管理、活性 |
 | [级联客户端](docs/zh/cascade.md) | 注册上级平台：`CameraSource`/`Store`/`SegmentParser` 接缝 |
+| [`gb-gateway` 部署与 UDS](docs/zh/gateway.md) | 构建、systemd 部署、配置、控制/媒体 UDS v1 与排障 |
 
 ## 示例
 
