@@ -334,7 +334,8 @@ func TestGatewayConformanceRecoveryEpochGapAndDuplicateDialog(t *testing.T) {
 		return s.upperSM.GetHub(frontChannel.ID) == nil && s.gateway.cascade.ForwardCount() == 0
 	}, 5*time.Second, 20*time.Millisecond, "first dialog must release before the replacement dialog")
 
-	require.NoError(t, s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID))
+	secondInvite := make(chan error, 1)
+	go func() { secondInvite <- s.upper.InviteChannel(conformanceGatewayID, frontChannel.ID) }()
 	secondHub := awaitUpperHub(t, s.upperSM, frontChannel.ID)
 	secondGot := make(chan struct{}, 1)
 	require.NoError(t, secondHub.Subscribe("conformance-recovery-second-dialog", func(_ int64, _ [][]byte, _ bool) { secondGot <- struct{}{} }))
@@ -345,6 +346,7 @@ func TestGatewayConformanceRecoveryEpochGapAndDuplicateDialog(t *testing.T) {
 		Codec: edgeipc.CodecH265, Flags: edgeipc.FlagIDR, CameraID: "front",
 		Sequence: 4, PTS90kHz: 36000, Payload: h265IDR(),
 	})
+	require.NoError(t, <-secondInvite)
 	select {
 	case <-secondGot:
 	case <-time.After(5 * time.Second):
