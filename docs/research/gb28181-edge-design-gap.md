@@ -1,10 +1,10 @@
 # 盒端 GB28181 设计—代码差距
 
-> 修订日期：2026-09-09  
-> 最新设计：`cki-cv-project` 提交 `eee31d21dd8d347a617ce0db751347d39839be7d` 的 `docs/盒端系统详细设计.md`。本地 `master` 停在 `0b4c0a5`，但 `origin/master`、`github/master` 与 `docs/box-system-design-gb28181-rk3588` 均指向 `eee31d2`；下文“设计”行号均指该 blob。  
-> 当前代码：`gb28181-go` HEAD `43f84652195d55dd03b785435b0e17ce18c8b2bb`（`main`、`origin/main`、`upstream/main` 一致）。  
-> 对比基线：上一版报告为设计 `0b4c0a5` / 代码 `5af7002`。  
-> 验证：`go test ./...` 与 `go test -race ./...` 均通过（14 个包、575 项）。这不替代真实上级、摄像机及 4G/CGNAT 验收。
+> 修订日期：2026-09-10
+> 最新设计：`cki-cv-project` 提交 `eee31d21dd8d347a617ce0db751347d39839be7d` 的 `docs/盒端系统详细设计.md`。检查全部本地/远端 refs 后，`origin/master`、`github/master` 与 `docs/box-system-design-gb28181-rk3588` 仍共同指向该提交；下文“设计”行号均指该 blob。
+> 当前代码：`gb28181-go` HEAD `3aebca59e9ed4778db23ded957ec6e14f5a473ce`（`main`、`origin/main` 一致），已合并 `upstream/main` `bdc43a1`。
+> 本次对比基线：设计 `eee31d2` / 代码 `43f8465`。
+> 验证：`go test ./...` 与 `go test -race ./...` 均通过（14 个包、578 项）。这不替代真实上级、摄像机及 4G/CGNAT 验收。
 
 ## 结论
 
@@ -20,6 +20,14 @@
 因此 Wayfinder 地图必须以 2022/H.265 为主干，并覆盖本仓的协议 profile、网关宿主、PTZ 和回放；旧地图中“2016/H.264 主路径”“H.265 条件启用”以及“网关宿主在盒端仓库”的决定全部作废。
 
 ## 新版变更
+
+### 本次复核：`43f8465` → `3aebca5`
+
+- 设计未变化：最新有效设计仍是 `eee31d2`。
+- `12d61f1` 只提交本报告、`CONTEXT.md` 和 agent 配置，没有实现代码。
+- upstream `d752226` 新增的是普通设备角色的 GB/T 28181-2022 抓拍执行 seam：`SnapshotExecutor`、`SetSnapshotExecutor` 和异步 `UploadSnapShotFinished`；代码明确位于 `device` 包（`device/snapshot.go:1-96`; `device/server.go:1106-1130`）。详细设计的盒端下级平台范围没有要求抓拍（设计 `:39-49,62-79`），且该改动没有触及 `platform/cascade`，因此不关闭任何网关、PTZ 或回放差距，也不生成 Wayfinder 任务。
+- `3af26d6`、`bdc43a1` 仅补充上述抓拍能力的双语文档/版本记录；合并提交 `3aebca5` 本身没有额外实现。
+- 当前仍无 `cmd/gb-gateway`，`platform/cascade` 在此区间无源码改动；`ProtocolVersion`、`X-GB-Ver`、DeviceStatus、动态状态、主流生命周期、UDS、PTZAdapter 和 fMP4 parser/index 等判断保持不变（当前证据：`platform/cascade/seam.go:8-71`; `platform/cascade/service.go:53-65,434-545,642-673`; `platform/cascade/catalog.go:62-74`）。
 
 ### 设计：`0b4c0a5` → `eee31d2`
 
@@ -43,7 +51,7 @@ PTZ、回放、网关归属和两仓 seam 未再次改变：PTZ 仍是阶段 2�
 
 ## 本仓范围与差距
 
-| 领域 | 最新设计 | `43f8465` 证据 | 结论 |
+| 领域 | 最新设计 | `3aebca5` 证据 | 结论 |
 | --- | --- | --- | --- |
 | 2022 profile | 2022/H.265 默认；REGISTER 双向 `X-GB-Ver: 3.0`；不匹配拒流（设计 `:96-106,283-292`） | Config 无版本字段；REGISTER 仅追加 Expires/Digest（`platform/cascade/seam.go:8-71`; `platform/cascade/service.go:504-545`） | **新增最高优先级缺口** |
 | 编码组合 | 仅允许 2022/H.265、2022/H.264、2016/H.264（设计 `:273,564,590`） | `SetVideoCodec` 对未知值默认 H.264，无版本约束（`psmux/mux.go:52-63`） | **需 fail-fast 校验** |
@@ -68,6 +76,8 @@ PTZ、回放、网关归属和两仓 seam 未再次改变：PTZ 仍是阶段 2�
 5. **保留阶段 2 PTZ 任务**：基础 decode 可复用；只拆 Adapter、超时 Stop、审计与跨仓电子围栏暂停 seam。
 6. **保留阶段 3 回放任务**：录像索引、fragmented MP4 parser、能力门控和跨片段/清理并发；默认录像/直播通常均为 H.265，但仍分别是原始主码流与 AI 结果流（设计 `:507-555`）。
 7. **撤销旧任务中的过时表述**：“2016/H.264 首期主路径”“H.265 后置可选”“把 `gb-gateway` 源码放入 `rk3588-test`”都不再成立。现有 issue 没有一项因此整体完成或整体越界，所以不关闭任务，只收缩已由上游完成的部分。
+
+本次 `43f8465..3aebca5` 复核不要求调整上述顺序：**无需关闭、修改或新增 Wayfinder 任务**。抓拍 seam 属于 `device` 角色且不在盒端详细设计范围；只有未来明确把抓拍加入目标范围时，才另建决策票，而不是塞进当前网关任务。
 
 ## 本仓之外
 
