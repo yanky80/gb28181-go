@@ -725,6 +725,11 @@ func (s *Service) Status() string {
 		}
 	}
 	for _, u := range s.uppers {
+		if s.upperVersionMissingLocked(u) {
+			return StatusVersionMissing
+		}
+	}
+	for _, u := range s.uppers {
 		if u.online {
 			return StatusOnline
 		}
@@ -1110,14 +1115,29 @@ func responseProtocolVersion(resp sip.Response) string {
 }
 
 func (s *Service) saveUpperProtocolVersion(u *upper, version string) {
+	version = strings.TrimSpace(version)
 	s.mu.Lock()
-	u.protocolVersion = strings.TrimSpace(version)
+	u.protocolVersion = version
 	u.protocolVersionSeen = true
 	s.mu.Unlock()
+	if !s.requiresVersionGate() {
+		return
+	}
+	expected := profileVersionMarker(s.cfg.EffectiveProtocolVersion())
+	if version == "" {
+		slog.Warn("gb28181-cascade: upper REGISTER response omitted X-GB-Ver",
+			"upper", u.cfg.ServerAddr, "expected_gb_version", expected,
+			"status", StatusVersionMissing)
+	} else if version != expected {
+		slog.Warn("gb28181-cascade: upper REGISTER response has incompatible X-GB-Ver",
+			"upper", u.cfg.ServerAddr, "peer_gb_version", version,
+			"expected_gb_version", expected, "status", StatusVersionMismatch)
+	}
 }
 
 func (s *Service) upperVersionMismatchLocked(u *upper) bool {
-	return u.protocolVersionSeen && s.requiresVersionGate() && u.protocolVersion != profileVersionMarker("2022")
+	return u.protocolVersionSeen && s.requiresVersionGate() && u.protocolVersion != "" &&
+		u.protocolVersion != profileVersionMarker("2022")
 }
 
 var challengeRe = regexp.MustCompile(`(\w+)\s*=\s*"([^"]+)"`)

@@ -9,6 +9,7 @@ const (
 	StatusOnline          = "ONLINE"
 	StatusOffline         = "OFFLINE"
 	StatusVersionMismatch = "VERSION_MISMATCH"
+	StatusVersionMissing  = "VERSION_MISSING"
 )
 
 // resolveProtocolProfile normalizes the source-compatible config seam and
@@ -69,6 +70,10 @@ func (s *Service) mediaVersionAllowed(u *upper, cam CameraInfo) bool {
 	seen, upstreamVersion := u.protocolVersionSeen, u.protocolVersion
 	s.mu.Unlock()
 	return !seen || upstreamVersion == profileVersionMarker(version)
+}
+
+func (s *Service) upperVersionMissingLocked(u *upper) bool {
+	return u.protocolVersionSeen && s.requiresVersionGate() && u.protocolVersion == ""
 }
 
 func (s *Service) requiresVersionGate() bool {

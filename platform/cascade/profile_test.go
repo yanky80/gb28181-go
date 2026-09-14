@@ -103,6 +103,27 @@ func TestRegisterProtocolVersionHeaderAndResponse(t *testing.T) {
 	}
 }
 
+func TestRegisterStatusDistinguishesMissingPeerVersion(t *testing.T) {
+	cfg := testCfg()
+	cfg.ServerDomain = lbUpperDevice
+	cfg.SIPListen = freeSIPListenAddress(t)
+	up := newUpperSocket(t, cfg.SIPListen)
+	cfg.ServerAddr = up.conn.LocalAddr().String()
+
+	svc := New(cfg, fakeSource{cams: []CameraInfo{{ID: "cam-1", Encoding: "h265"}}}, nil)
+	stop := make(chan struct{})
+	go serveProfileRegistration(t, up, "", nil, stop)
+	t.Cleanup(func() {
+		_ = svc.Stop()
+		close(stop)
+	})
+	require.NoError(t, svc.Start(context.Background()))
+	require.Eventually(t, func() bool { return svc.Online() }, 5*time.Second, 20*time.Millisecond)
+
+	require.Equal(t, StatusVersionMissing, svc.Status())
+	require.Empty(t, svc.UpperProtocolVersion())
+}
+
 func TestRegisterWireCarriesProfileOnInitialAndDigestRetry(t *testing.T) {
 	for _, tt := range []struct{ name, configVersion, marker string }{
 		{name: "2022", marker: "3.0"},
@@ -154,7 +175,11 @@ func TestDynamicH265CameraUsesSavedPerUpperVersion(t *testing.T) {
 			require.Eventually(t, func() bool { return svc.Online() }, 5*time.Second, 20*time.Millisecond)
 
 			src.SetCamera(CameraInfo{ID: "cam-1", Encoding: "h265"})
-			require.Equal(t, StatusVersionMismatch, svc.Status())
+			wantStatus := StatusVersionMismatch
+			if responseVersion == "" {
+				wantStatus = StatusVersionMissing
+			}
+			require.Equal(t, wantStatus, svc.Status())
 			_, err := svc.catalogItems()
 			require.NoError(t, err)
 			res := up.roundTrip(up.request(sip.INVITE, lbChannelOne, playSDP(t, "Play", false), "application/sdp"))
@@ -463,6 +488,10 @@ func registerWireGoldenExpected(requestLine, marker string, auth bool) string {
 func TestH265VersionMismatchBlocksInvite(t *testing.T) {
 	for _, responseVersion := range []string{"", "2.0"} {
 		t.Run("response-"+responseVersion, func(t *testing.T) {
+			wantStatus := StatusVersionMismatch
+			if responseVersion == "" {
+				wantStatus = StatusVersionMissing
+			}
 			cfg := testCfg()
 			cfg.ServerDomain = lbUpperDevice
 			cfg.SIPListen = freeSIPListenAddress(t)
@@ -477,9 +506,9 @@ func TestH265VersionMismatchBlocksInvite(t *testing.T) {
 				close(stop)
 			})
 			require.NoError(t, svc.Start(context.Background()))
-			require.Eventually(t, func() bool { return svc.Status() == StatusVersionMismatch }, 5*time.Second, 20*time.Millisecond)
+			require.Eventually(t, func() bool { return svc.Status() == wantStatus }, 5*time.Second, 20*time.Millisecond)
 			svc.setOnline(svc.uppers[0], false)
-			require.Equal(t, StatusVersionMismatch, svc.Status(), "mismatch remains latched while the upper is offline")
+			require.Equal(t, wantStatus, svc.Status(), "version status remains latched while the upper is offline")
 
 			_, err := svc.catalogItems()
 			require.NoError(t, err)

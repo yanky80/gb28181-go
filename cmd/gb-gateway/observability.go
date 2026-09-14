@@ -51,6 +51,7 @@ type GatewaySnapshot struct {
 	Codec           string                   `json:"codec"`
 	PeerGBVersion   string                   `json:"peer_gb_version,omitempty"`
 	VersionMismatch bool                     `json:"version_mismatch"`
+	VersionMissing  bool                     `json:"version_missing"`
 	Metrics         GatewayMetricsSnapshot   `json:"metrics"`
 }
 
@@ -528,6 +529,7 @@ func (g *Gateway) refreshSnapshot() GatewaySnapshot {
 		ActiveDialogs: activeDialogs, ProtocolVersion: g.cfg.GB.ProtocolVersion,
 		Codec: codec, PeerGBVersion: peerVersion,
 		VersionMismatch: registration == cascade.StatusVersionMismatch,
+		VersionMissing:  registration == cascade.StatusVersionMissing,
 		Metrics:         g.observability.Snapshot(),
 	}
 	g.state.Store(snapshot)
